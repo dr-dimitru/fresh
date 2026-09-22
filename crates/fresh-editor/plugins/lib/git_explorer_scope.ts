@@ -116,10 +116,37 @@ export function parseStatusOutput(
   return [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
 }
 
+function normalizedPath(path: string): string {
+  let normalized = path.replaceAll("\\", "/");
+  if (/^\/\/\?\/UNC\//i.test(normalized)) {
+    normalized = `//${normalized.slice(8)}`;
+  } else if (/^\/\/\?\/[a-z]:\//i.test(normalized)) {
+    normalized = normalized.slice(4);
+  }
+
+  if (normalized.startsWith("//")) {
+    return `//${normalized.slice(2).replace(/\/{2,}/g, "/")}`;
+  }
+  return normalized.replace(/\/{2,}/g, "/");
+}
+
+function pathKey(path: string): string {
+  const normalized = normalizedPath(path);
+  return /^[a-z]:\//i.test(normalized) || normalized.startsWith("//")
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+function samePath(left: string, right: string): boolean {
+  return pathKey(left) === pathKey(right);
+}
+
 function isWithin(path: string, root: string): boolean {
-  if (path === root) return true;
-  const prefix = root.endsWith("/") ? root : `${root}/`;
-  return path.startsWith(prefix);
+  const candidate = pathKey(path);
+  const normalizedRoot = pathKey(root);
+  if (candidate === normalizedRoot) return true;
+  const prefix = normalizedRoot.endsWith("/") ? normalizedRoot : `${normalizedRoot}/`;
+  return candidate.startsWith(prefix);
 }
 
 /** Build highest-priority parent-directory markers up through `root`. */
@@ -133,9 +160,9 @@ export function buildAncestorDecorations(
   for (const status of statuses) {
     if (!isWithin(status.path, root)) continue;
     let descendant = status.path;
-    while (descendant !== root) {
+    while (!samePath(descendant, root)) {
       const parent = port.pathDirname(descendant);
-      if (!parent || parent === descendant || !isWithin(parent, root)) break;
+      if (!parent || samePath(parent, descendant) || !isWithin(parent, root)) break;
       const existing = byPath.get(parent);
       if (!existing || status.priority >= existing.priority) {
         byPath.set(parent, {
@@ -191,18 +218,19 @@ function scopeCandidatePaths(scope: FileExplorerScope, port: GitExplorerPort): s
   const paths: string[] = [];
   const seen = new Set<string>();
   const add = (path: string) => {
-    if (!isWithin(path, scope.root) || seen.has(path) || paths.length >= MAX_SCOPE_CANDIDATES) {
+    const key = pathKey(path);
+    if (!isWithin(path, scope.root) || seen.has(key) || paths.length >= MAX_SCOPE_CANDIDATES) {
       return;
     }
-    seen.add(path);
+    seen.add(key);
     paths.push(path);
   };
   const addAncestors = (path: string) => {
     let current = path;
-    while (current !== scope.root) {
+    while (!samePath(current, scope.root)) {
       const parent = port.pathDirname(current);
-      if (!parent || parent === current || !isWithin(parent, scope.root)) break;
-      if (parent === scope.root) break;
+      if (!parent || samePath(parent, current) || !isWithin(parent, scope.root)) break;
+      if (samePath(parent, scope.root)) break;
       add(parent);
       current = parent;
     }
@@ -268,26 +296,23 @@ export class GitExplorerScopeCache {
     if (!nextScope) {
       this.currentCandidates = [];
       this.queue = [];
-      this.pendingInvalidations.clear();
       return this.running ?? Promise.resolve();
     }
 
     this.workspaceRoot = nextScope.root;
     const candidates = scopeCandidatePaths(nextScope, this.git);
     this.currentCandidates = candidates;
-    for (const root of this.pendingInvalidations) {
-      if (!this.repositoryIsVisible(root)) this.pendingInvalidations.delete(root);
-    }
-
-    const invalidated: QueueItem[] = [...this.pendingInvalidations].map((root) => ({
-      kind: "repository",
-      job: {
-        root,
-        revision: nextScope.revision,
-        scopeGeneration: this.scopeGeneration,
-        repositoryGeneration: this.repositoryGenerations.get(root) ?? 0,
-      },
-    }));
+    const invalidated: QueueItem[] = [...this.pendingInvalidations]
+      .filter((root) => this.repositoryIsVisible(root))
+      .map((root) => ({
+        kind: "repository",
+        job: {
+          root,
+          revision: nextScope.revision,
+          scopeGeneration: this.scopeGeneration,
+          repositoryGeneration: this.repositoryGenerations.get(root) ?? 0,
+        },
+      }));
     const candidateItems: QueueItem[] = candidates.map((path) => ({
       kind: "candidate",
       candidate: {
@@ -303,9 +328,13 @@ export class GitExplorerScopeCache {
 
   /** Invalidate and queue only the visible repository that owns `path`. */
   invalidatePath(path: string): void {
-    if (!this.currentScope) return;
-    const root = [...this.repositories.keys()]
-      .filter((candidate) => isWithin(path, candidate) && this.repositoryIsVisible(candidate))
+    const knownRoots = new Set([
+      ...this.repositories.keys(),
+      ...this.repositoryGenerations.keys(),
+      ...this.pendingInvalidations,
+    ]);
+    const root = [...knownRoots]
+      .filter((candidate) => isWithin(path, candidate))
       .sort((left, right) => right.length - left.length)[0];
     if (!root) return;
 
@@ -319,6 +348,7 @@ export class GitExplorerScopeCache {
     this.queue = this.queue.filter(
       (item) => item.kind !== "repository" || item.job.root !== root,
     );
+    if (!this.currentScope || !this.repositoryIsVisible(root)) return;
     this.queue.unshift({
       kind: "repository",
       job: {
@@ -517,7 +547,11 @@ export class GitExplorerScopeCache {
       )[0];
       if (!oldest) return;
       this.repositories.delete(oldest[0]);
-      if (!this.pendingInvalidations.has(oldest[0])) {
+      const hasQueuedRefresh = this.queue.some(
+        (item) => item.kind === "repository" && item.job.root === oldest[0],
+      );
+      if (!hasQueuedRefresh) {
+        this.pendingInvalidations.delete(oldest[0]);
         this.repositoryGenerations.delete(oldest[0]);
       }
     }
@@ -529,6 +563,11 @@ export class GitExplorerScopeCache {
         .filter((item): item is Extract<QueueItem, { kind: "repository" }> => item.kind === "repository")
         .map((item) => item.job.root),
     );
+    for (const root of this.pendingInvalidations) {
+      if (!this.repositories.has(root) && !queuedRoots.has(root)) {
+        this.pendingInvalidations.delete(root);
+      }
+    }
     for (const root of this.repositoryGenerations.keys()) {
       if (
         !this.repositories.has(root) &&
