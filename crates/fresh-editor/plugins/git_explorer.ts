@@ -1,256 +1,124 @@
 /// <reference path="./lib/fresh.d.ts" />
-import { discoverSubRepos } from "./lib/git_repo.ts";
+import { GitExplorerScopeCache, type Decoration } from "./lib/git_explorer_scope.ts";
 
 const editor = getEditor();
-
-/**
- * Git Explorer Decorations
- *
- * Adds VS Code-style status badges (M/A/U/D/...) to the file explorer.
- * Optional filename coloring via plugins.git_explorer.settings.colorNames.
- */
-
 const NAMESPACE = "git-explorer";
-
-const COLORS = {
-  added:      "ui.file_status_added_fg",
-  modified:   "ui.file_status_modified_fg",
-  deleted:    "ui.file_status_deleted_fg",
-  renamed:    "ui.file_status_renamed_fg",
-  untracked:  "ui.file_status_untracked_fg",
-  conflicted: "ui.file_status_conflicted_fg",
-};
-
-const PRIORITY = {
-  conflicted: 90,
-  deleted: 80,
-  added: 60,
-  modified: 50,
-  renamed: 40,
-  untracked: 30,
-};
 
 editor.defineConfigBoolean("colorNames", {
   default: false,
   description: "Color file explorer entry names by git status",
 });
 
-let refreshInFlight = false;
-let refreshPending = false;
-
-function statusToDecoration(status: string, staged: boolean) {
-  switch (status) {
-    case "A":
-      return { symbol: "A", color: COLORS.added, priority: PRIORITY.added };
-    case "M":
-      return {
-        symbol: "M",
-        color: staged ? COLORS.added : COLORS.modified,
-        priority: PRIORITY.modified + (staged ? 2 : 0),
-      };
-    case "D":
-      return { symbol: "D", color: COLORS.deleted, priority: PRIORITY.deleted };
-    case "R":
-      return { symbol: "R", color: COLORS.renamed, priority: PRIORITY.renamed };
-    case "C":
-      return { symbol: "C", color: COLORS.renamed, priority: PRIORITY.renamed };
-    case "U":
-      return { symbol: "!", color: COLORS.conflicted, priority: PRIORITY.conflicted };
-    default:
+const scopeCache = new GitExplorerScopeCache({
+  pathDirname: (path) => editor.pathDirname(path),
+  pathJoin: (...parts) => editor.pathJoin(...parts),
+  fileExists: (path) => editor.fileExists(editor.authorityPath(path)),
+  resolveRepository: async (path) => {
+    try {
+      const result = await editor.spawnProcess(
+        "git",
+        ["rev-parse", "--show-toplevel"],
+        path,
+      );
+      return result.exit_code === 0 ? result.stdout.trim() || null : null;
+    } catch {
       return null;
+    }
+  },
+  readStatus: async (repoRoot) => {
+    try {
+      const result = await editor.spawnProcess(
+        "git",
+        ["status", "--porcelain", "-z"],
+        repoRoot,
+      );
+      return result.exit_code === 0 ? result.stdout : null;
+    } catch {
+      return null;
+    }
+  },
+});
+
+let scopeApiWarningIssued = false;
+
+function supportsExplorerScope(): boolean {
+  if (typeof editor.getFileExplorerScope === "function") return true;
+  if (!scopeApiWarningIssued) {
+    console.warn(
+      "[git-explorer] editor.getFileExplorerScope() is unavailable; Git Explorer refresh is disabled for this Fresh build.",
+    );
+    scopeApiWarningIssued = true;
   }
+  return false;
 }
 
-function parseStatusOutput(output: string, repoRoot: string) {
-  const separator = output.includes("\0") ? "\0" : "\n";
-  const entries = output
-    .split(separator)
-    .map((entry) => entry.replace(/\r$/, ""))
-    .filter((entry) => entry.length > 0);
-  const byPath = new Map<string, { path: string; symbol: string; color: string; priority: number }>();
-
-  for (let i = 0; i < entries.length; i++) {
-    const entry = entries[i];
-    if (entry.length < 3) {
-      continue;
-    }
-    const x = entry[0];
-    const y = entry[1];
-    let path = entry.slice(3);
-
-    if ((x === "R" || x === "C") && separator === "\0" && i + 1 < entries.length) {
-      i += 1;
-      path = entries[i];
-    } else if (entry.includes(" -> ") && (x === "R" || x === "C" || y === "R" || y === "C")) {
-      path = entry.split(" -> ").pop() ?? path;
-    }
-
-    let decoration = null;
-    if (x === "?" && y === "?") {
-      decoration = { symbol: "U", color: COLORS.untracked, priority: PRIORITY.untracked };
-    } else if (x !== " " && x !== "?") {
-      decoration = statusToDecoration(x, true);
-    } else if (y !== " ") {
-      decoration = statusToDecoration(y, false);
-    }
-
-    if (!decoration) {
-      continue;
-    }
-
-    const absolutePath = editor.pathJoin(repoRoot, path);
-    const existing = byPath.get(absolutePath);
-    if (!existing || decoration.priority >= existing.priority) {
-      byPath.set(absolutePath, { path: absolutePath, ...decoration });
-    }
-  }
-
-  return Array.from(byPath.values());
-}
-
-function buildNameColorSlots(
-  statuses: Array<{ path: string; color: string; priority: number }>,
-  repoRoot: string
-) {
+function buildNameColorSlots(decorations: Decoration[]) {
   const byPath = new Map<string, { path: string; nameColor: string; priority: number }>();
-
-  for (const status of statuses) {
-    const existing = byPath.get(status.path);
-    if (!existing || status.priority >= existing.priority) {
-      byPath.set(status.path, {
-        path: status.path,
-        nameColor: status.color,
-        priority: status.priority,
+  for (const decoration of decorations) {
+    const existing = byPath.get(decoration.path);
+    if (!existing || decoration.priority >= existing.priority) {
+      byPath.set(decoration.path, {
+        path: decoration.path,
+        nameColor: decoration.color,
+        priority: decoration.priority,
       });
     }
+  }
+  return [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
+}
 
-    let ancestor = status.path;
-    while (true) {
-      const parent = editor.pathDirname(ancestor);
-      if (!parent || parent === ancestor || !parent.startsWith(repoRoot)) {
-        break;
-      }
-      const bubbled = byPath.get(parent);
-      if (!bubbled || status.priority >= bubbled.priority) {
-        byPath.set(parent, {
-          path: parent,
-          nameColor: status.color,
-          priority: status.priority,
-        });
-      }
-      ancestor = parent;
-    }
+function publishCachedDecorations() {
+  if (!supportsExplorerScope()) return;
+  const decorations = scopeCache.decorations();
+  if (decorations.length === 0) {
+    editor.clearFileExplorerDecorations(NAMESPACE);
+    editor.clearFileExplorerSlots(NAMESPACE);
+    return;
   }
 
-  return Array.from(byPath.values()).map(({ path, nameColor, priority }) => ({
-    path,
-    nameColor,
-    priority,
-  }));
+  editor.setFileExplorerDecorations(NAMESPACE, decorations);
+  const config = (editor.getPluginConfig() ?? {}) as { colorNames?: boolean };
+  if (config.colorNames) {
+    editor.setFileExplorerSlots(NAMESPACE, buildNameColorSlots(decorations));
+  } else {
+    editor.clearFileExplorerSlots(NAMESPACE);
+  }
 }
 
 async function refreshGitExplorerDecorations() {
-  if (refreshInFlight) {
-    refreshPending = true;
-    return;
-  }
-  refreshInFlight = true;
+  if (!supportsExplorerScope()) return;
   try {
-    const cwd = editor.getCwd();
-    const rootResult = await editor.spawnProcess("git", ["rev-parse", "--show-toplevel"], cwd);
-
-    type Decoration = { path: string; symbol: string; color: string; priority: number };
-    // Keep each repo's decorations grouped with the root they came from, so
-    // slots are built per-repo without re-deriving membership by path prefix
-    // (a bare startsWith(root) mis-groups sibling repos that share a prefix,
-    // e.g. project-a vs project-a-extra).
-    const repoGroups: Array<{ root: string; decorations: Decoration[] }> = [];
-    // Guard against decorating the same repo twice — e.g. the workspace root
-    // repo and a discovered sub-repo path that resolves back to it.
-    const seenRoots = new Set<string>();
-
-    // Run `git status` in `repoRoot` and record its decorations, skipping any
-    // repo already collected.
-    const addRepoGroup = async (repoRoot: string): Promise<void> => {
-      if (!repoRoot || seenRoots.has(repoRoot)) return;
-      seenRoots.add(repoRoot);
-      const statusResult = await editor.spawnProcess("git", ["status", "--porcelain", "-z"], repoRoot);
-      if (statusResult.exit_code === 0) {
-        repoGroups.push({ root: repoRoot, decorations: parseStatusOutput(statusResult.stdout, repoRoot) });
-      }
-    };
-
-    // Decorate the workspace root's own repo when it is one.
-    if (rootResult.exit_code === 0 && rootResult.stdout.trim()) {
-      await addRepoGroup(rootResult.stdout.trim());
-    }
-    // Always also discover nested sub-repos below cwd. A monorepo whose root
-    // is *itself* a repo can still vendor independent git repos; those files
-    // must be decorated from their own repo's status, not left blank because
-    // the outer `git status` (which only sees the sub-repo dir as untracked)
-    // stops at the boundary (#2592). When the root is not a repo this is the
-    // sole discovery path (plain monorepo/multi-repo layout).
-    const subRepos = discoverSubRepos(editor, cwd);
-    for (const subDir of subRepos) {
-      const subRootResult = await editor.spawnProcess("git", ["rev-parse", "--show-toplevel"], subDir);
-      if (subRootResult.exit_code !== 0) continue;
-      await addRepoGroup(subRootResult.stdout.trim());
-    }
-
-    const allDecorations = repoGroups.flatMap(g => g.decorations);
-    if (allDecorations.length === 0) {
-      editor.clearFileExplorerDecorations(NAMESPACE);
-      editor.clearFileExplorerSlots(NAMESPACE);
-    } else {
-      editor.setFileExplorerDecorations(NAMESPACE, allDecorations);
-
-      const cfg = (editor.getPluginConfig() ?? {}) as { colorNames?: boolean };
-      if (cfg.colorNames) {
-        const allSlots = repoGroups.flatMap(g => buildNameColorSlots(g.decorations, g.root));
-        editor.setFileExplorerSlots(NAMESPACE, allSlots);
-      } else {
-        editor.clearFileExplorerSlots(NAMESPACE);
-      }
-    }
-  } catch (err) {
-    editor.clearFileExplorerDecorations(NAMESPACE);
-    editor.clearFileExplorerSlots(NAMESPACE);
-    throw err;
-  } finally {
-    refreshInFlight = false;
-    if (refreshPending) {
-      refreshPending = false;
-      void refreshGitExplorerDecorations();
-    }
+    await scopeCache.refresh(editor.getFileExplorerScope());
+    publishCachedDecorations();
+  } catch (error) {
+    // Keep the previous decorations if a repository refresh fails.
+    console.warn("[git-explorer] failed to refresh scoped Git decorations", error);
   }
 }
 
-editor.on("after_file_open", () => {
-  refreshGitExplorerDecorations();
-});
-editor.on("after_file_save", () => {
-  refreshGitExplorerDecorations();
-});
-// A reloaded buffer means the file changed on disk without a save — e.g.
-// `git checkout <ref> -- <file>` in another terminal — so its git status
-// badge may be stale.
-editor.on("after_file_revert", () => {
-  refreshGitExplorerDecorations();
-});
-editor.on("after_file_explorer_change", () => {
-  refreshGitExplorerDecorations();
-});
+function invalidateRepositoryForPath(path: string) {
+  if (!supportsExplorerScope()) return;
+  scopeCache.invalidatePath(path);
+  void refreshGitExplorerDecorations();
+}
+
 editor.on("editor_initialized", () => {
-  refreshGitExplorerDecorations();
+  void refreshGitExplorerDecorations();
 });
-editor.on("focus_gained", () => {
-  refreshGitExplorerDecorations();
+editor.on("file_explorer_scope_changed", () => {
+  void refreshGitExplorerDecorations();
 });
-// `colorNames` is read inside the refresh, so without this the setting
-// changes nothing until the next file open/save/explorer change — the
-// user ticks the box in Settings and the explorer just sits there.
+editor.on("after_file_save", ({ path }) => {
+  invalidateRepositoryForPath(path);
+});
+editor.on("after_file_revert", ({ path }) => {
+  invalidateRepositoryForPath(path);
+});
+editor.on("after_file_explorer_change", ({ path }) => {
+  invalidateRepositoryForPath(path);
+});
 editor.on("config_changed", () => {
-  refreshGitExplorerDecorations();
+  publishCachedDecorations();
 });
 
-refreshGitExplorerDecorations();
+void refreshGitExplorerDecorations();
