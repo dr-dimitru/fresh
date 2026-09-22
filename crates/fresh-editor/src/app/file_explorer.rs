@@ -374,6 +374,9 @@ impl Editor {
                 window.rebuild_file_explorer_slot_override_cache();
             }
         }
+
+        #[cfg(feature = "plugins")]
+        self.refresh_file_explorer_scope_and_notify_plugins();
     }
 
     pub fn file_explorer_open_file(&mut self) -> AnyhowResult<()> {
@@ -465,6 +468,9 @@ impl Editor {
                 }
             }
         }
+
+        #[cfg(feature = "plugins")]
+        self.refresh_file_explorer_scope_and_notify_plugins();
     }
 
     pub fn file_explorer_new_file(&mut self) {
@@ -984,6 +990,8 @@ impl Editor {
         // Persist to config so the setting survives across sessions
         self.config_mut().file_explorer.show_hidden = show_hidden;
         self.persist_config_change(crate::config_keys::FILE_EXPLORER_SHOW_HIDDEN, show_hidden);
+        #[cfg(feature = "plugins")]
+        self.refresh_file_explorer_scope_and_notify_plugins();
     }
 
     pub fn file_explorer_toggle_gitignored(&mut self) {
@@ -1007,6 +1015,8 @@ impl Editor {
             crate::config_keys::FILE_EXPLORER_SHOW_GITIGNORED,
             show_gitignored,
         );
+        #[cfg(feature = "plugins")]
+        self.refresh_file_explorer_scope_and_notify_plugins();
     }
 
     // Clear the file explorer search (or multi-selection, pending cut, or transfer focus).
@@ -1454,6 +1464,8 @@ impl Editor {
     /// Multi-target operations call this once per refresh, not once per
     /// file.
     pub(super) fn notify_file_explorer_change(&mut self, path: &Path) {
+        #[cfg(feature = "plugins")]
+        self.refresh_file_explorer_scope_and_notify_plugins();
         self.plugin_manager.read().unwrap().run_hook(
             "after_file_explorer_change",
             crate::services::plugins::hooks::HookArgs::AfterFileExplorerChange {

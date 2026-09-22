@@ -193,6 +193,21 @@ impl Editor {
         }
     }
 
+    pub(crate) fn refresh_file_explorer_scope_and_notify_plugins(&mut self) {
+        self.update_file_explorer_viewport_height_from_layout();
+        if !self
+            .active_window_mut()
+            .refresh_file_explorer_scope_state()
+        {
+            return;
+        }
+        self.update_plugin_state_snapshot();
+        self.plugin_manager.read().unwrap().run_hook(
+            "file_explorer_scope_changed",
+            crate::services::plugins::hooks::HookArgs::FileExplorerScopeChanged {},
+        );
+    }
+
     pub fn update_plugin_state_snapshot(&mut self) {
         // Rebuild the per-window filesystem registry so plugin file I/O resolves
         // against the correct window's authority (or the active one). This runs

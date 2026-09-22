@@ -764,7 +764,11 @@ impl crate::app::Editor {
         // finders, etc. — keep targeting the previous window's project
         // after a dive, surfacing the wrong project's files.
         #[cfg(feature = "plugins")]
-        self.update_plugin_state_snapshot();
+        {
+            self.active_window_mut()
+                .invalidate_file_explorer_scope_fingerprint();
+            self.refresh_file_explorer_scope_and_notify_plugins();
+        }
 
         self.plugin_manager.read().unwrap().run_hook(
             "active_window_changed",

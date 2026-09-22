@@ -3584,6 +3584,8 @@ impl Editor {
                 self.dismiss_transient_popups();
                 self.active_window().wheel_plugin_hook(x, y, delta);
                 self.active_window_mut().scroll_file_explorer_view(delta);
+                #[cfg(feature = "plugins")]
+                self.refresh_file_explorer_scope_and_notify_plugins();
             }
 
             UiFact::MenuItemClick { depth, index } => {

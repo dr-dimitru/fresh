@@ -1549,6 +1549,8 @@ impl Editor {
         win.install_initialized_file_explorer(view, defaults);
         if is_active {
             self.set_status_message(t!("status.file_explorer_ready").to_string());
+            #[cfg(feature = "plugins")]
+            self.refresh_file_explorer_scope_and_notify_plugins();
         }
     }
 
@@ -1575,6 +1577,10 @@ impl Editor {
         // Route to the requesting window (see `handle_file_explorer_initialized`).
         if let Some(win) = self.windows.get_mut(&window) {
             win.install_expanded_file_explorer(view);
+        }
+        if window == self.active_window_id() {
+            #[cfg(feature = "plugins")]
+            self.refresh_file_explorer_scope_and_notify_plugins();
         }
     }
 }
