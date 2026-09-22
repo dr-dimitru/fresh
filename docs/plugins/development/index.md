@@ -67,6 +67,12 @@ The global `editor` object is the main entry point for the Fresh plugin API. It 
 - Spawning external processes
 - Subscribing to editor events
 
+`editor.getFileExplorerScope()` returns a read-only snapshot of the Explorer root,
+visible rows, expanded directories, and scope revision. It returns `null` while
+the Explorer is hidden or uninitialized. Reading it uses loaded tree state and
+does not traverse the filesystem or run Git commands. Subscribe to
+`file_explorer_scope_changed` to read each new snapshot.
+
 ### Commands
 
 Commands are actions that can be triggered from the command palette or bound to keys. Register them with `editor.registerCommand()`:

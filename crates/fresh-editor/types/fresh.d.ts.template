@@ -55,11 +55,22 @@
  */
 declare function getEditor(): EditorAPI;
 
+/** Read-only snapshot of paths currently shown or expanded in File Explorer. */
+type FileExplorerScope = {
+  root: string;
+  revision: number;
+  visiblePaths: string[];
+  expandedDirectories: string[];
+};
+
 /**
  * Plugin-specific methods added by the JavaScript runtime wrapper.
  * These extend the base EditorAPI with i18n and command registration helpers.
  */
 interface EditorAPI {
+  /** Return the current File Explorer scope snapshot, or null while hidden or uninitialized. */
+  getFileExplorerScope(): FileExplorerScope | null;
+
   /**
    * Translate a string using the plugin's i18n file
    * @param key - Translation key (e.g., "status.ready")

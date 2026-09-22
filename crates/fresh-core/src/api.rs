@@ -1541,6 +1541,18 @@ pub struct PluginMarker {
     pub payload: serde_json::Value,
 }
 
+/// Read-only snapshot of the File Explorer rows and expanded directories.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct FileExplorerScope {
+    pub root: String,
+    #[ts(type = "number")]
+    pub revision: u64,
+    pub visible_paths: Vec<String>,
+    pub expanded_directories: Vec<String>,
+}
+
 /// Snapshot of editor state for plugin queries
 /// This is updated by the editor on each loop iteration
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -1591,6 +1603,10 @@ pub struct EditorStateSnapshot {
     /// Plugins that just need "where am I" can read this directly; plugins
     /// orchestrating multiple sessions (Orchestrator) iterate `sessions`.
     pub working_dir: PathBuf,
+    /// Current File Explorer scope, or `None` when the Explorer is hidden or
+    /// has not been initialized.
+    #[serde(default)]
+    pub file_explorer_scope: Option<FileExplorerScope>,
     /// All editor sessions, in id order. Always non-empty (the base
     /// session is `id == 1`). Updated when sessions are
     /// created/closed or relabelled.
@@ -1795,6 +1811,7 @@ impl EditorStateSnapshot {
             selected_text: None,
             clipboard: String::new(),
             working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            file_explorer_scope: None,
             windows: Vec::new(),
             active_window_id: WindowId(1),
             authority_label: String::new(),

@@ -6717,6 +6717,50 @@ mod tests {
 }
 
 impl Window {
+    /// Return a read-only snapshot of the current visible Explorer scope.
+    /// This only reads the loaded tree and performs no filesystem work.
+    pub(crate) fn current_file_explorer_scope(
+        &self,
+    ) -> Option<fresh_core::api::FileExplorerScope> {
+        if !self.file_explorer_visible {
+            return None;
+        }
+
+        let explorer = self.file_explorer.as_ref()?;
+        let paths = explorer.plugin_scope_paths();
+        let normalize = |path: &std::path::Path| {
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.root.join(path)
+            };
+            crate::app::path_utils::normalize_path(&absolute)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let mut visible_paths: Vec<String> = paths
+            .visible_paths
+            .iter()
+            .map(|path| normalize(path))
+            .collect();
+        visible_paths.sort();
+        visible_paths.dedup();
+        let mut expanded_directories: Vec<String> = paths
+            .expanded_directories
+            .iter()
+            .map(|path| normalize(path))
+            .collect();
+        expanded_directories.sort();
+        expanded_directories.dedup();
+
+        Some(fresh_core::api::FileExplorerScope {
+            root: normalize(explorer.tree().root_path()),
+            revision: self.file_explorer_scope_revision,
+            visible_paths,
+            expanded_directories,
+        })
+    }
+
     /// Populate the per-window fields of the plugin state snapshot.
     ///
     /// Called by `Editor::update_plugin_state_snapshot` while it holds
@@ -6765,6 +6809,7 @@ impl Window {
         }
 
         snapshot.active_buffer_id = self.active_buffer();
+        snapshot.file_explorer_scope = self.current_file_explorer_scope();
 
         // Mirror the active session's recorded macros into the snapshot so
         // plugins can read them synchronously via `editor.listMacros()` /

@@ -727,6 +727,9 @@ pub struct Window {
     /// Whether the file-explorer panel is visible in this window.
     pub file_explorer_visible: bool,
 
+    /// Monotonic revision for meaningful File Explorer scope changes.
+    pub file_explorer_scope_revision: u64,
+
     /// Whether a file-explorer rebuild is in flight (debounce flag).
     pub file_explorer_sync_in_progress: bool,
 
@@ -2418,6 +2421,7 @@ impl Window {
             interactive_replace_state: None,
             scroll_sync_manager: crate::view::scroll_sync::ScrollSyncManager::new(),
             file_explorer_visible: false,
+            file_explorer_scope_revision: 0,
             file_explorer_sync_in_progress: false,
             file_explorer_sync_deferred: None,
             file_explorer_width: resources.config.file_explorer.width,

@@ -66,3 +66,47 @@ editor.on("editor_initialized", () => {
         })
         .unwrap();
 }
+
+#[test]
+fn file_explorer_scope_api_returns_null_while_hidden() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().to_path_buf();
+    fs::write(project_root.join("foo.txt"), "hello").unwrap();
+
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin_lib(&plugins_dir);
+
+    let test_plugin = r###"
+/// <reference path="./lib/fresh.d.ts" />
+const editor = getEditor();
+const currentScope = () => {
+  const scope = editor.getFileExplorerScope();
+  return scope === null
+    ? "scope:null"
+    : `scope:${scope.revision}:${scope.visiblePaths.join("|")}`;
+};
+
+editor.on("file_explorer_scope_changed", () => {
+  editor.setStatus(currentScope());
+});
+editor.on("editor_initialized", () => {
+  editor.setStatus(`initial:${currentScope()}`);
+});
+"###;
+    fs::write(plugins_dir.join("file_explorer_scope_test.ts"), test_plugin).unwrap();
+
+    let mut config = Config::default();
+    config.plugins.insert(
+        "file_explorer_scope_test".to_string(),
+        fresh_core::config::PluginConfig {
+            enabled: true,
+            path: Some(plugins_dir.join("file_explorer_scope_test.ts")),
+            ..Default::default()
+        },
+    );
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 40, config, project_root).unwrap();
+    harness.wait_for_screen_contains("initial:scope:null").unwrap();
+}

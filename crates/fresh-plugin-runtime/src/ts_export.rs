@@ -19,8 +19,9 @@ use fresh_core::api::{
     BufferGroupResult, BufferInfo, BufferSavedDiff, CompositeHunk, CompositeLayoutConfig,
     CompositePaneStyle, CompositeSourceConfig, CreateCompositeBufferOptions, CreateTerminalOptions,
     CreateVirtualBufferInExistingSplitOptions, CreateVirtualBufferInSplitOptions,
-    CreateVirtualBufferOptions, CursorInfo, DiffBaselineResult, DirEntry, FormatterPackConfig,
-    GrammarInfoSnapshot, GrepMatch, JsDiagnostic, JsPosition, JsRange, JsTextPropertyEntry,
+    CreateVirtualBufferOptions, CursorInfo, DiffBaselineResult, DirEntry, FileExplorerScope,
+    FormatterPackConfig, GrammarInfoSnapshot, GrepMatch, JsDiagnostic, JsPosition, JsRange,
+    JsTextPropertyEntry,
     KeyEventPayload, LanguagePackConfig, LayoutHints, LineDiffHunk, LspServerPackConfig,
     OverlayColorSpec, OverlayOptions, PluginAnimationEdge, PluginAnimationKind,
     ProcessLimitsPackConfig, RemoteBackendInfo, ReplaceResult, ScreenSize, ScrollbarMarker,
@@ -51,6 +52,7 @@ fn get_type_decl(type_name: &str) -> Option<String> {
 
         // Core types
         "BufferInfo" => Some(BufferInfo::decl(&cfg)),
+        "FileExplorerScope" => Some(FileExplorerScope::decl(&cfg)),
         "WindowInfo" => Some(WindowInfo::decl(&cfg)),
         "RemoteBackendInfo" => Some(RemoteBackendInfo::decl(&cfg)),
         "CursorInfo" => Some(CursorInfo::decl(&cfg)),
@@ -618,6 +620,8 @@ interface HookEventMap {
    * explorer-driven changes too.
    */
   after_file_explorer_change: { path: string };
+  /** The visible Explorer scope changed; read it with `getFileExplorerScope()`. */
+  file_explorer_scope_changed: Record<string, never>;
 
   // ── text edits ───────────────────────────────────────────────────────────
   before_insert: { buffer_id: number; position: number; text: string };
