@@ -38,6 +38,8 @@ pub mod env_manager;
 pub mod file_explorer_slots;
 pub mod find_file;
 pub mod git;
+#[cfg(unix)]
+pub mod git_explorer_scope;
 pub mod git_log_current_file;
 pub mod git_log_diff_highlight_offset;
 pub mod git_log_hostile_diff_config;
