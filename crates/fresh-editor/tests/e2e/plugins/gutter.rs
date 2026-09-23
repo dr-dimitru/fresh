@@ -195,6 +195,29 @@ fn start_server(config: Config) {
     println!("Git gutter screen:\n{}", screen);
 }
 
+/// Git gutter indicators remain visible when line numbers are disabled.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn test_git_gutter_shows_when_line_numbers_are_hidden() {
+    let repo = GitTestRepo::new();
+    repo.setup_typical_project();
+    repo.setup_git_gutter_plugin();
+
+    let _guard = repo.change_to_repo_dir();
+    repo.modify_file(
+        "src/main.rs",
+        "fn main() {\n    println!(\"Modified line!\");\n}\n",
+    );
+
+    let mut config = Config::default();
+    config.editor.line_numbers = false;
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 40, config, repo.path.clone()).unwrap();
+    open_file(&mut harness, &repo.path, "src/main.rs");
+
+    wait_for_indicator(&mut harness, "│");
+}
+
 /// Regression test for issue #2721: user-configured external diff tools may
 /// emit side-by-side output, but the gutter parser requires a unified diff.
 #[test]

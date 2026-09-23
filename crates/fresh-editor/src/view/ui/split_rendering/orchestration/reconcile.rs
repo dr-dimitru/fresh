@@ -157,6 +157,7 @@ pub(crate) fn place_pane(
         compose_width,
         gutter_estimated_lines(state),
         state.diff_gutter.as_ref().map(|g| g.width()),
+        state.margins.has_line_indicators(),
     );
     state.margins.left_config = gutter.margin;
 

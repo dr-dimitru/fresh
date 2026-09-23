@@ -676,6 +676,11 @@ impl MarginManager {
         configure_left_for_line_numbers(&mut self.left_config, show_line_numbers);
     }
 
+    /// Whether any line indicator currently needs the left indicator slot.
+    pub fn has_line_indicators(&self) -> bool {
+        !self.line_indicators.is_empty()
+    }
+
     /// Get the number of annotations in a position
     pub fn annotation_count(&self, position: MarginPosition) -> usize {
         match position {
@@ -691,9 +696,9 @@ fn configure_left_for_line_numbers(cfg: &mut MarginConfig, show_line_numbers: bo
         // Hide the line-number digits and the separator, but keep the gutter
         // enabled with a zero-width number column so the 1-char indicator
         // slot survives. This lets diagnostic / git / fold indicators still
-        // render in compose mode (issue #2146) without showing line numbers
-        // or the `│` separator. The render layer draws this slot in the
-        // compose desk margin so it doesn't shrink the text width.
+        // render without showing line numbers or the `│` separator. Compose
+        // mode reclaims this slot from its desk margin so text width stays
+        // unchanged.
         cfg.width = 0;
         cfg.enabled = true;
         cfg.show_separator = false;
