@@ -7,6 +7,27 @@ use crate::services::async_bridge::AsyncMessage;
 use crate::view::file_tree::TreeNode;
 use std::path::{Path, PathBuf};
 
+/// Move a local path to the system trash without requiring Finder automation.
+///
+/// Finder's AppleScript path is the default in `trash`, but a terminal-launched
+/// editor may not have permission to send Apple Events to Finder. Foundation's
+/// file manager keeps the operation in the system Trash without that permission.
+fn delete_local_to_trash(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+
+        let mut context = trash::TrashContext::new();
+        context.set_delete_method(DeleteMethod::NsFileManager);
+        context.delete(path).map_err(std::io::Error::other)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        trash::delete(path).map_err(std::io::Error::other)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FileExplorerClipboard {
     pub paths: Vec<PathBuf>,
@@ -819,7 +840,7 @@ impl Editor {
         {
             self.move_to_remote_trash(path)
         } else {
-            trash::delete(path).map_err(std::io::Error::other)
+            delete_local_to_trash(path)
         }
     }
 
