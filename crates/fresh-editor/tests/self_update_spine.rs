@@ -116,6 +116,16 @@ fn place_binary(to: &Path) {
 ///
 /// Falls back to the unstripped binary if `strip` is unavailable.
 fn stripped_binary() -> PathBuf {
+    // all_tests runs these cases in one process, so the process-id-based
+    // staging path is shared by concurrent test threads. Serialize cache
+    // creation; nextest's one-process-per-case layout does not cover this
+    // folded integration-test binary.
+    static STRIP_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let _guard = STRIP_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let original = PathBuf::from(env!("CARGO_BIN_EXE_fresh"));
     let cache_dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let cached = cache_dir.join("fresh-stripped");

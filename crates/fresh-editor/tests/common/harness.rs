@@ -650,6 +650,17 @@ impl EditorTestHarness {
         // If no config provided, use defaults; if config provided, respect its settings
         let config_was_provided = options.config.is_some();
         let mut config = options.config.unwrap_or_default();
+        // macOS commonly reports zsh as the user's shell, whose startup
+        // files are user state and are not safe to run concurrently across
+        // tests. Use the stock POSIX-compatible shell with startup files disabled for
+        // deterministic PTYs, without changing explicit overrides.
+        #[cfg(target_os = "macos")]
+        if config.terminal.shell.is_none() {
+            config.terminal.shell = Some(fresh::config::TerminalShellConfig {
+                command: "/bin/bash".to_string(),
+                args: vec!["--noprofile".to_string(), "--norc".to_string()],
+            });
+        }
         // Only override auto_indent/auto_close/animations if no config was
         // explicitly provided. Animations span multiple render ticks, so
         // tests that drive the UI via single `render()` calls and then

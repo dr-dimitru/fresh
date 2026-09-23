@@ -1,5 +1,6 @@
 use crate::common::fixtures::TestFixture;
 use crate::common::git_test_helper::git_command;
+use crate::common::global_state::pin_config_globals;
 use crate::common::harness::{copy_plugin, copy_plugin_lib, EditorTestHarness};
 use crossterm::event::{KeyCode, KeyModifiers};
 use fresh::input::commands::Suggestion;
@@ -281,6 +282,7 @@ fn live_grep_folds_case_until_the_case_toggle_says_otherwise() {
 /// `theme.search_match_bg`.
 #[test]
 fn test_live_grep_preview_highlights_query_matches() {
+    let _locale_lock = pin_config_globals();
     let temp_dir = tempfile::TempDir::new().unwrap();
     let project_root = temp_dir.path().canonicalize().unwrap().join("project_root");
     fs::create_dir(&project_root).unwrap();
@@ -1454,6 +1456,7 @@ fn test_live_grep_overlay_is_mouse_modal() {
 /// to the input.
 #[test]
 fn test_live_grep_toolbar_is_on_the_prompts_ring() {
+    let _locale_lock = pin_config_globals();
     let temp_dir = tempfile::TempDir::new().unwrap();
     let project_root = temp_dir.path().join("project_root");
     fs::create_dir(&project_root).unwrap();
