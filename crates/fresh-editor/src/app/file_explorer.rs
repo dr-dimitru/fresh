@@ -170,6 +170,8 @@ impl Editor {
             self.set_status_message(t!("explorer.focused").to_string());
             self.active_window_mut()
                 .sync_file_explorer_to_active_file_with_feedback();
+            #[cfg(feature = "plugins")]
+            self.refresh_file_explorer_scope_and_notify_plugins();
         } else {
             self.toggle_file_explorer();
         }

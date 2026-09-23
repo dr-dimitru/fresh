@@ -1552,8 +1552,10 @@ impl Editor {
         let still_initializing = self
             .get_status_message()
             .is_none_or(|m| *m == t!("explorer.initializing"));
-        if is_active && still_initializing {
-            self.set_status_message(t!("status.file_explorer_ready").to_string());
+        if is_active {
+            if still_initializing {
+                self.set_status_message(t!("status.file_explorer_ready").to_string());
+            }
             #[cfg(feature = "plugins")]
             self.refresh_file_explorer_scope_and_notify_plugins();
         }
