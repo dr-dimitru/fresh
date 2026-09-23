@@ -6,7 +6,7 @@ import {
   GitExplorerScopeCache,
   type FileExplorerScope,
   type GitExplorerPort,
-} from "./lib/git_explorer_scope.ts";
+} from "../lib/git_explorer_scope.ts";
 
 class FakeGit implements GitExplorerPort {
   readonly statusCwds: string[] = [];
@@ -582,9 +582,9 @@ test("missing scope API warns once and performs no recursive Git fallback", asyn
   (globalThis as Record<string, unknown>).__gitExplorerEditor = fakeEditor;
   console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
 
-  const modulePath = resolve(import.meta.dir, `git_explorer_scope_missing_api_${Date.now()}.ts`);
+  const modulePath = resolve(import.meta.dir, "..", `git_explorer_scope_missing_api_${Date.now()}.ts`);
   try {
-    let source = await readFile(resolve(import.meta.dir, "./git_explorer.ts"), "utf8");
+    let source = await readFile(resolve(import.meta.dir, "../git_explorer.ts"), "utf8");
     source = source.replace(/^const editor = getEditor\(\);/m, "const editor = globalThis.__gitExplorerEditor as EditorAPI;");
     await writeFile(modulePath, source);
     await import(pathToFileURL(modulePath).href);
