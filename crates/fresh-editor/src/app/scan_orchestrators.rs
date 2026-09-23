@@ -23,6 +23,15 @@ impl Editor {
     /// When `open_goto_line` is true (Go to Line flow), the Go to Line prompt
     /// opens automatically when the scan completes.
     pub fn start_incremental_line_scan(&mut self, open_goto_line: bool) {
+        self.start_line_scan(open_goto_line, true);
+    }
+
+    /// Start an automatic, non-intrusive line scan for a newly opened buffer.
+    pub(crate) fn start_automatic_line_scan(&mut self) {
+        self.start_line_scan(false, false);
+    }
+
+    fn start_line_scan(&mut self, open_goto_line: bool, announce_progress: bool) {
         let buffer_id = self.active_buffer();
         if let Some(state) = self
             .windows
@@ -39,8 +48,11 @@ impl Editor {
                 chunks,
                 total_bytes,
                 open_goto_line,
+                announce_progress,
             );
-            self.set_status_message(t!("goto.scanning_progress", percent = 0).to_string());
+            if announce_progress {
+                self.set_status_message(t!("goto.scanning_progress", percent = 0).to_string());
+            }
         }
     }
 
@@ -53,15 +65,16 @@ impl Editor {
             return false;
         };
 
+        let announce_progress = self.active_window().line_scan.announces_progress();
         if let Err(e) = self.process_line_scan_batch(buffer_id) {
             tracing::warn!("Line scan error: {e}");
-            self.finish_line_scan_with_error(e);
+            self.finish_line_scan_with_error(e, announce_progress);
             return true;
         }
 
         if self.active_window_mut().line_scan.is_done() {
-            self.finish_line_scan_ok();
-        } else {
+            self.finish_line_scan_ok(announce_progress);
+        } else if announce_progress {
             let pct = self.active_window_mut().line_scan.progress_percent();
             self.set_status_message(t!("goto.scanning_progress", percent = pct).to_string());
         }
@@ -186,7 +199,7 @@ impl Editor {
         Ok(())
     }
 
-    fn finish_line_scan_ok(&mut self) {
+    fn finish_line_scan_ok(&mut self, announce_progress: bool) {
         let _span = tracing::info_span!("finish_line_scan_ok").entered();
         let Some(finished) = self.active_window_mut().line_scan.take_finished() else {
             return;
@@ -207,17 +220,21 @@ impl Editor {
                 .buffer
                 .rebuild_with_pristine_saved_root(&finished.updates);
         }
-        self.set_status_message(t!("goto.scan_complete").to_string());
+        if announce_progress {
+            self.set_status_message(t!("goto.scan_complete").to_string());
+        }
         if finished.open_goto_line {
             self.open_goto_line_if_active(finished.buffer_id);
         }
     }
 
-    fn finish_line_scan_with_error(&mut self, e: std::io::Error) {
+    fn finish_line_scan_with_error(&mut self, e: std::io::Error, announce_progress: bool) {
         let Some(finished) = self.active_window_mut().line_scan.take_finished() else {
             return;
         };
-        self.set_status_message(t!("goto.scan_failed", error = e.to_string()).to_string());
+        if announce_progress {
+            self.set_status_message(t!("goto.scan_failed", error = e.to_string()).to_string());
+        }
         if finished.open_goto_line {
             self.open_goto_line_if_active(finished.buffer_id);
         }

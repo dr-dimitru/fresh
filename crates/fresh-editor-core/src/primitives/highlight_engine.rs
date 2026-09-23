@@ -26,11 +26,11 @@
 //! - **Cold start / fallback** — no cache, or none of the above applies;
 //!   parse the appropriate range from a fresh state or nearest checkpoint.
 //!
-//! For files at or below `MAX_PARSE_BYTES` the parse range is the whole
-//! file, so the cache is whole-file after the first parse and scrolling
-//! becomes filter-only. Larger files use a viewport-centred window of
-//! `±context_bytes` and rely on the forward-extension path to keep
-//! scroll-cost bounded.
+//! For ordinary buffers at or below `MAX_PARSE_BYTES` the parse range is the
+//! whole file, so the cache is whole-file after the first parse and scrolling
+//! becomes filter-only. Buffers in large-file mode, and larger ordinary
+//! buffers, use a viewport-centred window of `±context_bytes` and rely on the
+//! forward-extension path to keep scroll-cost bounded.
 //!
 //! Edits go through `notify_insert` / `notify_delete`, which shift cached
 //! span byte offsets in place, set `dirty_from`, and invalidate `tail_state`
@@ -745,11 +745,11 @@ fn prepare_unified_diff_content(
 /// no trailing newline, so the cache can never commit a safe tail state
 /// (see `extend_cache_forward`) and every render re-parses all of it —
 /// which is what pinned a CPU core on a 441 KB single-line JSON.
-/// Set to `MAX_PARSE_BYTES` deliberately: at or below that size the
-/// parse range is the whole file, so a huge line is parsed once and
-/// committed at EOF (exact colours, cached, no per-frame cost). Only
-/// past it — where the parse range is already a viewport window and the
-/// EOF commit cannot apply — is windowing the lesser evil.
+/// Set to `MAX_PARSE_BYTES` deliberately for ordinary buffers: at or below
+/// that size the parse range is the whole file, so a huge line is parsed once
+/// and committed at EOF (exact colours, cached, no per-frame cost). Buffers
+/// already in large-file mode use a viewport window regardless of this
+/// internal cutoff, so their line cost is bounded too.
 const MAX_HIGHLIGHT_LINE_BYTES: usize = MAX_PARSE_BYTES;
 
 /// Extra bytes parsed either side of the viewport inside an over-long
@@ -1703,12 +1703,19 @@ impl TextMateEngine {
         context_bytes: usize,
     ) -> Vec<HighlightSpan> {
         let buf_len = buffer.len();
-        let (desired_parse_start, parse_end) = if buf_len <= MAX_PARSE_BYTES {
-            (0, buf_len)
-        } else {
+        // The buffer's large-file mode is an explicit user-facing decision
+        // to keep work viewport-bounded. Do not replace it with the
+        // highlighter's internal byte cutoff: a large-file threshold can be
+        // lower than MAX_PARSE_BYTES, and lazy buffers must not trigger a
+        // whole-file TextMate parse merely because their current length is
+        // below that internal limit.
+        let windowed_parse = buffer.is_large_file() || buf_len > MAX_PARSE_BYTES;
+        let (desired_parse_start, parse_end) = if windowed_parse {
             let s = viewport_start.saturating_sub(context_bytes);
-            let e = (viewport_end + context_bytes).min(buf_len);
+            let e = viewport_end.saturating_add(context_bytes).min(buf_len);
             (s, e)
+        } else {
+            (0, buf_len)
         };
 
         let dirty = self.dirty_from.take();
@@ -1759,6 +1766,7 @@ impl TextMateEngine {
                         viewport_start,
                         viewport_end,
                         theme,
+                        windowed_parse,
                     ) {
                         return result;
                     }
@@ -1782,6 +1790,7 @@ impl TextMateEngine {
             viewport_end,
             theme,
             context_bytes,
+            windowed_parse,
         )
     }
 
@@ -1822,6 +1831,7 @@ impl TextMateEngine {
         viewport_start: usize,
         viewport_end: usize,
         theme: &Theme,
+        windowed_parse: bool,
     ) -> Option<Vec<HighlightSpan>> {
         let syntax = &self.syntax_set.syntaxes()[self.syntax_index];
 
@@ -1836,10 +1846,13 @@ impl TextMateEngine {
                 } else {
                     return None; // orphan, fall back
                 }
-            } else if parse_end <= MAX_PARSE_BYTES {
+            } else if !windowed_parse && parse_end <= MAX_PARSE_BYTES {
                 (0, ParseSnapshot::new(syntax))
             } else {
-                return None; // large file, no nearby checkpoint, fall back
+                // A windowed parse has no trustworthy state before its
+                // start. Returning to full_parse keeps the fallback bounded
+                // at desired_parse_start instead of scanning from byte zero.
+                return None;
             }
         };
 
@@ -2171,6 +2184,7 @@ impl TextMateEngine {
         viewport_end: usize,
         theme: &Theme,
         _context_bytes: usize,
+        windowed_parse: bool,
     ) -> Vec<HighlightSpan> {
         self.stats.cache_misses += 1;
         self.dirty_from = None; // consumed
@@ -2181,7 +2195,7 @@ impl TextMateEngine {
 
         let syntax = &self.syntax_set.syntaxes()[self.syntax_index];
         let (actual_start, mut snapshot, create_checkpoints) =
-            self.find_parse_resume_point(desired_parse_start, parse_end, syntax);
+            self.find_parse_resume_point(desired_parse_start, parse_end, syntax, windowed_parse);
 
         let content = buffer.slice_bytes(actual_start..parse_end);
         let content_str = match std::str::from_utf8(&content) {
@@ -2367,6 +2381,7 @@ impl TextMateEngine {
         desired_start: usize,
         parse_end: usize,
         syntax: &syntect::parsing::SyntaxReference,
+        windowed_parse: bool,
     ) -> (usize, ParseSnapshot, bool) {
         // Look for a checkpoint near the desired start. For large files, only
         // consider checkpoints that are within MAX_PARSE_BYTES of desired_start
@@ -2383,12 +2398,15 @@ impl TextMateEngine {
             }
         }
 
-        if parse_end <= MAX_PARSE_BYTES {
-            // File is small enough to parse from byte 0
+        if !windowed_parse && parse_end <= MAX_PARSE_BYTES {
+            // Non-windowed buffer is small enough to parse from byte 0.
             (0, ParseSnapshot::new(syntax), true)
         } else {
-            // Large file, no nearby checkpoint — start fresh from desired_start.
-            // Still create checkpoints so future visits to this region can resume.
+            // Windowed buffer, or a file above the internal cutoff, has no
+            // trustworthy state before desired_start. Start there rather than
+            // turning a small viewport request into a deep scan from byte 0.
+            // Still create checkpoints so future visits to this region can
+            // resume.
             (desired_start, ParseSnapshot::new(syntax), true)
         }
     }
@@ -2485,6 +2503,7 @@ impl TextMateEngine {
             0
         };
         let parse_end = range.end.saturating_add(lookahead).min(buffer.len());
+        let windowed_parse = buffer.is_large_file() || buffer.len() > MAX_PARSE_BYTES;
         if range.start >= parse_end {
             return StructureLines::default();
         }
@@ -2516,11 +2535,11 @@ impl TextMateEngine {
                 Some(snap) => (cp_pos, snap.clone()),
                 None => return StructureLines::default(), // orphaned checkpoint
             },
-            None if parse_end <= MAX_PARSE_BYTES => (
+            None if !windowed_parse && parse_end <= MAX_PARSE_BYTES => (
                 0,
                 ParseSnapshot::new(&self.syntax_set.syntaxes()[self.syntax_index]),
             ),
-            None => return StructureLines::default(), // large file, no anchor: unknown
+            None => return StructureLines::default(), // windowed file, no anchor: unknown
         };
 
         // Bound the walk itself, not just the anchor search. An edit high in a
@@ -3904,6 +3923,61 @@ diff --git a/tools/check.py b/tools/check.py
         );
     }
 
+    /// A buffer opened in large-file mode must keep the Markdown highlighter
+    /// viewport-bounded even when its byte length is below the highlighter's
+    /// internal whole-file threshold. The user-facing large-file threshold
+    /// is intentionally allowed to be lower than that internal threshold.
+    #[test]
+    fn test_large_markdown_buffer_edit_does_not_reparse_whole_line() {
+        let registry =
+            GrammarRegistry::load(&crate::primitives::grammar::LocalGrammarLoader::embedded_only());
+        let mut engine = HighlightEngine::for_file(Path::new("large.md"), None, &registry);
+        let theme = Theme::load_builtin(theme::THEME_LIGHT).unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let content = "word ".repeat(200_000);
+        std::fs::write(tmp.path(), &content).unwrap();
+        let mut buffer = Buffer::load_from_file(tmp.path(), 1, test_fs()).unwrap();
+        assert!(buffer.is_large_file());
+        // The editor loads the visible chunk before highlighting. Load the
+        // complete fixture here so the test measures parser work, not a
+        // deliberately unread lazy piece.
+        let _ = buffer.get_text_range_mut(0, buffer.len()).unwrap();
+
+        let HighlightEngine::TextMate(ref mut tm) = engine else {
+            panic!("expected TextMate engine for .md");
+        };
+        let _ = tm.highlight_viewport(&buffer, 0, 1_000, &theme, 0);
+        let bytes_before = tm.stats().bytes_parsed;
+
+        buffer.insert(0, "X");
+        tm.notify_insert(0, 1);
+        let _ = tm.highlight_viewport(&buffer, 0, 1_000, &theme, 0);
+
+        let parsed = tm.stats().bytes_parsed - bytes_before;
+        assert!(
+            parsed < 100_000,
+            "editing a large Markdown line should parse only the viewport window, not \
+             the whole {}-byte line (parsed {parsed} bytes)",
+            content.len()
+        );
+
+        // A deep viewport must not take the small-window fallback through
+        // byte zero just because this buffer is below MAX_PARSE_BYTES.
+        let mut deep_engine = HighlightEngine::for_file(Path::new("large.md"), None, &registry);
+        let HighlightEngine::TextMate(ref mut deep_tm) = deep_engine else {
+            panic!("expected TextMate engine for .md");
+        };
+        let deep_start = 900_000;
+        let _ = deep_tm.highlight_viewport(&buffer, deep_start, deep_start + 1_000, &theme, 0);
+        let deep_parsed = deep_tm.stats().bytes_parsed;
+        assert!(
+            deep_parsed < 100_000,
+            "a deep large-file viewport must not fall back to byte zero \
+             (parsed {deep_parsed} bytes)"
+        );
+    }
+
     /// Embedded highlighting must keep working past MAX_PARSE_BYTES — the
     /// whole point of integrating regions into the windowed/checkpointed
     /// engine instead of a full-buffer scan with a size cutoff.
@@ -4914,10 +4988,7 @@ diff --git a/tools/check.py b/tools/check.py
     /// viewport, not the whole file.
     ///
     /// The viewport is placed past `MAX_PARSE_BYTES` so we exercise the
-    /// "large file, no nearby checkpoint" branch in `find_parse_resume_point`
-    /// — the symmetric branch that fires when `parse_end <= MAX_PARSE_BYTES`
-    /// still parses from byte 0 even on big files (pre-existing behaviour,
-    /// addressed in a later phase).
+    /// "large file, no nearby checkpoint" branch in `find_parse_resume_point`.
     #[test]
     fn test_large_file_uses_windowed_parse() {
         let registry =
@@ -4941,8 +5012,8 @@ diff --git a/tools/check.py b/tools/check.py
             panic!("expected TextMate engine for .rs");
         };
 
-        // Viewport past MAX_PARSE_BYTES: parse_end > MAX_PARSE_BYTES, so the
-        // resume-from-byte-0 fallback in find_parse_resume_point doesn't fire.
+        // Viewport past MAX_PARSE_BYTES: the windowed parse starts from the
+        // viewport when no nearby checkpoint is available.
         let context_bytes = 10_000usize;
         let viewport_start = MAX_PARSE_BYTES + 200_000;
         let viewport_end = viewport_start + 1000;

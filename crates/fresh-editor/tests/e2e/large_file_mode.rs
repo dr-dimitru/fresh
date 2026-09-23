@@ -16,6 +16,35 @@ fn force_large_file_config() -> fresh::config::Config {
     }
 }
 
+/// Opening a large file with line numbers enabled starts the bounded line
+/// scan automatically, so the gutter switches from byte offsets to logical
+/// line numbers without requiring an edit or an explicit Go to Line action.
+#[test]
+fn test_large_file_open_automatically_indexes_lines_for_gutter() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("large.txt");
+    fs::write(&path, "first line\nsecond line\nthird line\n").unwrap();
+
+    let mut config = force_large_file_config();
+    config.editor.large_file_threshold_bytes = 1;
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(80, 24, config, temp.path().to_path_buf())
+            .unwrap();
+    harness.open_file(&path).unwrap();
+
+    harness
+        .wait_until(|h| h.screen_to_string().contains(" 1 │ first line"))
+        .unwrap();
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains(" 2 │ second line"),
+        "gutter should show logical line numbers after automatic scan:\n{screen}"
+    );
+}
+
 /// Test cursor positioning when moving down in large file mode
 /// This test catches a bug where cursor movement with Down arrow key
 /// doesn't work correctly after the first few lines in large file mode
@@ -1170,20 +1199,11 @@ fn test_edit_scan_edit_line_numbers_stay_exact() {
     );
 }
 
-/// End-to-end test: gutter indicators appear in byte-offset mode (no line scan).
-///
-/// In large file mode without a line scan, the editor is in byte-offset mode
-/// (no line numbers).  Native diff indicators should still appear because
-/// `diff_indicators_for_viewport` works purely with byte ranges — it scans
-/// viewport bytes for `\n` to find line starts, with no line metadata needed.
-///
-/// Flow:
-///   1. Open a large file (>11 MB) — editor enters byte-offset mode
-///   2. Verify byte-offset mode (no line numbers)
-///   3. Make edits on three separate lines
-///   4. Verify gutter indicators appear on all edited lines (no line scan!)
+/// End-to-end test: large-file gutter indicators appear after automatic line
+/// indexing. The native diff path still computes the indicators from byte
+/// ranges; automatic indexing supplies logical labels without requiring edits.
 #[test]
-fn test_large_file_gutter_indicators_byte_offset_mode() {
+fn test_large_file_gutter_indicators_after_automatic_indexing() {
     use std::fs;
     use tempfile::TempDir;
 
@@ -1270,11 +1290,11 @@ fn test_large_file_gutter_indicators_byte_offset_mode() {
         .wait_until(|h| h.screen_to_string().contains("large.txt"))
         .unwrap();
 
-    // ── Step 1: Verify byte-offset mode ──
+    // ── Step 1: Automatic line scan completed ──
     let screen = harness.screen_to_string();
     assert!(
-        screen.contains("Byte 0"),
-        "Should be in byte-offset mode (no line scan).\nScreen:\n{}",
+        screen.contains("Ln 1, Col 1"),
+        "Opening a large file should automatically build logical line numbers.\nScreen:\n{}",
         screen
     );
 
@@ -1311,20 +1331,13 @@ fn test_large_file_gutter_indicators_byte_offset_mode() {
         .unwrap();
     harness.render().unwrap();
 
-    // ── Step 4: Verify indicators appear without line scan ──
+    // ── Step 4: Verify indicators appear after automatic line scan ──
     let screen = harness.screen_to_string();
     let indicators = count_gutter_indicators(&screen, "│");
     let indicator_lines = get_indicator_lines(&screen, "│");
     println!(
-        "=== Byte-offset mode indicators ===\nCount: {}\nLines: {:?}\nScreen:\n{}",
+        "=== Automatically indexed indicators ===\nCount: {}\nLines: {:?}\nScreen:\n{}",
         indicators, indicator_lines, screen
-    );
-
-    // Still in byte-offset mode
-    assert!(
-        screen.contains("Byte 0"),
-        "Should still be in byte-offset mode.\nScreen:\n{}",
-        screen
     );
 
     // All three edits should be visible
@@ -1360,21 +1373,11 @@ fn test_large_file_gutter_indicators_byte_offset_mode() {
     );
 }
 
-/// End-to-end test: large file mode gutter indicators appear after enabling line scan.
-///
-/// In large file mode, gutter indicators are computed natively from
-/// `diff_since_saved()` byte ranges during rendering.  After line scanning
-/// completes, line numbers become available in the gutter.
-///
-/// Flow:
-///   1. Open a large file (>11 MB threshold) – editor enters byte-offset mode
-///   2. Make edits on several lines – track which lines are edited
-///   3. Enable line scanning via Ctrl+G → "y" → line number → Enter
-///   4. Verify that the gutter now shows line numbers (not byte offsets)
-///   5. Verify that ALL previously-edited lines have gutter indicators
+/// End-to-end test: automatic line indexing preserves gutter indicators for
+/// edits in a large file.
 #[test]
 #[cfg(feature = "plugins")]
-fn test_large_file_gutter_indicators_after_line_scan() {
+fn test_large_file_gutter_indicators_after_automatic_line_scan() {
     use crossterm::event::KeyModifiers;
     use std::fs;
     use tempfile::TempDir;
@@ -1473,11 +1476,11 @@ fn test_large_file_gutter_indicators_after_line_scan() {
         .wait_until(|h| h.screen_to_string().contains("large.txt"))
         .unwrap();
 
-    // ── Step 1: Verify byte-offset mode (large file, no line scan yet) ──
+    // ── Step 1: Verify automatic line indexing ──
     let screen = harness.screen_to_string();
     assert!(
-        screen.contains("Byte 0"),
-        "Should be in byte-offset mode before scanning.\nScreen:\n{}",
+        screen.contains("Ln 1, Col 1"),
+        "Opening a large file should automatically build logical line numbers.\nScreen:\n{}",
         screen
     );
 
@@ -1534,40 +1537,16 @@ fn test_large_file_gutter_indicators_after_line_scan() {
         "EDIT_C should be visible on screen"
     );
 
-    // ── Step 3: Enable line scanning via Ctrl+G → "y" ──
-    harness
-        .send_key(KeyCode::Char('g'), KeyModifiers::CONTROL)
-        .unwrap();
-    let screen = harness.screen_to_string();
-    assert!(
-        screen.contains("Scan file"),
-        "Ctrl+G should show scan confirmation prompt.\nScreen:\n{}",
-        screen
-    );
-
-    // Answer "y" to start scanning
-    let _ = harness.type_text("s");
-
-    // Drive incremental scan to completion
-    while harness.editor_mut().process_line_scan() {}
-
-    // The Go To Line prompt opens after the scan – type a line number and press Enter
-    // (this also tests that Go To Line works after scanning)
-    let _ = harness.type_text("1");
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
-        .unwrap();
-
-    // ── Step 4: Verify line-number mode ──
+    // ── Step 3: Verify automatic line-number mode ──
     harness.render().unwrap();
     let screen = harness.screen_to_string();
     assert!(
         screen.contains("Ln "),
-        "After scanning, status bar should show 'Ln' not 'Byte'.\nScreen:\n{}",
+        "Automatic indexing should replace byte offsets with line numbers.\nScreen:\n{}",
         screen
     );
 
-    // ── Step 5: Trigger plugin re-evaluation ──
+    // ── Step 4: Trigger plugin re-evaluation ──
     // Make a tiny no-op edit (type + backspace) on line 1 to trigger
     // reapplyIndicatorsFromDiff which now has byte_ranges available.
     harness

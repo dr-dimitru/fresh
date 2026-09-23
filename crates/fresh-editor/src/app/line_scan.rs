@@ -35,6 +35,7 @@ struct Active {
     scanned_bytes: usize,
     updates: Vec<(usize, usize)>,
     open_goto_line_on_complete: bool,
+    announce_progress: bool,
 }
 
 /// Owner of the optional in-flight line-feed scan.
@@ -58,6 +59,11 @@ impl LineScan {
             Some(a) => a.next_chunk >= a.chunks.len(),
             None => true,
         }
+    }
+
+    /// Whether this scan may replace the status message with progress.
+    pub(crate) fn announces_progress(&self) -> bool {
+        self.active.as_ref().is_some_and(|a| a.announce_progress)
     }
 
     /// Progress percent (0..=100), or 100 when there is nothing to scan.
@@ -89,6 +95,7 @@ impl LineScan {
         chunks: Vec<LineScanChunk>,
         total_bytes: usize,
         open_goto_line_on_complete: bool,
+        announce_progress: bool,
     ) {
         self.active = Some(Active {
             buffer_id,
@@ -99,6 +106,7 @@ impl LineScan {
             scanned_bytes: 0,
             updates: Vec::new(),
             open_goto_line_on_complete,
+            announce_progress,
         });
     }
 
@@ -154,7 +162,7 @@ mod tests {
 
     fn empty_scan_of(chunks: Vec<LineScanChunk>, total_bytes: usize) -> LineScan {
         let mut s = LineScan::default();
-        s.start(BufferId(1), Vec::new(), chunks, total_bytes, false);
+        s.start(BufferId(1), Vec::new(), chunks, total_bytes, false, true);
         s
     }
 
@@ -233,7 +241,7 @@ mod tests {
     #[test]
     fn open_goto_line_flag_round_trips() {
         let mut s = LineScan::default();
-        s.start(BufferId(2), Vec::new(), Vec::new(), 0, true);
+        s.start(BufferId(2), Vec::new(), Vec::new(), 0, true, true);
         let finished = s.take_finished().unwrap();
         assert!(finished.open_goto_line);
     }

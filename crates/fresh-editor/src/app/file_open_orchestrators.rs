@@ -241,6 +241,18 @@ impl Editor {
                 Some(t!("buffer.opened", name = display_name).to_string());
         }
 
+        // Large-file buffers begin without line metadata, which makes the
+        // gutter show byte offsets. When the active split requests line
+        // numbers, build that metadata incrementally after opening so the
+        // gutter converges to logical line numbers without requiring an edit
+        // or an explicit Go to Line scan.
+        if self.active_window().is_line_numbers_visible()
+            && self.active_state().buffer.is_large_file()
+            && !self.active_buffer_has_line_index()
+        {
+            self.start_automatic_line_scan();
+        }
+
         Ok(buffer_id)
     }
 
