@@ -811,10 +811,14 @@ impl crate::app::Editor {
         // this, plugins that read `editor.getCwd()` — Live Grep, file
         // finders, etc. — keep targeting the previous window's project
         // after a dive, surfacing the wrong project's files.
-        // The announcer fires `active_window_changed` and — the part this
-        // path used to forget (sinelaw/fresh#3326) — `buffer_deactivated` /
-        // `buffer_activated` for the incoming window's buffer, so plugins
-        // tracking "the active buffer" follow a dive like a tab switch.
+        #[cfg(feature = "plugins")]
+        {
+            self.active_window_mut()
+                .invalidate_file_explorer_scope_fingerprint();
+            self.refresh_file_explorer_scope_and_notify_plugins();
+        }
+        // The announcer fires `active_window_changed` and the incoming
+        // buffer focus hooks after the snapshot is refreshed.
         self.announce_focus();
 
         // Bring `terminal_mode` in line with the incoming window's active

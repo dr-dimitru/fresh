@@ -3643,6 +3643,8 @@ impl Editor {
             }
             UiFact::ExplorerScrollTo(offset) => {
                 self.active_window_mut().scroll_file_explorer_to(offset);
+                #[cfg(feature = "plugins")]
+                self.refresh_file_explorer_scope_and_notify_plugins();
             }
 
             UiFact::MenuItemClick { depth, index } => {

@@ -3352,6 +3352,40 @@ impl Editor {
         })
     }
 
+    /// Refresh the Explorer's model viewport height from current shell layout
+    /// state before plugin scope snapshots are published.
+    pub(crate) fn update_file_explorer_viewport_height_from_layout(&mut self) {
+        if !self.file_explorer_visible() {
+            return;
+        }
+
+        let flags = self.bottom_row_flags();
+        let menu_bar = self.active_window().menu_bar_visible;
+        let status_bar = self.active_window().status_bar_visible
+            && !flags.has_suggestions
+            && !flags.has_file_browser;
+        let search_options = self.search_options_content().is_some();
+        let fixed = crate::view::shell::frame::fixed_rows(
+            menu_bar,
+            status_bar,
+            search_options,
+            flags.prompt_row_visible,
+        );
+        let size = ratatui::layout::Rect::new(0, 0, self.terminal_width, self.terminal_height);
+        let (_, chrome_area) = self.compute_dock_split(size);
+        let sidebar_height = chrome_area.height.saturating_sub(fixed);
+        let rows = self.resolve_sidebar_sections(sidebar_height);
+        let explorer_rows = self
+            .sidebar_sections
+            .iter()
+            .position(|section| section.is_explorer())
+            .and_then(|index| rows.get(index).copied())
+            .unwrap_or(0) as usize;
+        if let Some(view) = self.file_explorer_mut() {
+            view.set_viewport_height(explorer_rows);
+        }
+    }
+
     /// The explorer as a section: its chrome, and its rows for a body
     /// `rows` tall.
     fn explorer_section(&mut self, rows: u16) -> ExplorerSection {

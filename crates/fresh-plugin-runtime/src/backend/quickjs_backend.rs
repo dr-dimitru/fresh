@@ -1241,6 +1241,23 @@ impl JsEditorApi {
             .unwrap_or(0)
     }
 
+    /// Read the current File Explorer scope snapshot, or `null` while hidden or uninitialized.
+    #[plugin_api(ts_return = "FileExplorerScope | null")]
+    pub fn get_file_explorer_scope<'js>(
+        &self,
+        ctx: rquickjs::Ctx<'js>,
+    ) -> rquickjs::Result<rquickjs::Value<'js>> {
+        let scope = self
+            .state_snapshot
+            .read()
+            .ok()
+            .and_then(|state| state.file_explorer_scope.clone());
+        rquickjs_serde::to_value(ctx, scope)
+            .map_err(|error| {
+                rquickjs::Error::new_from_js_message("serialize", "", &error.to_string())
+            })
+    }
+
     /// Get the active split ID
     pub fn get_active_split_id(&self) -> u32 {
         self.state_snapshot
@@ -10465,7 +10482,7 @@ impl QuickJsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fresh_core::api::{BufferInfo, CursorInfo};
+    use fresh_core::api::{BufferInfo, CursorInfo, FileExplorerScope};
     use std::sync::mpsc;
 
     /// Helper to create a backend with a command receiver for testing
@@ -10475,6 +10492,41 @@ mod tests {
         let services = Arc::new(TestServiceBridge::new());
         let backend = QuickJsBackend::with_state(state_snapshot, tx, services).unwrap();
         (backend, rx)
+    }
+
+    #[test]
+    fn get_file_explorer_scope_returns_snapshot_or_null() {
+        let (mut backend, _rx) = create_test_backend();
+        let mut snapshot = backend.state_snapshot.write().unwrap();
+        snapshot.file_explorer_scope = Some(FileExplorerScope {
+            root: "/workspace".into(),
+            revision: 7,
+            visible_paths: vec!["/workspace/src".into()],
+            expanded_directories: vec!["/workspace".into()],
+        });
+        drop(snapshot);
+        backend
+            .execute_js(
+                r#"
+                    const scope = getEditor().getFileExplorerScope();
+                    globalThis._scope = JSON.stringify(scope);
+                "#,
+                "scope-test.ts",
+            )
+            .unwrap();
+        backend
+            .plugin_contexts
+            .borrow()
+            .get("scope-test")
+            .unwrap()
+            .clone()
+            .with(|ctx| {
+                let scope: String = ctx.globals().get("_scope").unwrap();
+                assert_eq!(
+                    scope,
+                    r#"{"root":"/workspace","revision":7,"visiblePaths":["/workspace/src"],"expandedDirectories":["/workspace"]}"#
+                );
+            });
     }
 
     struct TestServiceBridge {

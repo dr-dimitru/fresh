@@ -435,6 +435,8 @@ impl Editor {
     /// "did this actually change the layout?" — they just call `relayout`.
     pub fn relayout(&mut self) {
         self.push_layout_geometry();
+        #[cfg(feature = "plugins")]
+        self.refresh_file_explorer_scope_and_notify_plugins();
         self.notify_layout_changed();
     }
 

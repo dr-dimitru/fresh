@@ -48,6 +48,12 @@ pub enum SortMode {
     Modified,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileExplorerScopePaths {
+    pub visible_paths: Vec<PathBuf>,
+    pub expanded_directories: Vec<PathBuf>,
+}
+
 impl FileTreeView {
     /// Create a new file tree view
     pub fn new(tree: FileTree) -> Self {
@@ -330,6 +336,31 @@ impl FileTreeView {
         self.sticky_indices(&visible, scroll_offset, self.viewport_height)
     }
 
+    pub(crate) fn plugin_scope_paths(&self) -> FileExplorerScopePaths {
+        let display = self.get_display_nodes();
+        let mut visible_paths: Vec<PathBuf> = self
+            .viewport_display_indices()
+            .into_iter()
+            .filter_map(|index| display.get(index).map(|(id, _)| *id))
+            .filter_map(|id| self.tree.get_node(id).map(|node| node.entry.path.clone()))
+            .collect();
+        visible_paths.sort();
+        visible_paths.dedup();
+
+        let mut expanded_directories: Vec<PathBuf> = self
+            .tree
+            .all_nodes()
+            .filter(|node| node.is_dir() && node.is_expanded())
+            .map(|node| node.entry.path.clone())
+            .collect();
+        expanded_directories.sort();
+        expanded_directories.dedup();
+
+        FileExplorerScopePaths {
+            visible_paths,
+            expanded_directories,
+        }
+    }
     fn viewport_display_indices_with_nodes(
         &self,
         visible: &[NodeId],
@@ -1128,6 +1159,53 @@ mod tests {
         view.set_compact_directories(false);
         view.set_viewport_height(5);
         (temp_dir, view)
+    }
+
+    async fn populated_scrolled_tree_view() -> (TempDir, FileTreeView) {
+        let (temp_dir, mut view) = create_test_view().await;
+        let root_id = view.tree().root_id();
+        view.tree_mut().expand_node(root_id).await.unwrap();
+        let dir1_path = temp_dir.path().join("dir1");
+        let dir1_id = view.tree().get_node_by_path(&dir1_path).unwrap().id;
+        view.tree_mut().expand_node(dir1_id).await.unwrap();
+        view.set_viewport_height(3);
+        view.set_scroll_offset(2);
+        (temp_dir, view)
+    }
+
+    #[tokio::test]
+    async fn plugin_scope_paths_uses_rendered_rows_and_expanded_directories() {
+        let (temp_dir, mut view) = create_test_view().await;
+        let root_id = view.tree().root_id();
+        view.tree_mut().expand_node(root_id).await.unwrap();
+        view.set_viewport_height(2);
+
+        let scope = view.plugin_scope_paths();
+
+        assert_eq!(scope.visible_paths.len(), 2);
+        assert_eq!(scope.visible_paths[0], temp_dir.path());
+        assert_eq!(
+            scope.expanded_directories,
+            vec![temp_dir.path().to_path_buf()]
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_scope_paths_includes_sticky_ancestor_once_after_scroll() {
+        let (_temp_dir, view) = populated_scrolled_tree_view().await;
+
+        let scope = view.plugin_scope_paths();
+
+        assert_eq!(scope.visible_paths.len(), 3);
+        assert_eq!(
+            scope
+                .visible_paths
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
+        assert!(scope.visible_paths.iter().any(|path| path.ends_with("dir1")));
     }
 
     #[tokio::test]

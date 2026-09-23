@@ -1,8 +1,216 @@
 use crate::common::git_test_helper::GitTestRepo;
-use crate::common::harness::EditorTestHarness;
+use crate::common::harness::{copy_plugin_lib, EditorTestHarness};
 use crossterm::event::{KeyCode, KeyModifiers};
 use fresh::config::Config;
 use std::fs;
+use std::path::Path;
+
+#[derive(Debug, Clone, Copy)]
+struct ScopeProbeStatus {
+    events: usize,
+    revision: Option<u64>,
+    visible_rows: usize,
+    root_visible: bool,
+}
+
+fn install_scope_probe(config: &mut Config, plugins_dir: &Path) {
+    fs::create_dir_all(plugins_dir).unwrap();
+    copy_plugin_lib(plugins_dir);
+    let plugin_path = plugins_dir.join("file_explorer_scope_probe.ts");
+    fs::write(
+        &plugin_path,
+        r###"
+/// <reference path="./lib/fresh.d.ts" />
+const editor = getEditor();
+let scopeEvents = 0;
+
+editor.on("file_explorer_scope_changed", () => {
+  scopeEvents += 1;
+  const scope = editor.getFileExplorerScope();
+  const revision = scope === null ? "null" : scope.revision;
+  const visibleRows = scope === null ? 0 : scope.visiblePaths.length;
+  const rootVisible = scope !== null && scope.visiblePaths.includes(scope.root);
+  editor.setStatus(`scope-event=${scopeEvents};revision=${revision};rows=${visibleRows};root=${rootVisible}`);
+});
+"###,
+    )
+    .unwrap();
+    config.plugins.insert(
+        "file_explorer_scope_probe".to_string(),
+        fresh_core::config::PluginConfig {
+            enabled: true,
+            path: Some(plugin_path),
+            ..Default::default()
+        },
+    );
+}
+
+fn scope_probe_status(screen: &str) -> Option<ScopeProbeStatus> {
+    let token = screen
+        .split_whitespace()
+        .find(|token| token.starts_with("scope-event="))?;
+    let mut fields = token.split(';');
+    let events = fields
+        .next()?
+        .strip_prefix("scope-event=")?
+        .parse()
+        .ok()?;
+    let revision = match fields.next()?.strip_prefix("revision=")? {
+        "null" => None,
+        revision => Some(revision.parse().ok()?),
+    };
+    let visible_rows = fields
+        .next()?
+        .strip_prefix("rows=")?
+        .parse()
+        .ok()?;
+    let root_visible = fields.next()?.strip_prefix("root=")?.parse().ok()?;
+    Some(ScopeProbeStatus {
+        events,
+        revision,
+        visible_rows,
+        root_visible,
+    })
+}
+
+fn wait_for_non_null_scope(harness: &mut EditorTestHarness) -> ScopeProbeStatus {
+    let mut frames = 0;
+    harness
+        .wait_until(|h| {
+            frames += 1;
+            scope_probe_status(&h.screen_to_string()).is_some_and(|status| status.revision.is_some())
+                || frames >= 10
+        })
+        .unwrap();
+    scope_probe_status(&harness.screen_to_string())
+        .filter(|status| status.revision.is_some())
+        .expect("File Explorer scope hook should publish a visible snapshot")
+}
+
+fn wait_for_scope_event_after(
+    harness: &mut EditorTestHarness,
+    event_count: usize,
+) -> ScopeProbeStatus {
+    let mut frames = 0;
+    harness
+        .wait_until(|h| {
+            frames += 1;
+            scope_probe_status(&h.screen_to_string())
+                .is_some_and(|status| status.events > event_count)
+                || frames >= 10
+        })
+        .unwrap();
+    scope_probe_status(&harness.screen_to_string())
+        .filter(|status| status.events > event_count)
+        .unwrap_or_else(|| {
+            panic!(
+                "Explorer scope change should invoke the plugin hook after {event_count} events.\n{}",
+                harness.screen_to_string()
+            )
+        })
+}
+
+#[test]
+fn file_explorer_scope_hook_fires_once_for_expand_and_once_for_collapse() {
+    let project = tempfile::TempDir::new().unwrap();
+    let project_root = project.path().to_path_buf();
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let _data_dir_pin = crate::common::global_state::pin_data_dir(data_dir.path());
+    fs::create_dir(project_root.join("packages")).unwrap();
+    fs::write(project_root.join("packages/visible.txt"), "visible").unwrap();
+
+    let mut config = Config::default();
+    install_scope_probe(&mut config, &project_root.join("plugins"));
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 40, config, project_root).unwrap();
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+
+    let initial = wait_for_non_null_scope(&mut harness);
+    let initial_revision = initial.revision.unwrap();
+    harness.editor_mut().file_explorer_toggle_expand();
+    let collapsed = wait_for_scope_event_after(&mut harness, initial.events);
+    assert_eq!(collapsed.events, initial.events + 1);
+    assert_eq!(collapsed.revision, Some(initial_revision + 1));
+
+    harness.editor_mut().file_explorer_toggle_expand();
+    let expanded = wait_for_scope_event_after(&mut harness, collapsed.events);
+    assert_eq!(expanded.events, collapsed.events + 1);
+    assert_eq!(expanded.revision, Some(initial_revision + 2));
+
+    harness.editor_mut().toggle_file_explorer();
+    let hidden = wait_for_scope_event_after(&mut harness, expanded.events);
+    assert_eq!(hidden.revision, None);
+
+    harness.editor_mut().toggle_file_explorer();
+    let shown = wait_for_non_null_scope(&mut harness);
+    assert!(shown.events > hidden.events);
+    assert!(shown.revision.unwrap() > initial_revision + 2);
+}
+
+#[test]
+fn file_explorer_scope_hook_tracks_filter_and_sticky_scroll_rows() {
+    let project = tempfile::TempDir::new().unwrap();
+    let project_root = project.path().to_path_buf();
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let _data_dir_pin = crate::common::global_state::pin_data_dir(data_dir.path());
+    fs::write(project_root.join("alpha.txt"), "alpha").unwrap();
+    fs::write(project_root.join("beta.txt"), "beta").unwrap();
+    fs::write(project_root.join(".hidden.txt"), "hidden").unwrap();
+    let mut config = Config::default();
+    install_scope_probe(&mut config, &project_root.join("plugins"));
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 40, config, project_root).unwrap();
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+
+    let initial = wait_for_non_null_scope(&mut harness);
+    harness.editor_mut().file_explorer_toggle_hidden();
+    let filtered = wait_for_scope_event_after(&mut harness, initial.events);
+    assert_eq!(filtered.events, initial.events + 1);
+    assert_eq!(filtered.revision, Some(initial.revision.unwrap() + 1));
+    assert!(filtered.visible_rows > initial.visible_rows);
+}
+
+#[test]
+fn file_explorer_scope_hook_tracks_scrolling_with_sticky_root() {
+    let project = tempfile::TempDir::new().unwrap();
+    let project_root = project.path().to_path_buf();
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let _data_dir_pin = crate::common::global_state::pin_data_dir(data_dir.path());
+    for index in 0..24 {
+        fs::write(
+            project_root.join(format!("file{index:02}.txt")),
+            "content",
+        )
+        .unwrap();
+    }
+    let mut config = Config::default();
+    install_scope_probe(&mut config, &project_root.join("plugins"));
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 10, config, project_root).unwrap();
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+
+    let initial = wait_for_non_null_scope(&mut harness);
+    for _ in 0..24 {
+        harness.send_key(KeyCode::Down, KeyModifiers::empty()).unwrap();
+        harness.render().unwrap();
+    }
+    let mut frames = 0;
+    harness
+        .wait_until(|h| {
+            frames += 1;
+            scope_probe_status(&h.screen_to_string()).is_some_and(|status| {
+                status.revision.is_some_and(|revision| revision > initial.revision.unwrap())
+                    && status.root_visible
+            }) || frames >= 10
+        })
+        .unwrap();
+    let scrolled = scope_probe_status(&harness.screen_to_string()).unwrap();
+    assert!(scrolled.events > initial.events);
+    assert!(scrolled.root_visible);
+}
 
 /// Test file explorer toggle
 #[test]

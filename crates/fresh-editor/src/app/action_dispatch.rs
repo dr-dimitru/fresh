@@ -2040,6 +2040,9 @@ impl Editor {
             }
         }
 
+        #[cfg(feature = "plugins")]
+        self.refresh_file_explorer_scope_and_notify_plugins();
+
         Ok(())
     }
 

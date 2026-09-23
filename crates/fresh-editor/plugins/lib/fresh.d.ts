@@ -2755,6 +2755,12 @@ type DiffBaselineResult = {
 	*/
 	hunks: Array<LineDiffHunk>;
 };
+type FileExplorerScope = {
+	root: string;
+	revision: number;
+	visiblePaths: Array<string>;
+	expandedDirectories: Array<string>;
+};
 type GrepMatch = {
 	/**
 	* Absolute file path
@@ -3046,6 +3052,10 @@ interface EditorAPI {
 	* Get the active buffer ID (0 if none)
 	*/
 	getActiveBufferId(): number;
+	/**
+	* Read the current File Explorer scope snapshot, or `null` while hidden or uninitialized.
+	*/
+	getFileExplorerScope(): FileExplorerScope | null;
 	/**
 	* Get the active split ID
 	*/
@@ -5770,6 +5780,8 @@ interface HookEventMap {
 	after_file_explorer_change: {
 		path: string;
 	};
+	/** The visible Explorer scope changed; read it with `getFileExplorerScope()`. */
+	file_explorer_scope_changed: Record<string, never>;
 	// ── text edits ───────────────────────────────────────────────────────────
 	before_insert: {
 		buffer_id: number;

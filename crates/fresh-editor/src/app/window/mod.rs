@@ -736,6 +736,11 @@ pub struct Window {
     /// Whether the file-explorer panel is visible in this window.
     pub file_explorer_visible: bool,
 
+    /// Monotonic revision for meaningful File Explorer scope changes.
+    pub file_explorer_scope_revision: u64,
+
+    file_explorer_scope_fingerprint: Option<FileExplorerScopeFingerprint>,
+
     /// Whether a file-explorer rebuild is in flight (debounce flag).
     pub file_explorer_sync_in_progress: bool,
 
@@ -1307,6 +1312,25 @@ pub(crate) enum NextKeyClaim {
     NotClaimed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileExplorerScopeFingerprint {
+    visible: bool,
+    root: Option<String>,
+    visible_paths: Vec<String>,
+    expanded_directories: Vec<String>,
+}
+
+impl FileExplorerScopeFingerprint {
+    fn hidden() -> Self {
+        Self {
+            visible: false,
+            root: None,
+            visible_paths: Vec::new(),
+            expanded_directories: Vec::new(),
+        }
+    }
+}
+
 impl Window {
     /// Claim a key for the plugin `getNextKey()` machinery, if it wants
     /// one. Pops the front-most pending callback (the caller resolves it
@@ -1326,6 +1350,36 @@ impl Window {
             return NextKeyClaim::Buffered;
         }
         NextKeyClaim::NotClaimed
+    }
+
+    /// Refresh the last published Explorer scope fingerprint. Increment the
+    /// revision only when the visible scope or panel visibility changes.
+    #[cfg(feature = "plugins")]
+    pub(crate) fn refresh_file_explorer_scope_state(&mut self) -> bool {
+        let scope = self.current_file_explorer_scope();
+        let fingerprint = FileExplorerScopeFingerprint {
+            visible: self.file_explorer_visible,
+            root: scope.as_ref().map(|scope| scope.root.clone()),
+            visible_paths: scope
+                .as_ref()
+                .map(|scope| scope.visible_paths.clone())
+                .unwrap_or_default(),
+            expanded_directories: scope
+                .as_ref()
+                .map(|scope| scope.expanded_directories.clone())
+                .unwrap_or_default(),
+        };
+        if self.file_explorer_scope_fingerprint.as_ref() == Some(&fingerprint) {
+            return false;
+        }
+
+        self.file_explorer_scope_fingerprint = Some(fingerprint);
+        self.file_explorer_scope_revision = self.file_explorer_scope_revision.saturating_add(1);
+        true
+    }
+
+    pub(crate) fn invalidate_file_explorer_scope_fingerprint(&mut self) {
+        self.file_explorer_scope_fingerprint = None;
     }
 
     /// The currently-open native context menu's shared geometry core, if
@@ -2436,6 +2490,8 @@ impl Window {
             interactive_replace_state: None,
             scroll_sync_manager: crate::view::scroll_sync::ScrollSyncManager::new(),
             file_explorer_visible: false,
+            file_explorer_scope_revision: 0,
+            file_explorer_scope_fingerprint: Some(FileExplorerScopeFingerprint::hidden()),
             file_explorer_sync_in_progress: false,
             file_explorer_sync_deferred: None,
             file_explorer_width: resources.config.file_explorer.width,

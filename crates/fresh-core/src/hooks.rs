@@ -64,6 +64,10 @@ pub enum HookArgs {
     /// fires once per refresh, not once per file.
     AfterFileExplorerChange { path: PathBuf },
 
+    /// The visible File Explorer scope changed. Plugins should read the new
+    /// snapshot with `editor.getFileExplorerScope()`.
+    FileExplorerScopeChanged {},
+
     /// A buffer was closed
     BufferClosed { buffer_id: BufferId, window_id: u64 },
 
@@ -913,6 +917,12 @@ mod tests {
                 "variant should serialize as {{}}"
             );
         }
+    }
+
+    #[test]
+    fn file_explorer_scope_hook_serializes_as_empty_object() {
+        let json = hook_args_to_json(&HookArgs::FileExplorerScopeChanged {}).unwrap();
+        assert_eq!(json, serde_json::json!({}));
     }
 
     #[test]
