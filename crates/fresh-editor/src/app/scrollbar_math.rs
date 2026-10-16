@@ -74,17 +74,8 @@ fn total_rows(
     inputs: crate::view::line_wrap_cache::PipelineInputs,
     fold_ranges: Vec<std::ops::Range<usize>>,
 ) -> usize {
-    let line_ending = state.buffer.line_ending();
-    // Resolved before `entry` takes `&mut state`.
-    let decorations = state.index_decorations(geometry.view_mode, fold_ranges, &[]);
-    let index = state.wrap_indices.entry(geometry);
-    index.ensure_built(
-        &mut state.buffer,
-        geometry,
-        inputs,
-        line_ending,
-        &decorations,
-    );
+    state.ensure_wrap_index(geometry, inputs, fold_ranges);
+    let index = state.wrap_indices.get(&geometry).expect("just ensured");
     index.total_rows() as usize
 }
 

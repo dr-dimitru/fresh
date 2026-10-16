@@ -213,17 +213,7 @@ pub(crate) fn place_pane(
             .is_some_and(|lc| lc <= MAX_WRAP_SCROLLBAR_LINES);
     let has_index = if within_bounds || (indexable && state.wrap_indices.get(&geometry).is_some()) {
         let line_ending = state.buffer.line_ending();
-        // Decorations — virtual-line anchors included — are resolved into
-        // one owned snapshot before `entry` takes `&mut state`.
-        let decorations = state.index_decorations(geometry.view_mode, fold_ranges.clone(), &[]);
-        let index = state.wrap_indices.entry(geometry);
-        index.ensure_built(
-            &mut state.buffer,
-            geometry,
-            inputs,
-            line_ending,
-            &decorations,
-        );
+        state.ensure_wrap_index(geometry, inputs, fold_ranges.clone());
 
         // Cursor-line expansion: the frame draws the cursor's line
         // cursor-aware, so placement must target the row the cursor is

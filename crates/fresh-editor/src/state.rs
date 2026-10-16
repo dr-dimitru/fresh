@@ -728,6 +728,36 @@ impl EditorState {
         crate::view::ui::split_rendering::fold_skip_set(&self.buffer, &self.marker_list, folds)
     }
 
+    /// Make a canonical wrap index current without resolving whole-buffer
+    /// decorations on a cache hit. Placement, scrollbar painting and dragging
+    /// share this gate; cursor-aware line expansion still queries separately.
+    pub(crate) fn ensure_wrap_index(
+        &mut self,
+        geometry: crate::view::wrap_index::WrapIndexGeometry,
+        inputs: crate::view::line_wrap_cache::PipelineInputs,
+        folds: Vec<std::ops::Range<usize>>,
+    ) {
+        let current = self
+            .wrap_indices
+            .get(&geometry)
+            .is_some_and(|index| index.is_built_for(&geometry, inputs));
+        let decorations =
+            (!current).then(|| self.index_decorations(geometry.view_mode, folds, &[]));
+        let line_ending = self.buffer.line_ending();
+        // Touch even a current entry: scrollbar markers read the most recently
+        // used geometry, and different splits can show the same buffer.
+        let index = self.wrap_indices.entry(geometry);
+        if let Some(decorations) = decorations {
+            index.ensure_built(
+                &mut self.buffer,
+                geometry,
+                inputs,
+                line_ending,
+                &decorations,
+            );
+        }
+    }
+
     /// Resolve the decorations the wrap index builds from.
     ///
     /// `cursors` must be empty for the index itself — the index is canonical,
@@ -741,6 +771,8 @@ impl EditorState {
         cursors: &[usize],
     ) -> crate::view::wrap_index::IndexDecorations {
         use crate::view::line_wrap_cache::CacheViewMode;
+        #[cfg(test)]
+        tests::INDEX_DECORATION_SNAPSHOTS.with(|count| count.set(count.get() + 1));
         let end = self.buffer.len().saturating_add(1);
         let no_cursors = cursors;
 
@@ -2119,6 +2151,64 @@ mod tests {
     }
     use super::*;
     use crate::model::event::CursorId;
+
+    thread_local! {
+        pub(super) static INDEX_DECORATION_SNAPSHOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn wrapped_scroll_reuses_unchanged_decoration_snapshot() {
+        use crate::view::overlay::OverlayNamespace;
+        use crate::view::ui::split_rendering::scrollbar::scrollbar_line_counts;
+        use crate::view::viewport::Viewport;
+        let mut state = EditorState::new(80, 24, usize::MAX, test_fs());
+        let line = "**bold** and words that wrap across several screen rows\n";
+        state.buffer.insert(0, &line.repeat(150));
+        let ns = OverlayNamespace::from_string("markdown".to_string());
+        for i in 0..150 {
+            state.conceals.add(
+                &mut state.marker_list,
+                ns.clone(),
+                i * line.len()..i * line.len() + 2,
+                None,
+            );
+        }
+        let len = state.buffer.len();
+        let mut viewport = Viewport::new(40, 24);
+        viewport.line_wrap_enabled = true;
+        let first = scrollbar_line_counts(&mut state, &viewport, u64::MAX, len, Vec::new());
+        let snapshots = INDEX_DECORATION_SNAPSHOTS.with(|count| count.get());
+        for i in 1..20 {
+            viewport.set_top_byte(i * line.len());
+            let scrolled = scrollbar_line_counts(&mut state, &viewport, u64::MAX, len, Vec::new());
+            assert_eq!(scrolled.0, first.0);
+            assert!(scrolled.1 > 0);
+        }
+        assert_eq!(
+            INDEX_DECORATION_SNAPSHOTS.with(|count| count.get()),
+            snapshots,
+            "unchanged wrapped scrolling must not resolve every decoration again"
+        );
+
+        // A changed decoration must still repair the row counts immediately.
+        state
+            .conceals
+            .add(&mut state.marker_list, ns, 4..8, Some("word ".repeat(40)));
+        let changed = scrollbar_line_counts(&mut state, &viewport, u64::MAX, len, Vec::new());
+        assert!(changed.0 > first.0);
+        assert_eq!(
+            INDEX_DECORATION_SNAPSHOTS.with(|count| count.get()),
+            snapshots + 1
+        );
+        // Geometry is also part of freshness, not just buffer/decorations.
+        viewport.width = 80;
+        let wider = scrollbar_line_counts(&mut state, &viewport, u64::MAX, len, Vec::new());
+        assert!(wider.0 < changed.0);
+        assert_eq!(
+            INDEX_DECORATION_SNAPSHOTS.with(|count| count.get()),
+            snapshots + 2
+        );
+    }
 
     /// A restored session (or any later `apply_config`) has to land on the
     /// same visibility the master toggle produced when the user switched it

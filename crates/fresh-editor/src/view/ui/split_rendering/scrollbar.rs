@@ -309,18 +309,8 @@ pub(super) fn scrollbar_visual_row_counts(
         fold_signature: crate::view::wrap_index::fold_signature(&fold_ranges),
     };
 
-    let line_ending = state.buffer.line_ending();
-    // Decorations — virtual-line anchors included — resolved into one owned
-    // snapshot before `entry` takes `&mut state`.
-    let decorations = state.index_decorations(geometry.view_mode, fold_ranges, &[]);
-    let index = state.wrap_indices.entry(geometry);
-    index.ensure_built(
-        &mut state.buffer,
-        geometry,
-        inputs,
-        line_ending,
-        &decorations,
-    );
+    state.ensure_wrap_index(geometry, inputs, fold_ranges);
+    let index = state.wrap_indices.get(&geometry).expect("just ensured");
 
     let total_visual_rows = index.total_rows() as usize;
     let top_visual_row = index.row_of_byte(&state.buffer, viewport.top_byte()) as usize
