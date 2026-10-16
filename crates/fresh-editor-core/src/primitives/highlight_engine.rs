@@ -13,7 +13,7 @@
 //!
 //! Three render-time paths, gated by what the cache covers:
 //!
-//! - **Cache hit** — cache fully covers the parse range and there's no
+//! - **Cache hit** — cache fully covers the viewport and there's no
 //!   pending edit; filter cached spans for the viewport. Zero parse work.
 //! - **Forward extension** — cache covers the start of the parse range but
 //!   not its end; resume from `tail_state` and parse only the uncovered
@@ -667,11 +667,15 @@ impl ParseSnapshot {
     }
 }
 
-/// Small/large file threshold (whole-file cache vs viewport window).
+/// Threshold for parsing an exact prefix from byte zero instead of a viewport window.
 const MAX_PARSE_BYTES: usize = 1024 * 1024;
 
 /// Distance between checkpoint anchors. Smaller = faster convergence on edit.
 const CHECKPOINT_INTERVAL: usize = 256;
+
+/// Extra trailing work on a scroll cache miss. Always cover the viewport,
+/// but do not replenish a large cold-start context in one interactive frame.
+const MAX_SCROLL_LOOKAHEAD_BYTES: usize = 1_024;
 
 /// Per-pass cap on partial-update parsing past `dirty_pos`. Bounds work for
 /// pathological edits whose effect doesn't converge.
@@ -768,11 +772,11 @@ fn prepare_unified_diff_content(
 /// no trailing newline, so the cache can never commit a safe tail state
 /// (see `extend_cache_forward`) and every render re-parses all of it —
 /// which is what pinned a CPU core on a 441 KB single-line JSON.
-/// Set to `MAX_PARSE_BYTES` deliberately for ordinary buffers: at or below
-/// that size the parse range is the whole file, so a huge line is parsed once
-/// and committed at EOF (exact colours, cached, no per-frame cost). Buffers
-/// already in large-file mode use a viewport window regardless of this
-/// internal cutoff, so their line cost is bounded too.
+/// Set to `MAX_PARSE_BYTES` deliberately: lines above this size are windowed
+/// when encountered in a parse range. Smaller lines are parsed as supplied by
+/// that range and become cacheable at a newline or EOF; a partial tail is
+/// reparsed on extension. Large-file mode also bounds the parse range even
+/// for buffers below this internal cutoff.
 const MAX_HIGHLIGHT_LINE_BYTES: usize = MAX_PARSE_BYTES;
 
 /// Extra bytes parsed either side of the viewport inside an over-long
@@ -1751,9 +1755,14 @@ impl TextMateEngine {
             && self
                 .cache
                 .as_ref()
-                .is_some_and(|c| c.range.end >= parse_end);
+                // Lookahead is a reserve for subsequent scrolls. Requiring
+                // its moving far edge here reparses the partial tail on every
+                // wheel notch, even though all visible lines are cached.
+                // range.end includes only complete lines (or the final EOF).
+                .is_some_and(|c| c.range.end >= viewport_end);
 
-        if cache_covers_viewport
+        if !exact_cache_hit
+            && cache_covers_viewport
             && dirty.is_none()
             && self.last_buffer_len == buffer.len()
             && self
@@ -1779,9 +1788,13 @@ impl TextMateEngine {
                 .as_ref()
                 .is_some_and(|c| c.range.end < parse_end && c.tail_state.is_some())
         {
+            let scroll_parse_end =
+                buffer.snap_to_char_boundary(parse_end.min(
+                    viewport_end.saturating_add(context_bytes.min(MAX_SCROLL_LOOKAHEAD_BYTES)),
+                ));
             return self.extend_cache_forward(
                 buffer,
-                parse_end,
+                scroll_parse_end,
                 viewport_start,
                 viewport_end,
                 theme,
@@ -4909,6 +4922,103 @@ diff --git a/tools/check.py b/tools/check.py
         assert_ne!(
             scope_to_category("storage.type"),
             Some(HighlightCategory::Type)
+        );
+    }
+
+    /// Lookahead is work saved for later viewports, not work that must be
+    /// repeated whenever a wheel notch moves its far edge. Cached, complete
+    /// lines remain usable with LF/CRLF and in threshold-zero large-file mode.
+    #[test]
+    fn test_markdown_scroll_reuses_cached_lookahead() {
+        let registry =
+            GrammarRegistry::load(&crate::primitives::grammar::LocalGrammarLoader::embedded_only());
+        let theme = Theme::load_builtin(theme::THEME_LIGHT).unwrap();
+        for newline in ["\n", "\r\n"] {
+            for large in [false, true] {
+                let content = format!(
+                    "Paragraph with **bold** and `code`, café 日本語, and enough words to wrap.{newline}"
+                ).repeat(150);
+                let temp = tempfile::NamedTempFile::new().unwrap();
+                std::fs::write(temp.path(), &content).unwrap();
+                let threshold = if large { 0 } else { usize::MAX };
+                let mut buffer = Buffer::load_from_file(temp.path(), threshold, test_fs()).unwrap();
+                let _ = buffer.get_text_range_mut(0, buffer.len()).unwrap();
+                let mut engine = HighlightEngine::for_file(Path::new("scroll.md"), None, &registry);
+                let _ = engine.highlight_viewport(&buffer, 0, 500, &theme, 4_000);
+                let before = engine.highlight_stats().unwrap().clone();
+                for end in (600..=3_000).step_by(100) {
+                    let start = end - 500;
+                    let spans = engine.highlight_viewport(&buffer, start, end, &theme, 4_000);
+                    let bold = content
+                        .match_indices("bold")
+                        .map(|(pos, _)| pos)
+                        .find(|&pos| pos >= start)
+                        .unwrap();
+                    assert_eq!(
+                        spans
+                            .iter()
+                            .find(|s| s.range.contains(&bold))
+                            .and_then(|s| s.category),
+                        Some(HighlightCategory::Constant),
+                    );
+                }
+                let after = engine.highlight_stats().unwrap();
+                assert_eq!(after.bytes_parsed, before.bytes_parsed,
+                    "scrolling inside complete cached lines must not replenish lookahead: large={large}, newline={newline:?}");
+                assert_eq!(after.cache_misses, before.cache_misses);
+            }
+        }
+    }
+
+    /// Consuming lookahead must not replace per-notch work with one large
+    /// speculative parse when the viewport finally reaches the cached edge.
+    #[test]
+    fn test_markdown_scroll_extension_bounds_speculative_work() {
+        let registry =
+            GrammarRegistry::load(&crate::primitives::grammar::LocalGrammarLoader::embedded_only());
+        let theme = Theme::load_builtin(theme::THEME_LIGHT).unwrap();
+        let content = "**bold** and `code` in a paragraph long enough to wrap in a narrow pane.\n"
+            .repeat(150);
+        let buffer = Buffer::from_str(&content, 0, test_fs());
+        let mut engine = HighlightEngine::for_file(Path::new("scroll.md"), None, &registry);
+        let _ = engine.highlight_viewport(&buffer, 0, 500, &theme, 4_000);
+        let HighlightEngine::TextMate(ref mut tm) = engine else {
+            panic!("expected TextMate")
+        };
+        let committed = tm.cache.as_ref().unwrap().range.end;
+        let before = tm.stats().bytes_parsed;
+        let end = committed + 200;
+        let spans = tm.highlight_viewport(&buffer, end - 500, end, &theme, 4_000);
+        assert!(!spans.is_empty());
+        assert!(
+            tm.stats().bytes_parsed - before <= 200 + 1_024,
+            "a scroll extension must bound speculative lookahead beyond the visible bytes"
+        );
+    }
+
+    #[test]
+    fn test_markdown_scroll_lookahead_does_not_split_utf8() {
+        let registry =
+            GrammarRegistry::load(&crate::primitives::grammar::LocalGrammarLoader::embedded_only());
+        let theme = Theme::load_builtin(theme::THEME_LIGHT).unwrap();
+        let content = "**bold** 日本語 🦀 café with more wrapping words.\n".repeat(150);
+        let buffer = Buffer::from_str(&content, 0, test_fs());
+        let mut engine = HighlightEngine::for_file(Path::new("scroll.md"), None, &registry);
+        // A whole-line cold range establishes a trustworthy cache boundary.
+        let first_end = content.match_indices('\n').nth(30).unwrap().0 + 1;
+        let _ = engine.highlight_viewport(&buffer, 0, first_end, &theme, 0);
+        let end = (first_end + 100..first_end + 300)
+            .find(|&end| content.is_char_boundary(end) && !content.is_char_boundary(end + 1_024))
+            .unwrap();
+        let spans = engine.highlight_viewport(&buffer, first_end, end, &theme, 4_000);
+        let bold = first_end + 2;
+        assert_eq!(
+            spans
+                .iter()
+                .find(|s| s.range.contains(&bold))
+                .and_then(|s| s.category),
+            Some(HighlightCategory::Constant),
+            "lookahead must not discard the new viewport at a UTF-8 boundary"
         );
     }
 
