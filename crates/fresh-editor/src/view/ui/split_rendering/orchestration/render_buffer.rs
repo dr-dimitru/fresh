@@ -113,15 +113,15 @@ pub(crate) fn resolve_gutter_layout(
     // In compose mode the gutter (diagnostic / indicator slot) is drawn in the
     // reclaimed desk margin so it does not shrink the centered text width
     // (issue #2146). Only do this when there is enough desk margin to give up;
-    // if the paper already fills the area, drop the gutter instead of eating
-    // into the text so table/wrap layout stays intact.
+    // if the paper already fills the area, drop only the optional indicator
+    // slot. Explicitly requested line numbers keep their space inside the page.
     if matches!(view_mode, ViewMode::PageView) && width > 0 {
         let g = width as u16;
         if compose.left_pad >= g {
             compose.left_pad -= g;
             let ra = compose.render_area;
             compose.render_area = Rect::new(ra.x - g, ra.y, ra.width + g, ra.height);
-        } else {
+        } else if !show_line_numbers && diff_gutter_width.is_none() {
             margin.enabled = false;
             margin.width = 0;
             width = 0;
@@ -278,7 +278,7 @@ pub(crate) fn compute_buffer_layout(
         let fold_ranges = state.fold_ranges(folds);
         let geometry = wrap_index_geometry_for(
             viewport,
-            &state.buffer,
+            state,
             line_wrap,
             &view_mode,
             crate::view::wrap_index::fold_signature(&fold_ranges),
@@ -831,7 +831,7 @@ fn resolve_build_anchor(
 /// up an entry that is never populated and silently fall back to the layout pass.
 pub(crate) fn wrap_index_geometry_for(
     viewport: &Viewport,
-    buffer: &crate::model::buffer::Buffer,
+    state: &EditorState,
     line_wrap: bool,
     view_mode: &ViewMode,
     fold_signature: u64,
@@ -845,9 +845,28 @@ pub(crate) fn wrap_index_geometry_for(
             cols: viewport.grid_cols().max(1),
         }
     } else if line_wrap {
-        let gutter_width = viewport.gutter_width(buffer);
+        let (render_width, gutter_width) = if matches!(view_mode, ViewMode::PageView) {
+            // Use the page that is actually drawn, including a gutter reclaimed
+            // from the desk margin. The full pane can be much wider than it.
+            let layout = resolve_gutter_layout(
+                &state.margins,
+                viewport.show_line_numbers,
+                view_mode,
+                Rect::new(0, 0, viewport.width, viewport.height),
+                viewport.compose_width,
+                super::reconcile::gutter_estimated_lines(state),
+                state.diff_gutter.as_ref().map(|g| g.width()),
+                state.margins.has_line_indicators(),
+            );
+            (layout.compose.render_area.width as usize, layout.width)
+        } else {
+            (
+                viewport.width as usize,
+                viewport.gutter_width(&state.buffer),
+            )
+        };
         let wrap_config = WrapConfig::new(
-            viewport.wrap_area_width(viewport.width as usize, gutter_width),
+            viewport.wrap_area_width(render_width, gutter_width),
             gutter_width,
             true,
             viewport.wrap_indent,

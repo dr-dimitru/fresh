@@ -4,7 +4,7 @@
 //! parameters. They have no dependency on any shared render-time "mega
 //! struct".
 
-use crate::state::EditorState;
+use crate::state::{EditorState, ViewMode};
 use crate::view::scrollbar_marker::{self, MarkerBasis};
 use crate::view::theme::Theme;
 use crate::view::viewport::Viewport;
@@ -38,6 +38,7 @@ pub(crate) const MAX_WRAP_SCROLLBAR_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) fn scrollbar_line_counts(
     state: &mut EditorState,
     viewport: &Viewport,
+    view_mode: &ViewMode,
     large_file_threshold_bytes: u64,
     buffer_len: usize,
     fold_ranges: Vec<std::ops::Range<usize>>,
@@ -70,7 +71,7 @@ pub(crate) fn scrollbar_line_counts(
         && buffer_len <= MAX_WRAP_SCROLLBAR_BYTES
     {
         let (total_rows, top_row) =
-            scrollbar_visual_row_counts(state, viewport, buffer_len, fold_ranges);
+            scrollbar_visual_row_counts(state, viewport, view_mode, buffer_len, fold_ranges);
         return (
             total_rows,
             top_row,
@@ -250,64 +251,22 @@ pub(crate) fn resolve_scrollbar_marks(
 pub(super) fn scrollbar_visual_row_counts(
     state: &mut EditorState,
     viewport: &Viewport,
+    view_mode: &ViewMode,
     buffer_len: usize,
     fold_ranges: Vec<std::ops::Range<usize>>,
 ) -> (usize, usize) {
-    use crate::primitives::line_wrapping::WrapConfig;
-    use crate::view::line_wrap_cache::CacheViewMode;
-    use crate::view::ui::split_rendering::MAX_SAFE_LINE_WIDTH;
-    use crate::view::wrap_index::WrapIndexGeometry;
-    use crate::view::wrap_machine::WrapRule;
-
     if buffer_len == 0 {
         return (1, 0);
     }
-
-    // Terminal-grid wrap (fresh#2649): count exact-column rows at the grid
-    // width — same row model as the renderer and the viewport scroll math.
-    let (effective_width, gutter_width, hanging_indent) = if viewport.grid_wrap {
-        (viewport.grid_cols(), 0usize, false)
-    } else {
-        let gutter_width = viewport.gutter_width(&state.buffer);
-        let wrap_config = WrapConfig::new(
-            viewport.wrap_area_width(viewport.width as usize, gutter_width),
-            gutter_width,
-            true,
-            viewport.wrap_indent,
-        );
-        let effective_width = wrap_config
-            .first_line_width
-            .saturating_add(gutter_width)
-            .max(2);
-        (effective_width, gutter_width, wrap_config.hanging_indent)
-    };
+    // Use the same page, gutter and decoration scope as placement and drawing.
+    let geometry = super::wrap_index_geometry_for(
+        viewport,
+        state,
+        viewport.line_wrap_enabled,
+        view_mode,
+        crate::view::wrap_index::fold_signature(&fold_ranges),
+    );
     let inputs = state.pipeline_inputs();
-
-    // The wrap index answers both numbers directly: `total_rows` is O(1) off the
-    // Fenwick tree and `row_of_byte` is a binary search. The path this replaced
-    // re-wrapped every logical line on every keystroke, because its key folded in
-    // the buffer version — 16.9% of a frame on a single-line file.
-    let geometry = WrapIndexGeometry {
-        rule: if viewport.grid_wrap {
-            WrapRule::Grid {
-                cols: effective_width,
-            }
-        } else if viewport.line_wrap_enabled {
-            WrapRule::Word {
-                content_width: effective_width,
-                gutter_width,
-                hanging_indent,
-            }
-        } else {
-            // Without soft wrap every logical line is one visual row until the
-            // safety chop, which no practical line reaches.
-            WrapRule::Chop {
-                chars: MAX_SAFE_LINE_WIDTH,
-            }
-        },
-        view_mode: CacheViewMode::Source,
-        fold_signature: crate::view::wrap_index::fold_signature(&fold_ranges),
-    };
 
     state.ensure_wrap_index(geometry, inputs, fold_ranges);
     let index = state.wrap_indices.get(&geometry).expect("just ensured");
@@ -430,6 +389,7 @@ mod tests {
         let (total, _, basis) = scrollbar_line_counts(
             &mut state,
             &vp,
+            &ViewMode::Source,
             crate::config::LARGE_FILE_THRESHOLD_BYTES,
             buffer_len,
             Vec::new(),
@@ -465,6 +425,7 @@ mod tests {
         let (total, _, basis) = scrollbar_line_counts(
             &mut state,
             &vp,
+            &ViewMode::Source,
             crate::config::LARGE_FILE_THRESHOLD_BYTES,
             buffer_len,
             Vec::new(),
@@ -494,6 +455,7 @@ mod tests {
         let (total, _, basis) = scrollbar_line_counts(
             &mut state,
             &vp,
+            &ViewMode::Source,
             crate::config::LARGE_FILE_THRESHOLD_BYTES,
             len,
             Vec::new(),
@@ -512,6 +474,7 @@ mod tests {
         let (total, _, basis) = scrollbar_line_counts(
             &mut state,
             &vp,
+            &ViewMode::Source,
             crate::config::LARGE_FILE_THRESHOLD_BYTES,
             len,
             Vec::new(),
@@ -527,7 +490,8 @@ mod tests {
         // guaranteed to exist. A tiny threshold stands in for a huge file.
         let mut state = state_with_wrapping_lines(100);
         let len = state.buffer.len();
-        let (total, top, basis) = scrollbar_line_counts(&mut state, &vp, 16, len, Vec::new());
+        let (total, top, basis) =
+            scrollbar_line_counts(&mut state, &vp, &ViewMode::Source, 16, len, Vec::new());
         assert_eq!((total, top), (0, 0), "large files use the constant thumb");
         assert_eq!(basis, MarkerBasis::Bytes { total: len as u64 });
     }
@@ -641,6 +605,7 @@ mod tests {
         let (total, top, basis) = scrollbar_line_counts(
             &mut state,
             &vp,
+            &ViewMode::Source,
             crate::config::LARGE_FILE_THRESHOLD_BYTES,
             0,
             Vec::new(),
@@ -685,6 +650,7 @@ mod tests {
         let (_, _, basis) = scrollbar_line_counts(
             &mut state,
             &vp,
+            &ViewMode::Source,
             crate::config::LARGE_FILE_THRESHOLD_BYTES,
             0,
             Vec::new(),

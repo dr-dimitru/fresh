@@ -2176,11 +2176,25 @@ mod tests {
         let len = state.buffer.len();
         let mut viewport = Viewport::new(40, 24);
         viewport.line_wrap_enabled = true;
-        let first = scrollbar_line_counts(&mut state, &viewport, u64::MAX, len, Vec::new());
+        let first = scrollbar_line_counts(
+            &mut state,
+            &viewport,
+            &ViewMode::Source,
+            u64::MAX,
+            len,
+            Vec::new(),
+        );
         let snapshots = INDEX_DECORATION_SNAPSHOTS.with(|count| count.get());
         for i in 1..20 {
             viewport.set_top_byte(i * line.len());
-            let scrolled = scrollbar_line_counts(&mut state, &viewport, u64::MAX, len, Vec::new());
+            let scrolled = scrollbar_line_counts(
+                &mut state,
+                &viewport,
+                &ViewMode::Source,
+                u64::MAX,
+                len,
+                Vec::new(),
+            );
             assert_eq!(scrolled.0, first.0);
             assert!(scrolled.1 > 0);
         }
@@ -2194,7 +2208,14 @@ mod tests {
         state
             .conceals
             .add(&mut state.marker_list, ns, 4..8, Some("word ".repeat(40)));
-        let changed = scrollbar_line_counts(&mut state, &viewport, u64::MAX, len, Vec::new());
+        let changed = scrollbar_line_counts(
+            &mut state,
+            &viewport,
+            &ViewMode::Source,
+            u64::MAX,
+            len,
+            Vec::new(),
+        );
         assert!(changed.0 > first.0);
         assert_eq!(
             INDEX_DECORATION_SNAPSHOTS.with(|count| count.get()),
@@ -2202,7 +2223,14 @@ mod tests {
         );
         // Geometry is also part of freshness, not just buffer/decorations.
         viewport.width = 80;
-        let wider = scrollbar_line_counts(&mut state, &viewport, u64::MAX, len, Vec::new());
+        let wider = scrollbar_line_counts(
+            &mut state,
+            &viewport,
+            &ViewMode::Source,
+            u64::MAX,
+            len,
+            Vec::new(),
+        );
         assert!(wider.0 < changed.0);
         assert_eq!(
             INDEX_DECORATION_SNAPSHOTS.with(|count| count.get()),
