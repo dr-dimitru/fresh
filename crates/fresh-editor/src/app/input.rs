@@ -260,6 +260,10 @@ impl Editor {
         // user reached for Ctrl (issue #3324).
         let is_bare_modifier = matches!(code, crossterm::event::KeyCode::Modifier(_));
         if !is_bare_modifier {
+            // Finish the preceding wheel gesture before the key takes over.
+            // Otherwise a later animation frame reinstates the scroll hold
+            // and can leave Home/End or typing outside the visible viewport.
+            self.flush_pending_wheel_scroll();
             let active_split = self.effective_active_split();
             if let Some(view_state) = self
                 .active_window_mut()

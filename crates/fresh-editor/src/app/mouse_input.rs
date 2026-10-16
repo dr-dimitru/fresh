@@ -517,7 +517,7 @@ impl Editor {
     /// than dropping it. A wheel turned sideways, or a walk switched off
     /// mid-gesture, must not cost the view the distance already asked
     /// for.
-    fn flush_pending_wheel_scroll(&mut self) {
+    pub(super) fn flush_pending_wheel_scroll(&mut self) {
         let Some(pending) = self.pending_wheel_scroll.take() else {
             return;
         };
