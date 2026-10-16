@@ -924,7 +924,7 @@ fn test_file_explorer_git_change_indicator() {
             let screen = h.screen_to_string();
             screen
                 .lines()
-                .any(|line| line.contains("subdir") && line.contains("●"))
+                .any(|line| line.contains("subdir") && line.contains("M"))
         })
         .unwrap();
 }
@@ -2861,23 +2861,23 @@ fn test_file_explorer_directory_status_indicator_hover_tooltip() {
     harness.editor_mut().toggle_file_explorer();
     harness.wait_for_screen_contains("File Explorer").unwrap();
 
-    // Wait for subdir with ● indicator to appear (bubbled indicator for directory with changes)
+    // The fork bubbles the highest-priority status (M here) onto directories.
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
             screen
                 .lines()
-                .any(|line| line.contains("subdir") && line.contains("●"))
+                .any(|line| line.contains("subdir") && line.contains("M"))
         })
         .unwrap();
 
-    // Find the row with subdir and the ● indicator position
+    // Find the row carrying the directory status.
     let screen = harness.screen_to_string();
     let lines: Vec<&str> = screen.lines().collect();
     let (row, _line) = lines
         .iter()
         .enumerate()
-        .find(|(_, l)| l.contains("subdir") && l.contains("●"))
+        .find(|(_, l)| l.contains("subdir") && l.contains("M"))
         .expect("Should find subdir line");
 
     // Ensure layout cache (explorer area, trailing-slot bounds) is current.
@@ -4787,7 +4787,7 @@ fn test_file_explorer_git_decorations_monorepo_subrepos() {
             let screen = h.screen_to_string();
             screen
                 .lines()
-                .any(|line| line.contains("project-a") && line.contains("●"))
+                .any(|line| line.contains("project-a") && line.contains("M"))
                 || screen
                     .lines()
                     .any(|line| line.contains("file-a.txt") && line.contains("M"))
@@ -4797,10 +4797,10 @@ fn test_file_explorer_git_decorations_monorepo_subrepos() {
     let screen = harness.screen_to_string();
     println!("Monorepo file explorer:\n{screen}");
 
-    // Verify project-b also has a decoration (● on directory or U on new-file.txt)
+    // The fork bubbles the highest-priority status to each parent directory.
     let has_project_b_decoration = screen
         .lines()
-        .any(|line| line.contains("project-b") && line.contains("●"))
+        .any(|line| line.contains("project-b") && line.contains("U"))
         || screen
             .lines()
             .any(|line| line.contains("new-file") && line.contains("U"));
