@@ -328,19 +328,35 @@ Today a manifest declares one thing, chrome:
 
 ```json
 { "chrome": { "dock": {
-    "open": true,
+    "open": false,
     "open_setting": "autoOpenDock",
     "width": { "fraction": 0.28, "min": 24, "max": 40 } } } }
 ```
 
 `chrome.dock` says the plugin fills the editor-global left dock. From it the
 host decides at construction whether the slot is open and how wide
-(`Editor::apply_startup_dock_chrome`): a bare `fresh` in Orchestrator mode
-always opens it; `open_setting` (a boolean in `plugins.<name>.settings`) set
-to `false` keeps it closed; otherwise it comes back as the user left it
-(`<data>/chrome.json`: open or closed, and the dragged width), or as `open`
-says on a first launch. The width rule is the host's from then on; the plugin
-reads it back with `editor.dockCols()`.
+(`Editor::apply_startup_dock_chrome`). `open_setting` names a key in
+`plugins.<name>.settings` holding one of three modes, and each means what it
+says: `never` keeps the slot closed and `always` opens it, both outright;
+`auto` (the default) brings it back as the user left it
+(`<data>/chrome.json`), and on a first launch `open` decides (default
+`true`; the orchestrator declares `false`). The launch mode plays no part:
+it used to override the setting (#3442), then to open the dock on a first
+launch. The host reads
+the setting (and rewrites a legacy boolean, below) but never writes it on the
+user's behalf; keeping it in step with the user is the plugin's job — the
+orchestrator writes `always` / `never` when the user opens or closes the dock,
+so a start follows their last instruction. The width rule
+is the host's from then on; the plugin reads it back with
+`editor.dockCols()`.
+
+`open_setting` used to be a plain boolean. Both spellings are read — `false`
+as `never`, `true` as `auto` — so behaviour never depends on the migration
+having run; and a boolean found at startup is rewritten as its mode, in memory
+and on disk. That rewrite is not cosmetic: `handle_add_plugin_config_field`
+only fills a value in when one is *absent*, so a surviving boolean would sit
+under an enum schema and the Settings UI would draw the enum's default beside
+a startup that had honoured the boolean.
 
 A manifest is a declaration, not a command. The plugin still mounts its dock
 from `ready`, gated on `editor.dockOpen()`, into a column that is already
@@ -412,6 +428,23 @@ authoritative. Stable `key` fields preserve instance state across spec re-emits.
 Updating a panel re-renders preserving state; a widget mutate is a fast path for
 targeted updates (set value, set checked, set items, set expanded keys, set
 completions, append tree nodes, set focus key, …).
+
+**A panel's keymap is the one it names.** A floating or dock panel's keys go to
+its focused control first, then to the `mode` it was mounted with, then to the
+panel's own defaults (Tab, Esc). A panel mounted without a `mode` has no keymap
+at all. It used to fall back to the window's editor mode (`setEditorMode`), so
+a menu that bound nothing handed its arrows and Esc to whatever plugin held
+that slot — vi-normal's `j`/`k`, for one — and plugins defined empty modes just
+to block the fallback. *Change for third-party plugins:* a plugin that keyed a
+centred panel by calling `setEditorMode` before mounting it must now pass that
+mode as the mount's `mode` option (`FloatingWidgetPanel.mount(spec, { mode })`).
+The window's editor mode is the buffer's.
+
+**Window mode vs input mode.** `setEditorMode` sets the *active window's*
+mode: window-scoped, invisible in other windows. A modal-editing plugin that
+should apply everywhere (vi) calls `setInputMode` instead, which sets the
+editor-wide input mode; the window's mode outranks it where both are set.
+See input-keybindings-actions.md §6.
 
 ### 7.3 Events back to the plugin
 

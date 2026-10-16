@@ -17,7 +17,11 @@ use std::collections::HashMap;
 /// v4: the channel carries *scripts* rather than command ids —
 /// `ClientControl::RunScript` / `ServerControl::ScriptResult` replace the
 /// command-id verbs (`ListCommands` / `RunCommand` / `CommandList`).
-pub const PROTOCOL_VERSION: u32 = 4;
+/// v5: a client's two connections are matched by a token rather than by the
+/// order they arrive in — `ClientHello::pair_token` on the control stream,
+/// and the same token at the start of the data stream (see
+/// `ipc::ServerListener::accept`).
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Terminal size in columns and rows
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,7 +46,8 @@ pub struct ClientHello {
     /// Initial terminal size
     pub term_size: TermSize,
     /// Environment variables relevant for rendering
-    /// Keys: TERM, COLORTERM, LANG, LC_ALL
+    /// Keys: TERM, COLORTERM, LANG, LC_ALL, and the two color-depth hints
+    /// `ColorCapability::detect` reads, FRESH_COLOR_MODE and WT_SESSION
     pub env: HashMap<String, Option<String>>,
     /// Per-workspace capability token (from `$FRESH_CMD_TOKEN`), presented so
     /// the server can authorize `RunScript` against this workspace's grant.
@@ -50,6 +55,12 @@ pub struct ClientHello {
     /// client) — script evaluation is then refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmd_token: Option<String>,
+    /// The token this client also sent at the start of its data stream, which
+    /// is how the server tells which data stream goes with this control
+    /// stream. Set by `ClientConnection::send_hello`; `None` only from a
+    /// client older than protocol v5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_token: Option<String>,
 }
 
 impl ClientHello {
@@ -58,7 +69,14 @@ impl ClientHello {
         let mut env = HashMap::new();
 
         // Collect terminal-relevant environment variables
-        for key in &["TERM", "COLORTERM", "LANG", "LC_ALL"] {
+        for key in &[
+            "TERM",
+            "COLORTERM",
+            "LANG",
+            "LC_ALL",
+            "FRESH_COLOR_MODE",
+            "WT_SESSION",
+        ] {
             env.insert(key.to_string(), std::env::var(key).ok());
         }
 
@@ -72,6 +90,7 @@ impl ClientHello {
             cmd_token: std::env::var("FRESH_CMD_TOKEN")
                 .ok()
                 .filter(|t| !t.is_empty()),
+            pair_token: None,
         }
     }
 
@@ -121,6 +140,25 @@ pub struct VersionMismatch {
     pub message: String,
 }
 
+impl VersionMismatch {
+    /// The reply to a client whose protocol version is not this server's.
+    pub fn for_client(hello: &ClientHello) -> Self {
+        Self {
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+            client_version: hello.client_version.clone(),
+            action: if hello.protocol_version > PROTOCOL_VERSION {
+                "upgrade_server".to_string()
+            } else {
+                "restart_server".to_string()
+            },
+            message: format!(
+                "Protocol version mismatch: server={}, client={}",
+                PROTOCOL_VERSION, hello.protocol_version
+            ),
+        }
+    }
+}
+
 /// Control messages from client to server
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -129,6 +167,10 @@ pub enum ClientControl {
     Hello(ClientHello),
     /// Terminal was resized
     Resize { cols: u16, rows: u16 },
+    /// This terminal is a Linux console whose mouse the client forwards from
+    /// GPM. GPM cannot draw its pointer over a full-screen program, so the
+    /// editor draws one itself while this terminal is the one in use.
+    GpmPointer,
     /// Keepalive ping
     Ping,
     /// Request to detach (keep server running)
@@ -195,6 +237,12 @@ pub enum ServerControl {
     Error { message: String },
     /// Signal that a --wait operation has completed
     WaitComplete,
+    /// Answer to an `OpenFiles { wait: true }` that reached a daemon nobody is
+    /// looking at: no terminal attached and no browser connected. The file is
+    /// open, but no one can see it to finish with it, so the waiting client
+    /// must not just block (git would hang on an invisible editor). It
+    /// attaches its own terminal, or fails when it has none.
+    NoViewer,
     /// Set the system clipboard on the client side
     /// The client should use the specified methods to copy the text
     SetClipboard {
@@ -229,23 +277,6 @@ pub enum ServerControl {
 pub enum ControlMessage {
     Client(ClientControl),
     Server(ServerControl),
-}
-
-/// Read a JSON control message from a reader
-pub fn read_control_message<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<String> {
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    Ok(line)
-}
-
-/// Write a JSON control message to a writer
-pub fn write_control_message<W: std::io::Write>(
-    writer: &mut W,
-    msg: &impl Serialize,
-) -> std::io::Result<()> {
-    let json = serde_json::to_string(msg).map_err(|e| std::io::Error::other(e.to_string()))?;
-    writeln!(writer, "{}", json)?;
-    writer.flush()
 }
 
 #[cfg(test)]

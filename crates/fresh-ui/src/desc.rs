@@ -236,6 +236,54 @@ pub struct BoxProps {
     /// The box's ground is this cluster, tiled across its rect, rather than a
     /// blank fill. See [`Node::rule`].
     pub rule: Option<std::rc::Rc<str>>,
+    /// A row whose children are the cells of a table row. See
+    /// [`Node::columns`].
+    pub columns: Option<Rc<Columns>>,
+}
+
+/// **The columns a table's rows lay their cells on.** Every row that shares
+/// one is given the same widths for the same room, so the cells of a column
+/// line up down the whole table without any row measuring another.
+///
+/// The natural widths are the description's to say: a table's rows are
+/// usually a windowed list, which builds only the rows on screen, and a
+/// column measured from those alone would change width as it scrolled. Layout
+/// fits them to the room each row actually has ([`Columns::fit`]).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Columns {
+    /// Each column's natural width — its widest cell, capped as the table
+    /// sees fit.
+    pub natural: Vec<u16>,
+    /// The narrowest a column is squeezed to when the table must fit.
+    pub floor: u16,
+}
+
+impl Columns {
+    pub fn new(natural: Vec<u16>, floor: u16) -> Self {
+        Columns { natural, floor }
+    }
+
+    /// The widths the columns take in `room` cells (gaps already taken out).
+    ///
+    /// Too wide, the widest column gives one cell at a time — so a long path
+    /// is cut before a short name is — and none goes below `floor` (nor below
+    /// its own natural width, if that is smaller). Ties go to the leftmost.
+    pub fn fit(&self, room: u16) -> Vec<u16> {
+        let mut w = self.natural.clone();
+        let total = |w: &[u16]| w.iter().map(|&v| v as u32).sum::<u32>();
+        while total(&w) > room as u32 {
+            let widest = w
+                .iter()
+                .enumerate()
+                .filter(|(_, &v)| v > self.floor)
+                .max_by_key(|(i, &v)| (v, std::cmp::Reverse(*i)));
+            match widest {
+                Some((i, _)) => w[i] -= 1,
+                None => break,
+            }
+        }
+        w
+    }
 }
 
 /// How a run gives up cells it was not given.
@@ -442,8 +490,10 @@ pub enum ScrollMode {
 pub enum Scroll {
     /// The framework's. The window starts here and is thereafter wherever the
     /// wheel, the bar and the anchor commands put it; the description's value
-    /// is read once, at the first layout. The default, at `(0, 0)`.
-    Own { x: u16, y: u16 },
+    /// is read once, at the first layout. The default, at `(0, 0)`. `y` is
+    /// an index for an index-scrolled window, which can be past a cell's
+    /// reach.
+    Own { x: u16, y: u32 },
     /// The owner's. The window is this far down — rows for a cell-scrolled
     /// window, items for an index-scrolled one — at *every* layout. The
     /// framework still moves its window for a wheel, a bar drag or an anchor
@@ -468,6 +518,31 @@ impl Default for Scroll {
     }
 }
 
+/// Which items a window pins at an offset — see [`Node::pinned_at`]. Compared
+/// by identity: the same function is the same answer.
+#[derive(Clone)]
+pub struct PinnedAt(pub Rc<dyn Fn(u32) -> Rc<[u32]>>);
+
+impl PinnedAt {
+    pub fn at(&self, offset: u32) -> Rc<[u32]> {
+        (self.0)(offset)
+    }
+}
+
+impl PartialEq for PinnedAt {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for PinnedAt {}
+
+impl std::fmt::Debug for PinnedAt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PinnedAt(..)")
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct ViewportProps {
     /// Where the window is, and whose that fact is. See [`Scroll`].
@@ -475,6 +550,9 @@ pub struct ViewportProps {
     /// Items drawn at the top of the window whatever the offset, in order —
     /// an index-scrolled window only. See [`Node::pinned`].
     pub pinned: Rc<[u32]>,
+    /// The pinned items as a function of the offset, evaluated by the window
+    /// at layout. Replaces `pinned` when set. See [`Node::pinned_at`].
+    pub pinned_at: Option<PinnedAt>,
     /// Mark the region as text-selectable in the display list. The library
     /// never interprets it — a backend that supports selection reads it, the
     /// same way it reads a theme name.
@@ -492,7 +570,18 @@ pub struct ViewportProps {
     pub overlay: bool,
     /// Appearance of the bar itself, named apart from the window's.
     pub bar_theme: Option<Rc<str>>,
+    /// Appearance of an overflow cap while the pointer is on it. See
+    /// [`Node::bar_hover_theme`].
+    pub bar_hover_theme: Option<Rc<str>>,
     pub mode: ScrollMode,
+    /// Which way this window scrolls. See [`Node::scroll_axis`].
+    pub axis: crate::event::Axis,
+    /// How far a press on an overflow cap moves the window, in the offset's
+    /// unit. `0` means one windowful. See [`Node::scroll_step`].
+    pub step: u16,
+    /// How wide one overflow cap is, in cells. `0` means one. See
+    /// [`Node::scroll_cap_width`].
+    pub cap: u16,
 }
 
 /// Whether a gesture region absorbs pointer hits that land on it.
@@ -543,8 +632,13 @@ pub struct FocusProps<M> {
     pub on_focus_change: Option<Handler<M>>,
     /// Rebuild this element when focus enters or leaves its subtree.
     pub focus_within: bool,
+    /// Called with `FocusGained` when focus enters this subtree and
+    /// `FocusLost` when it leaves. See [`Node::on_focus_within_change`].
+    pub on_focus_within_change: Option<Handler<M>>,
     /// The stop traversal enters this subtree at. See [`Node::enters_at`].
     pub entry: Option<crate::key::Key>,
+    /// How traversal moves inside this subtree. See [`Node::traversal`].
+    pub traversal: Option<Rc<dyn crate::focus::TraversalPolicy>>,
 }
 
 impl<M> Default for FocusProps<M> {
@@ -560,7 +654,9 @@ impl<M> Default for FocusProps<M> {
             actions: Vec::new(),
             on_focus_change: None,
             focus_within: false,
+            on_focus_within_change: None,
             entry: None,
+            traversal: None,
         }
     }
 }
@@ -1093,7 +1189,9 @@ impl<M> Clone for FocusProps<M> {
             actions: self.actions.clone(),
             on_focus_change: self.on_focus_change.clone(),
             focus_within: self.focus_within,
+            on_focus_within_change: self.on_focus_within_change.clone(),
             entry: self.entry.clone(),
+            traversal: self.traversal.clone(),
         }
     }
 }
@@ -1347,13 +1445,6 @@ impl<M> Node<M> {
         }
     }
 
-    pub fn child_if_some<T>(self, v: Option<T>, f: impl FnOnce(T) -> Node<M>) -> Self {
-        match v {
-            Some(v) => self.child(f(v)),
-            None => self,
-        }
-    }
-
     /// Keep this node when `cond`, otherwise collapse it to [`Node::nil`].
     pub fn if_(self, cond: bool) -> Self {
         if cond {
@@ -1502,7 +1593,7 @@ impl<M> Node<M> {
 
     /// Where the window starts. The initial value only: from the first layout
     /// on, the offset is framework-owned. See [`Scroll::Own`].
-    pub fn scroll_at(mut self, x: u16, y: u16) -> Self {
+    pub fn scroll_at(mut self, x: u16, y: u32) -> Self {
         match &mut self.desc {
             Desc::Viewport(p) => p.scroll = Scroll::Own { x, y },
             _ => panic!("scroll_at() applies to Viewport nodes only"),
@@ -1573,6 +1664,30 @@ impl<M> Node<M> {
         match &mut self.desc {
             Desc::Viewport(p) => p.pinned = Rc::from(indices),
             _ => panic!("pinned() applies to Viewport nodes only"),
+        }
+        self
+    }
+
+    /// [`Node::pinned`] as a function of the offset, which the window
+    /// evaluates at layout — **the pins are layout's answer**, not a list the
+    /// owner recomputes after being told where the window went. A tree's
+    /// sticky ancestors are the expanded ancestors of the first row of the
+    /// run, so they are known exactly when the offset is: in the window.
+    ///
+    /// The ceiling is the smallest offset whose run, under the pins *that
+    /// offset* has, reaches the last item — which the window can search for
+    /// only because it can ask this at an offset it is not at.
+    pub fn pinned_at(self, f: impl Fn(u32) -> Rc<[u32]> + 'static) -> Self {
+        self.pinned_by(PinnedAt(Rc::new(f)))
+    }
+
+    /// [`Node::pinned_at`] with the function already made, for a builder
+    /// that describes the window more than once and must hand it the same
+    /// function each time: the window compares it by identity.
+    pub fn pinned_by(mut self, f: PinnedAt) -> Self {
+        match &mut self.desc {
+            Desc::Viewport(p) => p.pinned_at = Some(f),
+            _ => panic!("pinned_by() applies to Viewport nodes only"),
         }
         self
     }
@@ -1751,6 +1866,19 @@ impl<M> Node<M> {
         self
     }
 
+    /// Lay this row's children on `columns`: child *i* is as wide as column
+    /// *i* comes out at the width this row is laid out at, whatever its own
+    /// sizing says, with the box's [`gap`](Self::gap) between them. Children
+    /// past the last column are sized as usual.
+    ///
+    /// Give every row of a table — and its header — the same `Rc`, and their
+    /// cells line up. A cell that does not fit its column is cut the way its
+    /// own text says ([`Elide`]).
+    pub fn columns(mut self, columns: Rc<Columns>) -> Self {
+        self.box_props().columns = Some(columns);
+        self
+    }
+
     /// Settle a wrapping box's lines against the end of the main axis.
     ///
     /// The answer to "flush right while they fit, wrapped from the left when
@@ -1873,7 +2001,73 @@ impl<M> Node<M> {
 
     /// Which end of this run survives a width it did not ask for.
     ///
-    /// See [`Elide`]. A no-op on anything but a text run, and on a wrapped one.
+    /// See `Elide`. A no-op on anything but a text run, and on a wrapped one.
+    /// Which way this window scrolls: the axis its offset counts along, its
+    /// affordance is drawn on, and its wheel and [`Anchor`](crate::behavior::Anchor)
+    /// commands move it in. Default [`Axis::Vertical`](crate::event::Axis).
+    ///
+    /// **The axis is the window's, not the command's.** `Anchor::reveal_key`
+    /// means "move the target's window so this is inside it", and which way
+    /// that is has exactly one right answer — the one the window scrolls. A
+    /// caller that had to say would be a caller that could say wrong, and
+    /// every command would need a second spelling.
+    ///
+    /// A horizontal window's affordance is not a bar. Its content is on the
+    /// rows a bar would need, so `scrollbar` emits [`Draw::Overflow`](crate::Draw)
+    /// caps over its first and last cell instead.
+    pub fn scroll_axis(mut self, a: crate::event::Axis) -> Self {
+        if let Desc::Viewport(p) = &mut self.desc {
+            p.axis = a;
+        }
+        self
+    }
+
+    /// What an overflow cap paints in while the pointer is on it. Falls back
+    /// to [`Node::scrollbar_theme`] when unset.
+    ///
+    /// A cap is a button, so it lights like one; and because the library is
+    /// what knows the pointer is on it (the cap is not a node — it exists
+    /// because the *window* knows there is more that way), the library is what
+    /// picks between the two names the surface gave it.
+    pub fn scrollbar_hover_theme(mut self, name: impl AsRef<str>) -> Self {
+        match &mut self.desc {
+            Desc::Viewport(p) => p.bar_hover_theme = Some(Rc::from(name.as_ref())),
+            _ => panic!("scrollbar_hover_theme() applies to Viewport nodes only"),
+        }
+        self
+    }
+
+    /// How far a press on an overflow cap moves the window, in the unit its
+    /// offset counts. Default: one windowful.
+    ///
+    /// **A policy, not a measurement.** A windowful is what pressing a
+    /// scrollbar's track means, and it is the right default for a window onto
+    /// a document. It is the wrong one for a strip of tabs, where the cap is a
+    /// nudge and a screenful skips past everything you were looking for — so
+    /// the surface that has an opinion states it, in cells it chose rather
+    /// than in cells it measured.
+    pub fn scroll_step(mut self, cells: u16) -> Self {
+        if let Desc::Viewport(p) = &mut self.desc {
+            p.step = cells;
+        }
+        self
+    }
+
+    /// How wide one overflow cap is, in cells. Default: one.
+    ///
+    /// **A cap is a button, and a button is as wide as the buttons beside
+    /// it.** One cell is enough to say "there is more this way", and it is
+    /// what a window whose neighbours are content wants. A window whose
+    /// neighbours are *buttons* — the tab strip, whose `+` is a padded label —
+    /// wants a cap the pointer meets at the same size, so it says so here and
+    /// the measure reserves that many cells at each end instead of one.
+    pub fn scroll_cap_width(mut self, cells: u16) -> Self {
+        if let Desc::Viewport(p) = &mut self.desc {
+            p.cap = cells;
+        }
+        self
+    }
+
     pub fn elide(mut self, e: Elide) -> Self {
         if let Desc::TextRun(t) = &mut self.desc {
             t.elide = e;
@@ -1929,10 +2123,6 @@ impl<M> Node<M> {
 
     pub fn on_click(self, f: impl Fn(&Event) -> M + 'static) -> Self {
         self.on(GestureKind::Click, Rc::new(move |e| Some(f(e))))
-    }
-
-    pub fn on_secondary_click(self, f: impl Fn(&Event) -> M + 'static) -> Self {
-        self.on(GestureKind::SecondaryClick, Rc::new(move |e| Some(f(e))))
     }
 
     /// The pointer entered this node. Fired on the node itself, not propagated —
@@ -1998,9 +2188,38 @@ impl<M> Node<M> {
         self
     }
 
+    /// Traversal inside this subtree follows `policy` — Tab, Shift+Tab and the
+    /// arrows alike, from any element in it.
+    ///
+    /// Which stop a move reaches is a property of the surface, not of the
+    /// application: a form reads in order, a grid of buttons or a two-column
+    /// dialog moves by where things are. The nearest ancestor that declares a
+    /// policy decides; with none declared, the one installed with
+    /// [`crate::Ui::set_traversal_policy`] does.
+    pub fn traversal(mut self, policy: impl crate::focus::TraversalPolicy + 'static) -> Self {
+        self.focus_props().traversal = Some(Rc::new(policy));
+        self
+    }
+
     /// Rebuild when focus enters or leaves this subtree.
     pub fn focus_within(mut self) -> Self {
         self.focus_props().focus_within = true;
+        self
+    }
+
+    /// Be told when focus enters this subtree (`FocusGained`) or leaves it
+    /// (`FocusLost`) — a move *within* the subtree is neither. Implies
+    /// [`Self::focus_within`].
+    ///
+    /// [`Self::on_focus_change`] answers for this element alone. A surface
+    /// whose keyboard is a subtree — a panel, whose controls are its
+    /// descendants — asks this instead: a layer opening over it takes focus
+    /// out of the subtree without any control in it changing, and closing
+    /// that layer brings focus back in the same way.
+    pub fn on_focus_within_change(mut self, f: impl Fn(&Event) -> Option<M> + 'static) -> Self {
+        let p = self.focus_props();
+        p.focus_within = true;
+        p.on_focus_within_change = Some(Rc::new(f));
         self
     }
 

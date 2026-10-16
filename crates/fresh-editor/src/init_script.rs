@@ -268,8 +268,8 @@ fn embedded_fresh_dts_path() -> Option<PathBuf> {
     None
 }
 
-/// Refresh `~/.config/fresh/types/fresh.d.ts` from the embedded copy and
-/// write `tsconfig.json` if it isn't already present.
+/// Refresh `~/.config/fresh/types/fresh.d.ts` from the embedded copy, and
+/// write `types/plugins.d.ts` and `tsconfig.json` if they aren't present.
 ///
 /// `fresh.d.ts` is **always overwritten** — it's an auto-generated API
 /// mirror that must track the running binary. Keeping a stale copy in
@@ -303,11 +303,25 @@ pub fn refresh_types_scaffolding(config_dir: &Path) {
         );
     }
 
+    ensure_plugin_declarations(config_dir);
+
     let tsconfig = config_dir.join("tsconfig.json");
     if !tsconfig.exists() {
         if let Err(e) = std::fs::write(&tsconfig, INIT_TSCONFIG) {
             tracing::warn!("init.ts: failed to write {}: {e}", tsconfig.display());
         }
+    }
+}
+
+/// Create an empty `<config_dir>/types/plugins.d.ts` if there is none.
+///
+/// The real contents are written once plugins load, which can be after a
+/// TypeScript server has started. A server that starts while the file is
+/// missing never picks it up, and keeps typing `getPluginApi()` as `{}`.
+/// With the file present from the start, the server sees the rewrite.
+pub fn ensure_plugin_declarations(config_dir: &Path) {
+    if !config_dir.join("types").join("plugins.d.ts").exists() {
+        write_plugin_declarations(config_dir, &[]);
     }
 }
 
@@ -602,10 +616,6 @@ pub fn check(config_dir: &Path) -> CheckReport {
 
 #[cfg(feature = "plugins")]
 pub fn check(config_dir: &Path) -> CheckReport {
-    use oxc_allocator::Allocator;
-    use oxc_parser::Parser;
-    use oxc_span::SourceType;
-
     let path = init_ts_path(config_dir);
 
     let source = match std::fs::read_to_string(&path) {
@@ -631,47 +641,25 @@ pub fn check(config_dir: &Path) -> CheckReport {
         }
     };
 
-    let allocator = Allocator::default();
-    let source_type = SourceType::from_path(&path).unwrap_or_default();
-    let parser_ret = Parser::new(&allocator, &source, source_type).parse();
-
-    let mut diagnostics = Vec::new();
-    for err in &parser_ret.errors {
-        // oxc errors carry labels/spans but the formatting is embedded in
-        // the miette-style Display impl. Pull the primary message + try to
-        // recover line/column from the start of the first label.
-        let (line, column) = err
-            .labels
-            .as_ref()
-            .and_then(|v| v.first())
-            .map(|l| line_col(&source, l.offset()))
-            .unwrap_or((0, 0));
-        diagnostics.push(CheckDiagnostic {
-            severity: CheckSeverity::Error,
-            message: err.message.to_string(),
-            line,
-            column,
-        });
-    }
+    // The same parser the runtime compiles init.ts with: oxc in-process, or
+    // the `esbuild` executable in builds without the `oxc` feature.
+    let filename = path.to_string_lossy();
+    let diagnostics: Vec<CheckDiagnostic> =
+        fresh_plugin_runtime::fresh_parser_js::syntax_errors(&source, &filename)
+            .into_iter()
+            .map(|e| CheckDiagnostic {
+                severity: CheckSeverity::Error,
+                message: e.message,
+                line: e.line,
+                column: e.column,
+            })
+            .collect();
 
     CheckReport {
-        ok: parser_ret.errors.is_empty(),
+        ok: diagnostics.is_empty(),
         diagnostics,
         path,
     }
-}
-
-/// Convert a byte offset into a (line, column) pair, 1-based, for display.
-#[cfg(feature = "plugins")]
-fn line_col(source: &str, offset: usize) -> (u32, u32) {
-    let clipped = source.get(..offset).unwrap_or(source);
-    let line = 1 + clipped.bytes().filter(|&b| b == b'\n').count();
-    let col = 1 + clipped
-        .rsplit('\n')
-        .next()
-        .map(|s| s.chars().count())
-        .unwrap_or(0);
-    (line as u32, col as u32)
 }
 
 #[cfg(test)]
@@ -825,6 +813,23 @@ mod tests {
         assert!(
             STARTER_TEMPLATE.contains(r#"/// <reference path="./types/plugins.d.ts" />"#),
             "starter template must reference plugins.d.ts so plugin APIs are typed"
+        );
+    }
+
+    #[test]
+    fn ensure_plugin_declarations_creates_but_never_overwrites() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("types/plugins.d.ts");
+
+        ensure_plugin_declarations(tmp.path());
+        assert!(path.exists(), "missing plugins.d.ts should be created");
+
+        std::fs::write(&path, "// real declarations\n").unwrap();
+        ensure_plugin_declarations(tmp.path());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "// real declarations\n",
+            "an existing plugins.d.ts must be left alone"
         );
     }
 

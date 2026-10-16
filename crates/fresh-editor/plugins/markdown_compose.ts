@@ -7,7 +7,32 @@
 //
 // Syntax highlighting is handled by the TextMate grammar (built-in to the editor)
 // This plugin only adds the compose mode layout features.
+import { wrapToWidth } from "./lib/text.ts";
+
 const editor = getEditor();
+
+// Everything this plugin draws is the composed rendering of one pane, but
+// decorations live on the buffer: a pane showing the same buffer as source
+// must not draw them. `composeOnly` is the editor's switch for that — every
+// conceal, overlay and virtual text below goes through these helpers or
+// carries it in its options.
+function addComposeConceal(
+  bufferId: number, namespace: string, start: number, end: number,
+  replacement: string | null,
+  activation?: string, scopeStart?: number, scopeEnd?: number,
+): void {
+  editor.addConceal(
+    bufferId, namespace, start, end, replacement,
+    activation ?? null, scopeStart ?? null, scopeEnd ?? null, true,
+  );
+}
+
+function addComposeOverlay(
+  bufferId: number, namespace: string, start: number, end: number,
+  options: Record<string, unknown>,
+): void {
+  editor.addOverlay(bufferId, namespace, start, end, { ...options, composeOnly: true });
+}
 
 
 interface MarkdownConfig {
@@ -287,7 +312,7 @@ function buildCodeFrameLine(measure: number, left: string, right: string): strin
 }
 
 // fg matches the table frame's so the two kinds of block read as one system.
-const codeFrameStyle = { fg: "editor.fg" };
+const codeFrameStyle = { fg: "editor.fg", composeOnly: true };
 
 // =============================================================================
 // Code block side rails
@@ -362,17 +387,22 @@ function codeInnerWidth(measure: number): number {
  * Shared by the rail pass and the soft-break pass so the two cannot disagree
  * about where the rows are, exactly as `widthsForRow` is shared for tables. */
 interface CodeRow { start: number; end: number }
-function codeRowLayout(text: string, measure: number): { breaks: number[]; rows: CodeRow[] } {
+function codeRowLayout(text: string, measure: number, continuationIndent = 0): { breaks: number[]; rows: CodeRow[] } {
   const inner = codeInnerWidth(measure);
   const breaks: number[] = [];
   const rows: CodeRow[] = [];
   let rowStart = 0;
   let lastSpace = -1;
   let column = 0;
+  let rowInner = inner;
 
-  for (let i = 0; i < text.length; i++) {
-    const w = displayWidth(text[i]);
-    if (column + w > inner && i > rowStart) {
+  let i = 0;
+  while (i < text.length) {
+    const cp = text.codePointAt(i)!;
+    const charLen = cp > 0xffff ? 2 : 1;
+    const ch = text.slice(i, i + charLen);
+    const w = displayWidth(ch);
+    if (column + w > rowInner && i > rowStart) {
       if (lastSpace > rowStart) {
         // Word break: the space ends the row and is consumed by it.
         breaks.push(lastSpace);
@@ -386,12 +416,14 @@ function codeRowLayout(text: string, measure: number): { breaks: number[]; rows:
         rowStart = i;
       }
       lastSpace = -1;
-      column = 0;
-      for (let j = rowStart; j <= i; j++) column += displayWidth(text[j]);
+      rowInner = Math.max(1, inner - continuationIndent);
+      column = displayWidth(text.slice(rowStart, i + charLen));
+      i += charLen;
       continue;
     }
-    if (text[i] === " ") lastSpace = i;
+    if (ch === " ") lastSpace = i;
     column += w;
+    i += charLen;
   }
   rows.push({ start: rowStart, end: text.length });
   return { breaks, rows };
@@ -436,13 +468,16 @@ function emitCodeRails(
   // The block's indent is real text on this line, drawn before the rail — so
   // the rail is anchored past it and the layout measures only what follows.
   const body = text.slice(blockIndent);
-  const { rows } = codeRowLayout(body, blockMeasure);
+  const codeIndent = body.length - body.trimStart().length;
+  // The indent the rail supplies on the rows a line wraps onto (see below),
+  // which the layout leaves room for.
+  const continuationIndent = Math.min(codeIndent, Math.max(0, inner - 1));
+  const { rows } = codeRowLayout(body, blockMeasure, continuationIndent);
   // A code line's indent WITHIN the block is real text too, so the first row
   // draws it and the rows it wraps onto do not — they would restart flush
   // against the rail, left of the code they continue. The rail supplies it for
   // those rows, because the wrap's own hanging indent would push the RAIL right
   // instead of the code.
-  const codeIndent = body.length - body.trimStart().length;
   // The renderer pads the rail to this column from the row it is drawing. A
   // width computed here lags: this pass is always an edit or two behind.
   const railColumn = { ...codeFrameStyle, padToColumn: codeFrameWidth(measure) };
@@ -450,7 +485,7 @@ function emitCodeRails(
     const row = rows[r];
     if (row.end <= row.start) continue;
     const rowText = body.slice(row.start, row.end);
-    const railIndent = r === 0 ? 0 : Math.min(codeIndent, Math.max(0, inner - 1));
+    const railIndent = r === 0 ? 0 : continuationIndent;
     // Only the first row has the block's indent as real text ahead of it.
     const railLead = r === 0 ? "" : " ".repeat(blockIndent);
 
@@ -628,6 +663,13 @@ async function prescanHeadingMarkers(bufferId: number): Promise<void> {
   let text: string;
   try {
     text = await editor.getBufferText(bufferId, 0, limit + 1);
+    // The caller turned compose on with `setViewMode`, which is queued. The
+    // host answers the read above from inside the same drain — before it
+    // republishes the snapshot `getBufferInfo` reads — so without this the
+    // gate below races that republish and can still see compose off, and the
+    // scan is skipped for a document that is composing. `flush` is what makes
+    // a read observe the caller's own writes.
+    await editor.flush();
   } catch (e) {
     editor.debug(`Heading pre-scan skipped for buffer ${bufferId}: ${e}`);
     return;
@@ -636,7 +678,7 @@ async function prescanHeadingMarkers(bufferId: number): Promise<void> {
     editor.debug(`Heading pre-scan skipped for buffer ${bufferId}: over ${limit} bytes`);
     return;
   }
-  // The await gave the user time to toggle compose off (or close the buffer);
+  // The awaits gave the user time to toggle compose off (or close the buffer);
   // publishing now would strand marks the disable path has already cleared.
   if (!isComposingInAnySplit(bufferId)) return;
 
@@ -840,7 +882,7 @@ function buildTableBorderLine(
 // pattern as addOverlay's fg/bg). fg → editor.fg matches the concealed
 // `│`/`─` glyphs inside rows so the frame has no seam; bg → editor.bg blends
 // with the page rather than carving an opaque slab.
-const tableBorderOptions = { fg: "editor.fg", bg: "editor.bg" };
+const tableBorderOptions = { fg: "editor.fg", bg: "editor.bg", composeOnly: true };
 
 /** Remove table border virtual lines for this row, clearing its *whole content
  * range* `[byteStart, byteEnd)` — exactly like the per-line conceal clear.
@@ -1201,7 +1243,8 @@ function isMarkdownFile(path: string): boolean {
 // Idempotent: safe to call when already in compose mode (re-applies line numbers,
 // line wrap, and layout hints — needed after session restore where Rust already has
 // ViewMode::Compose but the plugin hasn't applied its settings yet).
-function enableMarkdownCompose(bufferId: number): void {
+// `splitId` names the pane to compose; by default, the one in focus.
+function enableMarkdownCompose(bufferId: number, splitId: number | null = null): void {
   const info = editor.getBufferInfo(bufferId);
   if (!info || !isMarkdownFile(info.path)) return;
 
@@ -1238,12 +1281,12 @@ function enableMarkdownCompose(bufferId: number): void {
   // wrap forced on in the source pane every time focus landed on the composing
   // one — this hook runs on `buffer_activated`, so merely switching between
   // the two rewrote the source pane's setting.
-  editor.setLineWrap(bufferId, editor.getActiveSplitId(), true);
+  editor.setLineWrap(bufferId, splitId ?? editor.getActiveSplitId(), true);
 
   // Set layout hints for centered margins. With no explicit session choice
   // this resolves to the configured page width (default 80), so compose opens
   // as a readable measure rather than running the full pane width.
-  editor.setLayoutHints(bufferId, null, { composeWidth: activeComposeWidth() ?? undefined });
+  editor.setLayoutHints(bufferId, splitId, { composeWidth: activeComposeWidth() ?? undefined });
 
   // Trigger a refresh so lines_changed hooks fire for visible content
   editor.refreshLines(bufferId);
@@ -1259,21 +1302,6 @@ function enableMarkdownCompose(bufferId: number): void {
 // Disable compose mode for a buffer
 function disableMarkdownCompose(bufferId: number): void {
   if (isComposing(bufferId)) {
-    // Clear all table border virtual lines (one shared namespace) so the frame
-    // can't linger as orphaned virtual lines after compose is toggled off, and
-    // drop the per-table width memos.
-    editor.clearVirtualTextNamespace(bufferId, TABLE_BORDER_NS);
-    // Same for the inter-list-item spacer rows, so they can't linger as
-    // orphaned virtual lines after compose is toggled off.
-    editor.clearVirtualTextNamespace(bufferId, LIST_SPACING_NS);
-    // And the code blocks' side rails, which are inline virtual text rather
-    // than virtual lines and so are not covered by the namespace clears.
-    editor.removeVirtualTextsByPrefix(bufferId, CODE_RAIL_ID_PREFIX);
-    const memos = (editor.queryMarkers(bufferId, 0, 0x7fffffff) as Array<{ id: string }>) || [];
-    for (const m of memos) {
-      if (m.id.startsWith(TABLE_WIDTH_NS_PREFIX)) editor.deleteMarker(bufferId, m.id);
-    }
-
     // Tell Rust side this buffer is back in source mode
     editor.setViewMode(bufferId, "source");
 
@@ -1289,16 +1317,38 @@ function disableMarkdownCompose(bufferId: number): void {
     editor.setFoldIndicators(bufferId, null);
     editor.setIndentationGuide(bufferId, null);
 
-    // Clear layout hints, emphasis overlays, conceals, and soft breaks
-    editor.setLayoutHints(bufferId, null, {});
-    editor.clearNamespace(bufferId, "md-emphasis");
-    editor.clearConcealNamespace(bufferId, "md-syntax");
-    editor.clearSoftBreakNamespace(bufferId, "md-wrap");
-    editor.clearScrollbarMarkers(bufferId, HEADING_MARKER_NS);
-
-    editor.refreshLines(bufferId);
+    clearComposeDecorations(bufferId);
     editor.debug(`Markdown compose disabled for buffer ${bufferId}`);
   }
+}
+
+// Remove everything compose drew on the buffer, and its page-width layout
+// hints. Decorations live on the buffer, not on a pane, so this is for when
+// no pane composes the buffer any more.
+function clearComposeDecorations(bufferId: number): void {
+  // Clear all table border virtual lines (one shared namespace) so the frame
+  // can't linger as orphaned virtual lines after compose is toggled off, and
+  // drop the per-table width memos.
+  editor.clearVirtualTextNamespace(bufferId, TABLE_BORDER_NS);
+  // Same for the inter-list-item spacer rows, so they can't linger as
+  // orphaned virtual lines after compose is toggled off.
+  editor.clearVirtualTextNamespace(bufferId, LIST_SPACING_NS);
+  // And the code blocks' side rails, which are inline virtual text rather
+  // than virtual lines and so are not covered by the namespace clears.
+  editor.removeVirtualTextsByPrefix(bufferId, CODE_RAIL_ID_PREFIX);
+  const memos = (editor.queryMarkers(bufferId, 0, 0x7fffffff) as Array<{ id: string }>) || [];
+  for (const m of memos) {
+    if (m.id.startsWith(TABLE_WIDTH_NS_PREFIX)) editor.deleteMarker(bufferId, m.id);
+  }
+
+  // Clear layout hints, emphasis overlays, conceals, and soft breaks
+  editor.setLayoutHints(bufferId, null, {});
+  editor.clearNamespace(bufferId, "md-emphasis");
+  editor.clearConcealNamespace(bufferId, "md-syntax");
+  editor.clearSoftBreakNamespace(bufferId, "md-wrap");
+  editor.clearScrollbarMarkers(bufferId, HEADING_MARKER_NS);
+
+  editor.refreshLines(bufferId);
 }
 
 // Toggle markdown compose mode for current buffer
@@ -1349,6 +1399,166 @@ function markdownToggleComposeAll(): void {
   }
 }
 registerHandler("markdownToggleComposeAll", markdownToggleComposeAll);
+
+// =============================================================================
+// View modes: Source, Rendered, and Source/Compose dual mode (the source
+// beside its composed view)
+// =============================================================================
+//
+// Source and Rendered act on the pane in focus, as Toggle Compose does. Dual mode
+// opens a tab in that pane holding the file twice, side by side: a source
+// panel and a rendered one, scrolling together. The tab is a buffer group
+// whose panels show the file itself, so both edit it. Leaving dual mode closes the
+// tab; the file stays open in the pane, as it was.
+
+/** A dual-mode tab: its buffer group, the file it shows, and the pane it opened
+ * in. Group ids are per window, so the window is part of its name. */
+interface DualView {
+  groupId: number;
+  windowId: number;
+  bufferId: number;
+  hostSplit: number;
+}
+const duals: DualView[] = [];
+
+/** The dual view of `bufferId` in the pane in focus, if there is one. One whose
+ * pane is gone (closed, its tabs taken by a neighbour) matches any pane. */
+function dualHere(bufferId: number): DualView | undefined {
+  const info = editor.getBufferInfo(bufferId);
+  const active = editor.getActiveSplitId();
+  // Panes on screen, and the panes holding the file behind a tab (a pane
+  // showing a dual-mode tab is listed only there).
+  const panes = [
+    ...(editor.listSplits() || []).map((s: SplitSnapshot) => s.splitId),
+    ...(info?.splits ?? []),
+  ];
+  return duals.find((d) =>
+    d.bufferId === bufferId && d.windowId === info?.window_id
+    && (d.hostSplit === active || !panes.includes(d.hostSplit)));
+}
+
+function forgetDual(dual: DualView): void {
+  duals.splice(duals.indexOf(dual), 1);
+}
+
+/** A dual-mode tab closed: the user closed it or the file, or a mode command
+ * left dual mode. With no pane composing the file any more, compose's decorations go. */
+editor.on("buffer_group_closed", async (data) => {
+  const dual = duals.find((d) => d.groupId === data.group_id && d.windowId === data.window_id);
+  if (!dual) return;
+  forgetDual(dual);
+  await editor.flush();
+  if (editor.getBufferInfo(dual.bufferId) && !isComposingInAnySplit(dual.bufferId)) {
+    clearComposeDecorations(dual.bufferId);
+  }
+});
+
+/** Close the dual-mode tab of `bufferId` in the pane in focus, if it has one, and
+ * wait for the pane to show the file again. */
+async function leaveDual(bufferId: number): Promise<void> {
+  const dual = dualHere(bufferId);
+  if (!dual) return;
+  forgetDual(dual);
+  editor.closeBufferGroup(dual.groupId);
+  await editor.flush();
+  if (!isComposingInAnySplit(bufferId)) clearComposeDecorations(bufferId);
+}
+
+function currentViewMode(bufferId: number): "source" | "rendered" | "dual" {
+  if (dualHere(bufferId)) return "dual";
+  return isComposing(bufferId) ? "rendered" : "source";
+}
+
+/** The active buffer, if it is a markdown file; otherwise says so and returns null. */
+function activeMarkdownBuffer(): number | null {
+  const bufferId = editor.getActiveBufferId();
+  const info = editor.getBufferInfo(bufferId);
+  if (!info) return null;
+  if (!isMarkdownFile(info.path)) {
+    editor.setStatus(editor.t("status.not_markdown_file"));
+    return null;
+  }
+  return bufferId;
+}
+
+async function markdownModeSource(): Promise<void> {
+  const bufferId = activeMarkdownBuffer();
+  if (bufferId === null) return;
+  await leaveDual(bufferId);
+  disableMarkdownCompose(bufferId);
+  editor.setStatus(editor.t("status.mode_source"));
+}
+registerHandler("markdownModeSource", markdownModeSource);
+
+async function markdownModeRendered(): Promise<void> {
+  const bufferId = activeMarkdownBuffer();
+  if (bufferId === null) return;
+  await leaveDual(bufferId);
+  enableMarkdownCompose(bufferId);
+  editor.setStatus(editor.t("status.mode_rendered"));
+}
+registerHandler("markdownModeRendered", markdownModeRendered);
+
+async function markdownModeDual(): Promise<void> {
+  const bufferId = activeMarkdownBuffer();
+  if (bufferId === null) return;
+  if (!dualHere(bufferId)) {
+    // The dual-mode tab opens in the pane in focus, which leaves compose first if
+    // it was composing.
+    disableMarkdownCompose(bufferId);
+    const name = editor.getBufferInfo(bufferId)?.name ?? "";
+    // The tab opens in this pane.
+    const hostSplit = editor.getActiveSplitId();
+    const panel = (id: string) => ({ type: "scrollable", id, bufferId });
+    const group = await editor.createBufferGroup(
+      editor.t("dual.tab_name", { name }),
+      "",
+      JSON.stringify({ type: "split", direction: "h", ratio: 0.5, first: panel("source"), second: panel("preview") }),
+    );
+    duals.push({
+      groupId: group.groupId,
+      windowId: editor.getBufferInfo(bufferId)?.window_id ?? 0,
+      bufferId,
+      hostSplit,
+    });
+    // Compose the preview panel. The settings that name no pane apply to
+    // the one in focus, so it takes the focus while they are made.
+    editor.focusBufferGroupPanel(group.groupId, "preview");
+    enableMarkdownCompose(bufferId, group.panelSplits.preview);
+    // Indentation guides are a setting of the buffer, not of a pane, so
+    // compose's opinion would hide them in the source panel too. Withdraw
+    // it: the source panel is where the user edits.
+    editor.setIndentationGuide(bufferId, null);
+    // The preview panel's split id names the sync group: unique while the
+    // panel lives, which is as long as the group does, so a reloaded plugin
+    // never reuses an id an earlier dual view still holds.
+    const { source, preview } = group.panelSplits;
+    editor.createScrollSyncGroup(preview, source, preview);
+    editor.focusBufferGroupPanel(group.groupId, "source");
+  }
+  editor.setStatus(editor.t("status.mode_dual"));
+}
+registerHandler("markdownModeDual", markdownModeDual);
+
+// Source → Rendered → Source/Compose dual → Source.
+async function markdownCycleMode(): Promise<void> {
+  const bufferId = activeMarkdownBuffer();
+  if (bufferId === null) return;
+  const mode = currentViewMode(bufferId);
+  if (mode === "source") await markdownModeRendered();
+  else if (mode === "rendered") await markdownModeDual();
+  else await markdownModeSource();
+}
+registerHandler("markdownCycleMode", markdownCycleMode);
+
+// Dual mode on, or back to a single source pane.
+async function markdownToggleDual(): Promise<void> {
+  const bufferId = activeMarkdownBuffer();
+  if (bufferId === null) return;
+  if (currentViewMode(bufferId) === "dual") await markdownModeSource();
+  else await markdownModeDual();
+}
+registerHandler("markdownToggleDual", markdownToggleDual);
 
 /**
  * Extract text content from incoming tokens
@@ -1587,28 +1797,10 @@ function distributeColumnWidths(maxW: number[], available: number): number[] {
 }
 
 /**
- * Wrap text into lines of at most `width` characters, breaking at word boundaries.
+ * Wrap text into lines of at most `width` columns, breaking at word boundaries.
  */
 function wrapText(text: string, width: number): string[] {
-  if (width <= 0 || text.length <= width) return [text];
-  const lines: string[] = [];
-  let pos = 0;
-  while (pos < text.length) {
-    if (pos + width >= text.length) {
-      lines.push(text.slice(pos));
-      break;
-    }
-    let breakAt = text.lastIndexOf(' ', pos + width);
-    if (breakAt <= pos) {
-      breakAt = pos + width;
-      lines.push(text.slice(pos, breakAt));
-      pos = breakAt;
-    } else {
-      lines.push(text.slice(pos, breakAt));
-      pos = breakAt + 1;
-    }
-  }
-  return lines.length > 0 ? lines : [text];
+  return wrapToWidth(text, width, displayWidth);
 }
 
 // =============================================================================
@@ -1711,7 +1903,7 @@ function listItemInfo(content: string, measure: number): ListLineInfo | null {
 // bytes ahead under the async `lines_changed` lag must still be caught by the
 // clear.
 const LIST_SPACING_NS = "md-ls";
-const listSpacingOptions = { bg: "editor.bg" };
+const listSpacingOptions = { bg: "editor.bg", composeOnly: true };
 const listBulletStyle = { fg: "syntax.keyword" };
 
 // Block-quote rendering. The bar is a left half-block: it fills the full cell
@@ -1854,11 +2046,11 @@ function processLineConceals(
     const frame = region === "open"
       ? buildCodeFrameLine(blockMeasure, "┌", "┐")
       : buildCodeFrameLine(blockMeasure, "└", "┘");
-    editor.addConceal(
+    addComposeConceal(
       bufferId, "md-syntax", frameStart, frameEnd, frame,
       "unless-cursor-in", byteStart, lineScopeInclEnd,
     );
-    editor.addOverlay(bufferId, "md-emphasis", frameStart, frameEnd, codeFrameStyle);
+    addComposeOverlay(bufferId, "md-emphasis", frameStart, frameEnd, codeFrameStyle);
     return;
   }
   // A fence-looking line the editor could not classify: leave it literal
@@ -1876,11 +2068,11 @@ function processLineConceals(
   if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
     const hrWidth = Math.max(1, measure - 2);
     const hrEnd = lineContentEndByte(lineContent, byteStart);
-    editor.addConceal(
+    addComposeConceal(
       bufferId, "md-syntax", byteStart, hrEnd, "─".repeat(hrWidth),
       "unless-cursor-in", byteStart, lineScopeInclEnd,
     );
-    editor.addOverlay(
+    addComposeOverlay(
       bufferId, "md-emphasis", byteStart, hrEnd, { fg: "ui.split_separator_fg" },
     );
     return;
@@ -1940,7 +2132,7 @@ function processLineConceals(
         for (let vl = 0; vl < visualLines.length; vl++) {
           const sByteS = charToByte(lineContent, segStarts[vl], byteStart);
           const sByteE = charToByte(lineContent, segEnds[vl], byteStart);
-          editor.addConceal(
+          addComposeConceal(
             bufferId, "md-syntax", sByteS, sByteE, visualLines[vl] || '',
             "unless-cursor-in", byteStart, lineScopeStrictEnd,
           );
@@ -1963,7 +2155,7 @@ function processLineConceals(
               padOn = " ".repeat(colWidths[cellIdx] - rawW);
             }
           }
-          editor.addConceal(
+          addComposeConceal(
             bufferId, "md-syntax", pipeByte, pipeByteEnd, padOn + "│",
             "if-cursor-in", byteStart, lineScopeStrictEnd,
           );
@@ -2076,7 +2268,7 @@ function processLineConceals(
               // Normalised: `␣` + content + pad, the two whitespace runs
               // concealed away so the content keeps its own decorations.
               if (norm.lead > 0) {
-                editor.addConceal(
+                addComposeConceal(
                   bufferId, "md-syntax",
                   charToByte(lineContent, norm.charStart, byteStart),
                   charToByte(lineContent, norm.charStart + norm.lead, byteStart),
@@ -2084,7 +2276,7 @@ function processLineConceals(
                 );
               }
               if (norm.trail > 0) {
-                editor.addConceal(
+                addComposeConceal(
                   bufferId, "md-syntax",
                   charToByte(lineContent, norm.charEnd - norm.trail, byteStart),
                   pipeByte, "", "unless-cursor-in", byteStart, lineScopeStrictEnd,
@@ -2100,7 +2292,7 @@ function processLineConceals(
               const content = concealedText(
                 lineContent.slice(norm.charStart, norm.charEnd),
               ).trim();
-              editor.addConceal(
+              addComposeConceal(
                 bufferId, "md-syntax", cellByteStart, pipeByte,
                 " " + content.slice(0, Math.max(0, allocatedWidth - 2)) + "-",
                 "unless-cursor-in", byteStart, lineScopeStrictEnd,
@@ -2117,7 +2309,7 @@ function processLineConceals(
               if (offWidth > allocatedWidth) {
                 const prevPipeCharPos = pipePositions[pipeIdx - 1];
                 const cellByteStart = charToByte(lineContent, prevPipeCharPos + 1, byteStart);
-                editor.addConceal(
+                addComposeConceal(
                   bufferId, "md-syntax", cellByteStart, pipeByte,
                   isSeparator
                     ? '─'.repeat(allocatedWidth)
@@ -2152,13 +2344,13 @@ function processLineConceals(
           }
           if (padOff === padOn && leadOff === "") {
             // Same rendering in both cursor states — one always-active conceal.
-            editor.addConceal(bufferId, "md-syntax", pipeByte, pipeByteEnd, padOff + glyph);
+            addComposeConceal(bufferId, "md-syntax", pipeByte, pipeByteEnd, padOff + glyph);
           } else {
-            editor.addConceal(
+            addComposeConceal(
               bufferId, "md-syntax", pipeByte, pipeByteEnd, padOff + glyph + leadOff,
               "unless-cursor-in", byteStart, lineScopeStrictEnd,
             );
-            editor.addConceal(
+            addComposeConceal(
               bufferId, "md-syntax", pipeByte, pipeByteEnd, padOn + glyph,
               "if-cursor-in", byteStart, lineScopeStrictEnd,
             );
@@ -2174,12 +2366,12 @@ function processLineConceals(
           const db = charToByte(lineContent, i, byteStart);
           const de = charToByte(lineContent, i + 1, byteStart);
           if (inTruncated) {
-            editor.addConceal(
+            addComposeConceal(
               bufferId, "md-syntax", db, de, "─",
               "if-cursor-in", byteStart, lineScopeStrictEnd,
             );
           } else {
-            editor.addConceal(bufferId, "md-syntax", db, de, "─");
+            addComposeConceal(bufferId, "md-syntax", db, de, "─");
           }
         }
       }
@@ -2197,7 +2389,7 @@ function processLineConceals(
   if (imageMatch) {
     const alt = imageMatch[1];
     const url = imageMatch[2];
-    editor.addConceal(
+    addComposeConceal(
       bufferId, "md-syntax", byteStart, byteEnd, `Image: ${alt} — ${url}`,
       "unless-cursor-in", byteStart, lineScopeInclEnd,
     );
@@ -2229,11 +2421,11 @@ function processLineConceals(
       if (lineContent[i] !== '>') continue;
       const markerByte = charToByte(lineContent, i, byteStart);
       const markerByteEnd = charToByte(lineContent, i + 1, byteStart);
-      editor.addConceal(
+      addComposeConceal(
         bufferId, "md-syntax", markerByte, markerByteEnd, QUOTE_BAR,
         "unless-cursor-in", byteStart, lineScopeInclEnd,
       );
-      editor.addOverlay(
+      addComposeOverlay(
         bufferId, "md-emphasis", markerByte, markerByteEnd, quoteBarStyle,
       );
     }
@@ -2241,7 +2433,7 @@ function processLineConceals(
     const quotedStart = charToByte(lineContent, runEnd, byteStart);
     const quotedEnd = lineContentEndByte(lineContent, byteStart);
     if (quotedEnd > quotedStart) {
-      editor.addOverlay(
+      addComposeOverlay(
         bufferId, "md-emphasis", quotedStart, quotedEnd, quoteTextStyle,
       );
     }
@@ -2258,11 +2450,11 @@ function processLineConceals(
     const [indent, markerLen, level] = heading;
     const markerByteStart = charToByte(lineContent, indent, byteStart);
     const markerByteEnd = charToByte(lineContent, indent + markerLen, byteStart);
-    editor.addConceal(
+    addComposeConceal(
       bufferId, "md-syntax", markerByteStart, markerByteEnd, null,
       "unless-cursor-in", byteStart, lineScopeInclEnd,
     );
-    editor.addOverlay(
+    addComposeOverlay(
       bufferId, "md-emphasis", markerByteEnd, byteEnd, headingTextStyle(level),
     );
   }
@@ -2276,7 +2468,7 @@ function processLineConceals(
       // with a longer run. processLineSoftBreaks charges the same widened
       // indent against the wrap budget, so the two passes agree.
       const indentEndByte = charToByte(lineContent, listInfo.sourceIndent, byteStart);
-      editor.addConceal(
+      addComposeConceal(
         bufferId, "md-syntax", byteStart, indentEndByte,
         " ".repeat(listInfo.renderedIndent),
         "unless-cursor-in", byteStart, lineScopeInclEnd,
@@ -2285,11 +2477,11 @@ function processLineConceals(
     if (listInfo.bullet !== null) {
       const bulletByte = charToByte(lineContent, listInfo.sourceIndent, byteStart);
       const bulletByteEnd = charToByte(lineContent, listInfo.sourceIndent + 1, byteStart);
-      editor.addConceal(
+      addComposeConceal(
         bufferId, "md-syntax", bulletByte, bulletByteEnd, LIST_BULLET,
         "unless-cursor-in", byteStart, lineScopeInclEnd,
       );
-      editor.addOverlay(
+      addComposeOverlay(
         bufferId, "md-emphasis", bulletByte, bulletByteEnd, listBulletStyle,
       );
     }
@@ -2311,22 +2503,22 @@ function processLineConceals(
     // Overlays (styling)
     switch (span.type) {
       case 'code':
-        editor.addOverlay(bufferId, "md-emphasis", byteCS, byteCE, { fg: "syntax.constant" });
+        addComposeOverlay(bufferId, "md-emphasis", byteCS, byteCE, { fg: "syntax.constant" });
         break;
       case 'bold':
-        editor.addOverlay(bufferId, "md-emphasis", byteCS, byteCE, { bold: true });
+        addComposeOverlay(bufferId, "md-emphasis", byteCS, byteCE, { bold: true });
         break;
       case 'italic':
-        editor.addOverlay(bufferId, "md-emphasis", byteCS, byteCE, { italic: true });
+        addComposeOverlay(bufferId, "md-emphasis", byteCS, byteCE, { italic: true });
         break;
       case 'bold-italic':
-        editor.addOverlay(bufferId, "md-emphasis", byteCS, byteCE, { bold: true, italic: true });
+        addComposeOverlay(bufferId, "md-emphasis", byteCS, byteCE, { bold: true, italic: true });
         break;
       case 'strikethrough':
-        editor.addOverlay(bufferId, "md-emphasis", byteCS, byteCE, { strikethrough: true });
+        addComposeOverlay(bufferId, "md-emphasis", byteCS, byteCE, { strikethrough: true });
         break;
       case 'link':
-        editor.addOverlay(bufferId, "md-emphasis", byteCS, byteCE, {
+        addComposeOverlay(bufferId, "md-emphasis", byteCS, byteCE, {
           fg: "syntax.link",
           underline: true,
           url: span.linkUrl,
@@ -2345,7 +2537,7 @@ function processLineConceals(
     for (const range of span.concealRanges) {
       const rStart = charToByte(lineContent, range.start, byteStart);
       const rEnd = charToByte(lineContent, range.end, byteStart);
-      editor.addConceal(
+      addComposeConceal(
         bufferId, "md-syntax", rStart, rEnd, range.replacement,
         "unless-cursor-in", scopeStart, scopeEnd,
       );
@@ -2781,7 +2973,10 @@ function processFlowBlock(
     const blockIndent = blockIndents.get(head.byte_start) ?? 0;
     const body = text.slice(blockIndent);
     const blockWidth = Math.max(4, width - blockIndent);
-    for (const charPos of codeRowLayout(body, blockWidth).breaks.map(
+    const inner = codeInnerWidth(blockWidth);
+    const codeIndent = body.length - body.trimStart().length;
+    const railIndent = Math.min(codeIndent, Math.max(0, inner - 1));
+    for (const charPos of codeRowLayout(body, blockWidth, railIndent).breaks.map(
       (p) => p + blockIndent,
     )) {
       // Indent 0, not the rail's width: the continuation row's own left rail
@@ -2939,7 +3134,7 @@ function processFlowBlock(
     const text = lineText(line);
     const joinEnd = line.byte_start
       + editor.utf8ByteLength(text.slice(0, block.contentStart[li]));
-    editor.addConceal(
+    addComposeConceal(
       bufferId, "md-syntax", joinStart, joinEnd, " ",
     );
   }
@@ -3422,6 +3617,9 @@ editor.on("prompt_confirmed", (args) => {
 });
 editor.on("buffer_activated", (data) => {
   const bufferId = data.buffer_id;
+  // Dual mode set its panels up itself; what this reads is the pane holding
+  // the dual-mode tab, not the panel in focus.
+  if (dualHere(bufferId)) return;
 
   const info = editor.getBufferInfo(bufferId);
   if (!info || !isMarkdownFile(info.path)) return;
@@ -3448,8 +3646,8 @@ function markdownSetComposeWidth() : void {
   editor.startPromptWithInitial(editor.t("prompt.compose_width"), "markdown-compose-width", currentValue);
   editor.setPromptInputSync(true);
   editor.setPromptSuggestions([
-    { text: "None", description: editor.t("suggestion.none") },
-    { text: "120", description: editor.t("suggestion.default") },
+    { id: "None", text: "None", description: editor.t("suggestion.none") },
+    { id: "120", text: "120", description: editor.t("suggestion.default") },
   ]);
 }
 registerHandler("markdownSetComposeWidth", markdownSetComposeWidth);
@@ -3476,6 +3674,41 @@ editor.registerCommand(
   "%cmd.set_compose_width",
   "%cmd.set_compose_width_desc",
   "markdownSetComposeWidth",
+  null
+);
+
+editor.registerCommand(
+  "%cmd.mode_source",
+  "%cmd.mode_source_desc",
+  "markdownModeSource",
+  null
+);
+
+editor.registerCommand(
+  "%cmd.mode_rendered",
+  "%cmd.mode_rendered_desc",
+  "markdownModeRendered",
+  null
+);
+
+editor.registerCommand(
+  "%cmd.mode_dual",
+  "%cmd.mode_dual_desc",
+  "markdownModeDual",
+  null
+);
+
+editor.registerCommand(
+  "%cmd.cycle_mode",
+  "%cmd.cycle_mode_desc",
+  "markdownCycleMode",
+  null
+);
+
+editor.registerCommand(
+  "%cmd.toggle_dual",
+  "%cmd.toggle_dual_desc",
+  "markdownToggleDual",
   null
 );
 

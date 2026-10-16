@@ -137,6 +137,35 @@ pub enum UiFact {
         slot: super::widgets::Slot,
         widget: String,
     },
+    /// A press picked up a `draggable` tree row (`WidgetEvent::drag_source`).
+    /// The row took the pointer as a drag (`fresh_ui::Event::start_drag`);
+    /// `event`, `byte` and `clicks` are the press whole — what a release
+    /// back on the row delivers as its click.
+    WidgetDragStart {
+        slot: super::widgets::Slot,
+        event: crate::widgets::WidgetEvent,
+        byte: Option<usize>,
+        clicks: u8,
+    },
+    /// A drag came onto a row that takes drops: the row's hover, and the
+    /// drag has now been somewhere other than where it started if `event`
+    /// names another row — from then on the plugin hears where it is.
+    WidgetDragOver {
+        slot: super::widgets::Slot,
+        event: crate::widgets::WidgetEvent,
+    },
+    /// A drag went off a row that takes drops.
+    WidgetDragLeave {
+        slot: super::widgets::Slot,
+        event: crate::widgets::WidgetEvent,
+    },
+    /// A drag was released on a row that takes drops; `event` is that row's
+    /// `select`. The drag itself ends when the tree's does
+    /// (`fresh_ui::Ui::dragging`), after this is applied.
+    WidgetDrop {
+        slot: super::widgets::Slot,
+        event: crate::widgets::WidgetEvent,
+    },
     /// A press landed on a plugin widget, carrying what that press means.
     ///
     /// **What replaces the byte-range scan.** The runtime recorded a
@@ -256,11 +285,6 @@ pub enum UiFact {
     /// The pointer was released while a tab's name held it: the drop, if the
     /// drag ever passed its threshold.
     PaneTabDrop,
-    /// The `<` or `>` at a strip's edge: step the strip one notch.
-    PaneTabsScroll {
-        pane: LeafId,
-        delta: i32,
-    },
     /// The `+` after the last tab: the new-tab menu, just below it.
     PaneNewTab {
         pane: LeafId,
@@ -451,26 +475,44 @@ pub enum UiFact {
     /// `Event::clicks` — the editor counts the run, the library carries it,
     /// and the handler reads it, so the two routes cannot disagree about which
     /// row they mean.
+    ///
+    /// `segment` is the folded directory of a compact row's label the press
+    /// landed on, `None` for the row's own name. Either button names it: a
+    /// click on `dir1` of a `dir1/dir2/dir3` row is about `dir1`.
     ExplorerRowPress {
         index: usize,
+        segment: Option<std::path::PathBuf>,
         clicks: u8,
     },
+    /// A held drag came onto this row, or left it. The row it is over decides
+    /// where a drop would land, so the row says which one it is.
+    ExplorerRowDragOver {
+        index: usize,
+        segment: Option<std::path::PathBuf>,
+    },
+    ExplorerRowDragLeave,
+    /// A drag was released over this row.
+    ExplorerRowDrop {
+        index: usize,
+        segment: Option<std::path::PathBuf>,
+    },
     /// A right click on a tree row: select it and open its context menu at the
-    /// pointer.
+    /// pointer. `segment` as on `ExplorerRowPress`.
     ExplorerRowContext {
         index: usize,
+        segment: Option<std::path::PathBuf>,
         x: u16,
         y: u16,
     },
-    /// A right-press on the panel that did not land on a row.
+    /// A right-press on the panel that did not land on a row. It names the
+    /// project root: see
+    /// [`Editor::explorer_body_context`](crate::app::Editor::explorer_body_context).
     ///
     /// The old component bound its right-press to the *whole* explorer — its
     /// comment said "the union box spans the whole explorer" — so a click
     /// past the last entry still opened the menu, in its root mode. Binding
     /// only to rows dropped that: empty space below the files answered
-    /// nothing. The row index is resolved app-side from the panel's own
-    /// rectangle, as the component resolved `relative_row`, because the
-    /// description cannot read geometry.
+    /// nothing.
     ExplorerBodyContext {
         x: u16,
         y: u16,
@@ -532,6 +574,8 @@ pub enum UiFact {
     SuggestionConfirm(usize),
     /// The `×` on the panel's title line.
     ExplorerClose,
+    /// The `⟳` on the panel's title line: re-read the tree from disk.
+    ExplorerRefresh,
     /// A press on the panel's right-edge grip: start a width drag from here.
     ExplorerResizeBegin {
         x: u16,
@@ -625,10 +669,10 @@ pub enum UiFact {
     ///
     /// **The grip captured the pointer on its press**, so this arrives
     /// wherever the pointer has travelled to — which is the whole of what
-    /// `chrome::PointerGrab` and its ladder were arranging by hand. It fires
-    /// on a bare hover over the grip too; whether a drag is actually in
-    /// progress is state the applier holds, and it is the applier that says
-    /// so.
+    /// `chrome::PointerGrab` and its ladder were arranging by hand. Only a
+    /// captured move is reported — a bare hover over the grip is not a
+    /// drag — and the applier reads the gesture's own state for where it
+    /// started.
     GripDrag {
         which: Grip,
         x: u16,
@@ -641,6 +685,13 @@ pub enum UiFact {
     /// A left press landed outside the dock column. Blurs a focused dock and
     /// does nothing to one already blurred; either way the press goes on.
     DockBlur,
+    /// The tree's focus entered (`held`) or left a panel's interior. While the
+    /// panel keeps its keyboard layer that is a layer above it opening or
+    /// closing — see `Editor::panel_keyboard_changed`.
+    PanelKeyboard {
+        slot: super::widgets::Slot,
+        held: bool,
+    },
     /// A press outside the theme inspector, or any key while it is up. Both
     /// dismiss it and both go on to what they were aimed at.
     ThemeInfoDismiss,
@@ -794,13 +845,11 @@ pub enum UiFact {
     /// painter filed one rectangle per visible row in `layout.categories` and
     /// `layout.sections`, and the arm behind them walked both lists.
     SettingsCategory(usize),
+    /// A press on a category in the narrow layout's strip, which has no tree
+    /// to open or shut: it only selects the page (and takes it to the top).
+    SettingsStripCategory(usize),
     /// A press on a section row under a category, by `(category, section)`.
     SettingsCategorySection(usize, usize),
-    /// A press on a category's `▶`/`▼`, which expands it rather than
-    /// selecting it. This was `layout.disclosures` — a one-column rectangle
-    /// per expandable row, filed so a chain of `point_in_rect` could tell the
-    /// chevron from the label beside it.
-    SettingsCategoryDisclosure(usize),
     /// **A key the category tree answered for itself.** The first of the
     /// settings dialog's keys to arrive as what it *means* rather than as
     /// `ModalKey` — "here is your key back, work out whose it was". The node

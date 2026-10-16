@@ -14,9 +14,12 @@ The workspace declares 8 members. `fresh-gui` is a member but **not** in `defaul
 |---|---|---|
 | `fresh-editor` | The `fresh` binary + all runtime subsystems | core, parser-js, languages, plugin-runtime, plugin-api-macros, gui, winterm (all optional / target-gated) |
 | `fresh-core` | Dependency-light shared models, ID types, plugin API surface | — (leaf) |
-| `fresh-parser-js` | JS/TS transpile, bundle, `.d.ts` emit (oxc toolchain) | — (leaf) |
+| `fresh-parser-js` | JS/TS transpile, bundle, `.d.ts` emit (oxc toolchain; feature `oxc`, default) or an external `esbuild` (without it) | — (leaf) |
 | `fresh-languages` | tree-sitter grammars + `Language`/`HighlightCategory` enums | — (leaf) |
-| `fresh-plugin-runtime` | QuickJS (rquickjs) plugin host on a dedicated thread | core (feature `plugins`), parser-js, plugin-api-macros |
+| `fresh-plugin-runtime` | QuickJS (rquickjs) plugin host on a dedicated thread | core (feature `plugins`), js, parser-js, plugin-api-macros |
+| `fresh-js` | The JS engine boundary: the only crate that names the engine. rquickjs re-exports by default; with `--cfg fresh_js_system`, Fresh's own backend over the system QuickJS | quickjs-sys, js-macros (system backend only) |
+| `fresh-quickjs-sys` | bindgen bindings + C shim over the system QuickJS (Debian's `libquickjs`); empty unless `--cfg fresh_js_system` | — (leaf) |
+| `fresh-js-macros` | proc-macros: `#[class]`/`#[methods]` and the `Trace`/`JsLifetime` derives for the system backend | — (leaf, proc-macro) |
 | `fresh-plugin-api-macros` | proc-macro: Rust API impl → TypeScript `.d.ts` | — (leaf, proc-macro) |
 | `fresh-gui` | winit + wgpu native window backend (`publish = false`) | core |
 | `fresh-winterm` | Windows console VT input + relay; empty crate off-Windows | — (leaf) |
@@ -27,7 +30,8 @@ Dependency DAG (local path deps only):
 fresh-editor ──┬─► fresh-core
                ├─► fresh-parser-js
                ├─► fresh-languages
-               ├─► fresh-plugin-runtime ─► fresh-core (feature=plugins)
+               ├─► fresh-plugin-runtime ─► fresh-core (feature=plugins) ─► fresh-js
+               │                          ├► fresh-js
                │                          ├► fresh-parser-js
                │                          └► fresh-plugin-api-macros
                ├─► fresh-gui ─► fresh-core
@@ -38,7 +42,7 @@ fresh-editor ──┬─► fresh-core
 
 ### Why `fresh-core` is separate from `fresh-editor`
 
-`fresh-core` is deliberately **dependency-light**: only serde/serde_json/schemars/anyhow/lsp-types/ts-rs/unicode-width plus an *optional* `rquickjs` gated behind feature `plugins`. No tree-sitter, ratatui, crossterm, tokio, or platform crates. It holds pure-data ID types (cursor, split/leaf/container, buffer, terminal, window) and shared models — the action, plugin-api, command, hooks, config, menu, overlay, services, text-property, file-explorer, file-uri, and display-width surfaces. The reasons for the boundary:
+`fresh-core` is deliberately **dependency-light**: only serde/serde_json/schemars/anyhow/lsp-types/ts-rs/unicode-width plus an *optional* `fresh-js` (the JS engine, rquickjs today) gated behind feature `plugins`. No tree-sitter, ratatui, crossterm, tokio, or platform crates. It holds pure-data ID types (cursor, split/leaf/container, buffer, terminal, window) and shared models — the action, plugin-api, command, hooks, config, menu, overlay, services, text-property, file-explorer, file-uri, and display-width surfaces. The reasons for the boundary:
 
 - **Shared by three crates** — `fresh-plugin-runtime` and `fresh-gui` need the command/action/hook/menu/ID models without dragging in the editor's heavy dependency tree (e.g. `fresh-gui` consumes the core menu types as the single menu source of truth).
 - **`ts-rs` export boundary** — these types are exported so the plugin API and `.d.ts` generation reference one canonical definition.
@@ -52,10 +56,11 @@ The crate was introduced when the project was refactored into a Cargo workspace 
 
 ## 2. Feature gating: `runtime` / `wasm` / `dev-bins`
 
-`fresh-editor` defines the workspace's feature surface. The default set is `plugins`, `runtime`, `embed-plugins`, `tree-sitter`, and `http`.
+`fresh-editor` defines the workspace's feature surface. The default set is `plugins`, `runtime`, `embed-plugins`, `tree-sitter`, `http`, `self-update`, and `oxc`.
 
 - **`runtime`** — the big one: all heavy native deps (crossterm, ratatui, tokio, syntect, alacritty_terminal, portable-pty, lsp-types, notify, libc/nix, `fresh-languages`). The `fresh` binary requires this feature.
-- **`plugins`** — pulls in `fresh-plugin-runtime`/`fresh-parser-js`/`fresh-plugin-api-macros` + oxc to syntax-check `init.ts`.
+- **`plugins`** — pulls in `fresh-plugin-runtime`/`fresh-parser-js`/`fresh-plugin-api-macros`.
+- **`oxc`** — compiles TypeScript in-process with the oxc toolchain. Off ⇒ `fresh-parser-js` runs the system `esbuild` binary for every plugin load (bundled, user, package-manager, `init.ts`) and syntax check, with an on-disk cache; `.d.ts` emit for plugins is unavailable. This is the Debian build, where oxc is not packaged (see `debian-quickjs-spike.md`).
 - **`tree-sitter`** — enables `fresh-languages`' bundled grammars and the tree-sitter AST features; off ⇒ indentation falls back to regex pattern rules.
 - **`embed-plugins`** — bakes plugins into the binary as a fallback.
 - **`http`** — adds the HTTP client; drops the whole TLS stack when off.
@@ -85,7 +90,7 @@ Per-iteration loop structure:
 
 1. Pump local control — drain nested forward requests.
 2. Editor tick — shared per-tick housekeeping: drains async messages (§5), timers, auto-save, file-change polling.
-3. Quit handling: auto-save buffers, end recovery session, save every window's workspace, write orchestrator state, then break.
+3. Quit handling (`Editor::persist_on_exit`, shared with the GUI, the daemon and the test harness): auto-save buffers, end recovery session, save every window's workspace, write orchestrator state, then break. The quit itself is decided before this: with auto-save on, nothing is written until the quit is confirmed (`Ctrl+Q`, and the `confirm_quit` question when that is on); only then are the buffers saved, and one the save can't write — its file changed on disk, or the write failed (say, it needs sudo) — raises the unsaved-changes prompt instead of the exit dropping its edits. Buffers hidden from the tabs (a plugin's replace-in-file) are saved where they can be, but never hold the quit. What gets written and what gets asked about come from one plan (`Editor::exit_save_plan`); the auto-save is `persist_on_exit`'s (`auto_save_on_exit`), and a confirmed quit runs it early so a buffer it can't write can still hold the quit.
 4. Suspend handling — tears down terminal modes, raises `SIGTSTP`, restores on `SIGCONT`.
 5. Force a render if animations are active, an LSP `$/progress` spinner is live, or terminal titles need a poll — these are wall-clock-driven and need periodic frames even with no input.
 6. **Render gate**: render only when one is needed, the frame duration has elapsed since the last render, and rendering is not suppressed. The frame duration is the 60fps cap (~16ms). The draw is bracketed in the terminal's synchronized-update sequences so the terminal shows a coherent frame.
@@ -103,7 +108,7 @@ Communication is **uniformly one-directional**: every background OS thread / tok
 - **Main thread** — the render/event loop. Sole owner of `EditorState`; renders via ratatui, polls crossterm input, runs the editor tick → async-message processing every iteration.
 - **Tokio runtime: 2 worker threads** — a multi-thread runtime named `editor-async`, created once during editor init, held as a shared handle on the `Editor` and mirrored into windows. Hosts all LSP I/O tasks, file-explorer scans, plugin spawn/HTTP, remote connect/reconnect, and quick-open scans. If the runtime fails to build, async features degrade gracefully — every use is optional.
 - **Plugin thread** — one dedicated OS thread running the QuickJS/TS runtime. Returns results to the main loop via the async bridge as plugin messages; health-checked each frame.
-- **Terminal threads (per PTY)** — each spawned terminal gets a plain `std::thread` reader thread (PTY → alacritty emulator → posts terminal output) and a wait thread (blocks on the child process, posts a terminal-exited message). Not tokio.
+- **Terminal threads (per PTY)** — each spawned terminal gets a plain `std::thread` reader thread (PTY → alacritty emulator → posts terminal output) and a wait thread (blocks on the child process, then waits for the reader to drain the PTY to EOF, bounded by a short grace, before posting a terminal-exited message, so the child's last output is on screen before the terminal turns into read-only scrollback), plus a writer thread that owns the PTY master. Not tokio.
 - **File-watch thread** — `notify`'s own backend thread; a `'static` callback translates events to path-changed messages.
 - **stdin-stream thread** — when launched with piped stdin, a `std::thread` spools input to a temp file. This one is **polled, not bridged**.
 - **Remote runtimes** — the authority subsystem builds additional multi-thread tokio runtimes for SSH/k8s carriers, separate from the editor-async runtime.

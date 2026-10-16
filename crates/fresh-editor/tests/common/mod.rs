@@ -5,7 +5,13 @@
 pub mod blog_showcase;
 #[cfg(test)]
 #[allow(dead_code)]
+pub mod daemon;
+#[cfg(test)]
+#[allow(dead_code)]
 pub mod dormant_ssh;
+#[cfg(test)]
+#[allow(dead_code)]
+pub mod explorer;
 #[cfg(test)]
 #[allow(dead_code)]
 pub mod fake_lsp;
@@ -21,6 +27,9 @@ pub mod global_state;
 #[cfg(test)]
 #[allow(dead_code)]
 pub mod harness;
+#[cfg(test)]
+#[allow(dead_code)]
+pub mod launch_form;
 #[cfg(test)]
 #[allow(dead_code)]
 pub mod pty;

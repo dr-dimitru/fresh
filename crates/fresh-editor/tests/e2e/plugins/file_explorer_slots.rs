@@ -108,7 +108,9 @@ editor.on("editor_initialized", () => {
 
     let mut harness =
         EditorTestHarness::with_config_and_working_dir(120, 40, config, project_root).unwrap();
-    harness.wait_for_screen_contains("initial:scope:null").unwrap();
+    harness
+        .wait_for_screen_contains("initial:scope:null")
+        .unwrap();
 }
 
 #[test]

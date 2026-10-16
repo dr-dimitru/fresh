@@ -15,7 +15,6 @@ use super::transforms::{
 };
 use super::MAX_SAFE_LINE_WIDTH;
 use crate::state::{EditorState, ViewMode};
-use crate::view::compose_only::md_syntax_namespace;
 use crate::view::folding::FoldManager;
 use crate::view::theme::Theme;
 use crate::view::ui::view_pipeline::{LineStart, ViewLine, ViewLineIterator};
@@ -83,6 +82,7 @@ fn effective_wrap_width(
     viewport: &Viewport,
     line_wrap_enabled: bool,
     content_width: usize,
+    gutter_width: usize,
 ) -> usize {
     if !line_wrap_enabled {
         return MAX_SAFE_LINE_WIDTH;
@@ -98,12 +98,10 @@ fn effective_wrap_width(
         // the non-wrapped exit frame always has.
         return viewport.grid_cols();
     }
-    let base = if let Some(col) = viewport.wrap_column {
-        col.min(content_width)
-    } else {
-        content_width
-    };
-    base.saturating_sub(1).max(1)
+    viewport
+        .wrap_area_width(content_width, gutter_width)
+        .saturating_sub(1)
+        .max(1)
 }
 
 /// Character budget for [`build_base_tokens`], or `None` to bound the read by
@@ -224,7 +222,8 @@ pub(super) fn build_view_data(
     // Width one visual row wraps at. Computed here — before the token build
     // rather than just before `apply_wrapping_transform` — because it also
     // sizes the token build's character budget (see `base_char_budget`).
-    let effective_width = effective_wrap_width(viewport, line_wrap_enabled, content_width);
+    let effective_width =
+        effective_wrap_width(viewport, line_wrap_enabled, content_width, gutter_width);
     // What a row can show, which with wrapping off is not what a row is
     // *chopped* at: the chop is a safety bound no real line reaches, while this
     // is the handful of columns the pane draws.
@@ -258,8 +257,7 @@ pub(super) fn build_view_data(
         content_width
             .max(1)
             .saturating_mul(2)
-            .min(MAX_SAFE_LINE_WIDTH)
-            .max(1)
+            .clamp(1, MAX_SAFE_LINE_WIDTH)
     } else if line_wrap_enabled {
         effective_width
     } else {
@@ -362,11 +360,11 @@ pub(super) fn build_view_data(
     // concealed byte ranges. A blanket `is_compose` gate used to live here but
     // was removed because other plugins (flash) legitimately conceal in source
     // mode. Conceals are buffer-global, though, so markdown_compose's compose
-    // cell conceals (`md-syntax`) would otherwise render in a Source-mode split
-    // whenever a *sibling* split composes the same buffer (the plugin emits
-    // them whenever `isComposingInAnySplit`). So suppress only that compose-only
-    // namespace in Source mode — mirroring the `md-emphasis` overlay gate in
-    // `overlays.rs` — while every other namespace (flash, etc.) still renders.
+    // conceals would otherwise render in a Source-mode split whenever a
+    // *sibling* split composes the same buffer (the plugin emits them whenever
+    // `isComposingInAnySplit`). So a Source-mode split skips the conceals added
+    // as `composeOnly` — as `overlays.rs` does for overlays — while every
+    // other conceal (flash, etc.) still renders.
     if !state.conceals.is_empty() {
         let viewport_end = tokens
             .iter()
@@ -374,12 +372,11 @@ pub(super) fn build_view_data(
             .next_back()
             .unwrap_or(viewport.top_byte())
             + 1;
-        let exclude_ns = (!is_compose).then(md_syntax_namespace);
-        let conceal_ranges = state.conceals.query_viewport_excluding(
+        let conceal_ranges = state.conceals.query_viewport_in(
             viewport.top_byte(),
             viewport_end,
             &state.marker_list,
-            exclude_ns.as_ref(),
+            is_compose,
             cursor_positions,
         );
         if !conceal_ranges.is_empty() {

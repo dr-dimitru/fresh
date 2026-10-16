@@ -75,11 +75,6 @@ impl Editor {
         let buffer_len = state.buffer.len();
         let clamped_position = final_position.min(buffer_len);
 
-        // Update the cached line number so the status bar shows the correct
-        // position. Without this, the status bar reads a stale value from
-        // state.primary_cursor_line_number which was set before the jump.
-        state.primary_cursor_line_number = crate::model::buffer::LineNumber::Absolute(target_line);
-
         // Funnel through the navigation primitive so the cursor is guaranteed
         // visible in the viewport (#1689 — without this, jump_to_line_column
         // could land off-screen if a prior scroll set skip_ensure_visible).
@@ -269,7 +264,7 @@ impl Editor {
     /// blocks waiting for that invisible buffer to be closed, so the
     /// terminal appears to hang. Un-maximize so the focused buffer shows.
     fn reveal_active_split_if_hidden_by_maximize(&mut self) {
-        let mgr = self.split_manager();
+        let mgr = self.active_window().split_manager();
         let active: crate::model::event::SplitId = mgr.active_split().into();
         let hidden = matches!(mgr.maximized_split(), Some(maximized) if maximized != active);
         if !hidden {
@@ -277,7 +272,8 @@ impl Editor {
         }
         // `unmaximize_split` only errors when nothing is maximized, which
         // the `hidden` guard above already excludes.
-        self.split_manager_mut()
+        self.active_window_mut()
+            .split_manager_mut()
             .unmaximize_split()
             .expect("a split is maximized (checked above)");
         self.relayout();
@@ -381,6 +377,7 @@ impl Editor {
             Arc::clone(&self.authority().filesystem),
             crate::model::buffer::BufferConfig {
                 estimated_line_length: self.config.editor.estimated_line_length,
+                large_file_threshold: Some(self.config.editor.large_file_threshold_bytes as usize),
             },
         )?;
         let first_line = buffer.first_line_lossy();
@@ -393,6 +390,7 @@ impl Editor {
                 &self.grammar_registry,
                 &self.config.languages,
                 self.config.default_language.as_deref(),
+                buffer.filesystem().as_ref(),
             );
 
         let mut state = EditorState::from_buffer_with_language(buffer, detected);
@@ -431,7 +429,7 @@ impl Editor {
         if let Some(view_state) = self
             .windows
             .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
+            .and_then(|w| w.buffers.split_view_states_mut())
             .expect("active window must have a populated split layout")
             .get_mut(&target_split)
         {
@@ -489,6 +487,7 @@ impl Editor {
             Arc::clone(&self.authority().filesystem),
             crate::model::buffer::BufferConfig {
                 estimated_line_length: self.config.editor.estimated_line_length,
+                large_file_threshold: Some(self.config.editor.large_file_threshold_bytes as usize),
             },
         )?;
 
@@ -506,21 +505,13 @@ impl Editor {
         }
 
         // Reset cursor to start in the split view state
-        let split_id = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
+        let split_id = self.active_window().split_manager().active_split();
         if let Some(view_state) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
+            .active_window_mut()
+            .split_view_states_mut()
             .get_mut(&split_id)
         {
-            if let Some(buf_state) = view_state.keyed_states.get_mut(&buffer_id) {
+            if let Some(buf_state) = view_state.buffer_state_mut(buffer_id) {
                 buf_state.cursors = crate::model::cursor::Cursors::new();
             }
         }
@@ -571,6 +562,7 @@ impl Editor {
         // Load buffer with forced full loading (bypasses the large file encoding check)
         let buffer = crate::model::buffer::Buffer::load_large_file_confirmed(
             path,
+            self.config.editor.large_file_threshold_bytes as usize,
             Arc::clone(&self.authority().filesystem),
         )?;
         let first_line = buffer.first_line_lossy();
@@ -583,6 +575,7 @@ impl Editor {
                 &self.grammar_registry,
                 &self.config.languages,
                 self.config.default_language.as_deref(),
+                buffer.filesystem().as_ref(),
             );
 
         let mut state = EditorState::from_buffer_with_language(buffer, detected);
@@ -621,7 +614,7 @@ impl Editor {
         if let Some(view_state) = self
             .windows
             .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
+            .and_then(|w| w.buffers.split_view_states_mut())
             .expect("active window must have a populated split layout")
             .get_mut(&target_split)
         {
@@ -815,6 +808,9 @@ impl Editor {
         // Detect language from the container path (the basename's
         // extension is what matters; the directory tree is
         // container-side and won't match host-relative globs anyway).
+        // For the same reason the buffer's host filesystem can't see that
+        // tree, so the `.h` C++ probe finds nothing here and a container
+        // header stays C — the pre-existing behaviour for this path.
         let first_line = buffer.first_line_lossy();
         let detected =
             crate::primitives::detected_language::DetectedLanguage::from_path_with_fallback(
@@ -823,6 +819,7 @@ impl Editor {
                 &self.grammar_registry,
                 &self.config.languages,
                 self.config.default_language.as_deref(),
+                buffer.filesystem().as_ref(),
             );
         let mut state = EditorState::from_buffer_with_language(buffer, detected);
         state.editing_disabled = true;
@@ -868,7 +865,7 @@ impl Editor {
         if let Some(view_state) = self
             .windows
             .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
+            .and_then(|w| w.buffers.split_view_states_mut())
             .expect("active window must have a populated split layout")
             .get_mut(&target_split)
         {
@@ -890,6 +887,22 @@ impl Editor {
 }
 
 impl crate::app::window::Window {
+    /// Whether `buffer_id` is an untouched scratch buffer — empty,
+    /// unmodified, with no file — which a file or recovered content can take
+    /// over rather than opening beside it. Not a composite buffer (they look
+    /// empty but are special views), nor one hosting a widget panel: its rows
+    /// are the tree's mirror (`app::pane_mirror`), written on the next frame,
+    /// so it is empty between its mount and that frame.
+    pub(crate) fn is_pristine_scratch(&self, buffer_id: BufferId) -> bool {
+        self.buffers.get(&buffer_id).is_some_and(|state| {
+            !state.is_composite_buffer
+                && !state.interactive_widget_panel
+                && state.buffer.is_empty()
+                && !state.buffer.is_modified()
+                && state.buffer.file_path().is_none()
+        })
+    }
+
     /// Open a file without switching focus to it.
     ///
     /// Window-scoped core of the open-file path: creates a new buffer
@@ -1168,14 +1181,7 @@ impl crate::app::window::Window {
         // `git show` opened from the same tick replaced.
         // Suppressed when `allow_replace_empty` is false — see
         // `open_file_for_preview` for the rationale.
-        let replace_current = allow_replace_empty && {
-            let current_state = self.buffers.get(&self.active_buffer()).unwrap();
-            !current_state.is_composite_buffer
-                && !current_state.interactive_widget_panel
-                && current_state.buffer.is_empty()
-                && !current_state.buffer.is_modified()
-                && current_state.buffer.file_path().is_none()
-        };
+        let replace_current = allow_replace_empty && self.is_pristine_scratch(self.active_buffer());
 
         let buffer_id = if replace_current {
             // Reuse the current empty buffer
@@ -1208,6 +1214,7 @@ impl crate::app::window::Window {
                     &self.resources.grammar_registry,
                     &self.resources.config.languages,
                     self.resources.config.default_language.as_deref(),
+                    buffer.filesystem().as_ref(),
                 );
             EditorState::from_buffer_with_language(buffer, detected)
         } else {
@@ -1253,11 +1260,7 @@ impl crate::app::window::Window {
         // Snapshot config values before taking the mutable view-states borrow
         // so the closure body doesn't have to re-borrow `self.resources`.
         let cfg = self.resources.config.editor.clone();
-        if let Some(view_state) = self
-            .split_view_states_mut()
-            .expect("active window must have a populated split layout")
-            .get_mut(&target_split)
-        {
+        if let Some(view_state) = self.split_view_states_mut().get_mut(&target_split) {
             view_state.add_buffer(buffer_id);
             // Initialize per-buffer view state for the new buffer with config defaults
             let buf_state = view_state.ensure_buffer_state(buffer_id);

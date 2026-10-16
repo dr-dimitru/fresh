@@ -10,6 +10,7 @@
 //! - Rename operations
 //! - Inlay hints
 
+use crate::view::theme::ThemeStyle;
 use anyhow::Result as AnyhowResult;
 use fresh_i18n::t;
 use std::io;
@@ -42,6 +43,18 @@ use super::{Editor, SemanticTokenRangeRequest};
 /// spacing between them.
 fn space_doc_paragraphs(text: &str) -> String {
     text.replace("\n\n", "\x00").replace(['\n', '\x00'], "\n\n")
+}
+
+/// A URI's scheme (`file`, `jdt`, …), read from its text. `Uri::scheme()`
+/// returns `Option<&Scheme>` with the fluent-uri 0.1 that lsp-types uses
+/// upstream but `&Scheme` with the fluent-uri 0.4 Debian builds it against,
+/// so this sticks to `as_str()`, which both have.
+fn uri_scheme(uri: &lsp_types::Uri) -> Option<&str> {
+    let (scheme, _) = uri.as_str().split_once(':')?;
+    let mut chars = scheme.chars();
+    let valid = chars.next()?.is_ascii_alphabetic()
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then_some(scheme)
 }
 
 /// Whether an LSP range (half-open end, like `[start, end)`) contains the given
@@ -163,10 +176,17 @@ impl Editor {
         // each candidate's origin has to be stamped on: once several
         // servers' results sit in one list, nothing else can tell them
         // apart.
-        let candidates = items.into_iter().map(|item| LspCompletionCandidate {
-            item,
-            server: Some(server),
-        });
+        let response = self.active_window().completion_responses;
+        self.active_window_mut().completion_responses += 1;
+        let candidates =
+            items
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, item)| LspCompletionCandidate {
+                    id: format!("lsp:{response}:{ordinal}"),
+                    item,
+                    server: Some(server),
+                });
         match &mut self.active_window_mut().completion_items {
             Some(existing) => {
                 existing.extend(candidates);
@@ -200,9 +220,9 @@ impl Editor {
             crate::app::popup_actions::build_completion_popup_from_items(all_popup_items, 0);
         let accept_hint = self.completion_accept_key_hint();
         let focus_hint = self.popup_focus_key_hint();
-        let (popup_bg, popup_border_fg) = {
+        let (popup_bg, popup_border) = {
             let theme = self.theme();
-            (theme.popup_bg, theme.popup_border_fg)
+            crate::state::popup_styles(&theme)
         };
 
         {
@@ -216,7 +236,7 @@ impl Editor {
                 .unwrap();
             // Convert PopupData to Popup and use show_or_replace to avoid stacking
             let mut popup_obj =
-                crate::state::convert_popup_data_to_popup(&popup_data, popup_bg, popup_border_fg);
+                crate::state::convert_popup_data_to_popup(&popup_data, popup_bg, popup_border);
             popup_obj.accept_key_hint = accept_hint;
             popup_obj.resolver = crate::view::popup::PopupResolver::Completion;
             popup_obj.focus_key_hint = focus_hint;
@@ -268,10 +288,8 @@ impl Editor {
         // class-file contents, and so on. `open_lsp_uri_target` would
         // decode those to nothing and surface the opaque "URI is not a
         // file path" error with no log trail.
-        if let Some(scheme) = location
-            .uri
-            .scheme()
-            .map(|s| s.as_str().to_string())
+        if let Some(scheme) = uri_scheme(&location.uri)
+            .map(str::to_string)
             .filter(|s| s != "file")
         {
             let uri = location.uri.as_str().to_string();
@@ -375,13 +393,7 @@ impl Editor {
                 new_sticky_column: None,
             };
 
-            let split_id = self
-                .windows
-                .get(&self.active_window)
-                .and_then(|w| w.buffers.splits())
-                .map(|(mgr, _)| mgr)
-                .expect("active window must have a populated split layout")
-                .active_split();
+            let split_id = self.effective_active_split();
             self.active_window_mut()
                 .apply_event_to_buffer(buffer_id, split_id, &event);
             // Without this the cursor lands at the definition but the
@@ -745,9 +757,9 @@ impl Editor {
         let popup_data = crate::app::popup_actions::build_completion_popup_from_items(items, 0);
         let accept_hint = self.completion_accept_key_hint();
         let focus_hint = self.popup_focus_key_hint();
-        let (popup_bg, popup_border_fg) = {
+        let (popup_bg, popup_border) = {
             let theme = self.theme();
-            (theme.popup_bg, theme.popup_border_fg)
+            crate::state::popup_styles(&theme)
         };
 
         let buffer_id = self.active_buffer();
@@ -759,7 +771,7 @@ impl Editor {
             .get_mut(&buffer_id)
             .unwrap();
         let mut popup_obj =
-            crate::state::convert_popup_data_to_popup(&popup_data, popup_bg, popup_border_fg);
+            crate::state::convert_popup_data_to_popup(&popup_data, popup_bg, popup_border);
         popup_obj.accept_key_hint = accept_hint;
         popup_obj.resolver = crate::view::popup::PopupResolver::Completion;
         popup_obj.focus_key_hint = focus_hint;
@@ -945,7 +957,45 @@ impl Editor {
             );
         }
 
+        // No server took it because the buffer's server has not finished
+        // starting: keep the request, and `replay_deferred_hover` asks again
+        // once it has, rather than the key press doing nothing.
+        let language = self.active_state().language.clone();
+        let waiting = results.is_empty()
+            && self
+                .lsp()
+                .is_some_and(|lsp| lsp.has_initializing_handle(&language, LspFeature::Hover));
+        self.active_window_mut()
+            .hover
+            .set_deferred(waiting.then_some((buffer_id, cursor_pos)));
+
         Ok(())
+    }
+
+    /// Re-issue a keyboard hover that was asked for before `language`'s
+    /// server finished initializing (see `request_hover`). Dropped instead
+    /// if the user has since moved the cursor or switched buffers: the
+    /// hover would answer a question no longer being asked.
+    pub(crate) fn replay_deferred_hover(&mut self, language: &str) {
+        let Some((buffer_id, byte)) = self.active_window().hover.deferred() else {
+            return;
+        };
+        match self.buffers().get(&buffer_id) {
+            // Waiting on another language's server.
+            Some(state) if state.language != language => return,
+            Some(_) => {}
+            None => {
+                self.active_window_mut().hover.set_deferred(None);
+                return;
+            }
+        }
+        self.active_window_mut().hover.set_deferred(None);
+        if self.active_buffer() != buffer_id || self.active_cursors().primary().position != byte {
+            return;
+        }
+        if let Err(e) = self.request_hover() {
+            tracing::debug!("Deferred hover request failed: {}", e);
+        }
     }
 
     /// Request LSP hover documentation at a specific byte position
@@ -1234,7 +1284,8 @@ impl Editor {
                         let mut sl = StyledLine::new();
                         sl.push(
                             s.to_string(),
-                            Style::default().fg(self.theme.read().unwrap().popup_text_fg),
+                            Style::default()
+                                .theme_fg(&self.theme.read().unwrap(), "ui.popup_text_fg"),
                         );
                         sl
                     })
@@ -1253,7 +1304,7 @@ impl Editor {
             let mut sep = StyledLine::new();
             sep.push(
                 "─".repeat(12),
-                Style::default().fg(self.theme.read().unwrap().popup_border_fg),
+                Style::default().theme_fg(&self.theme.read().unwrap(), "ui.popup_border_fg"),
             );
             sep
         };
@@ -1309,8 +1360,10 @@ impl Editor {
         };
         popup.width = popup_width;
         popup.max_height = dynamic_height;
-        popup.border_style = Style::default().fg(self.theme.read().unwrap().popup_border_fg);
-        popup.background_style = Style::default().bg(self.theme.read().unwrap().popup_bg);
+        popup.border_style =
+            Style::default().theme_fg(&self.theme.read().unwrap(), "ui.popup_border_fg");
+        popup.background_style =
+            Style::default().theme_bg(&self.theme.read().unwrap(), "ui.popup_bg");
         popup.focus_key_hint = self.popup_focus_key_hint();
 
         // Show the popup. Replace any existing transient (hover/signature)
@@ -1410,7 +1463,7 @@ impl Editor {
                 header.push(
                     format!("  ({})", source),
                     Style::default()
-                        .fg(self.theme.read().unwrap().tab_inactive_fg)
+                        .theme_fg(&self.theme.read().unwrap(), "ui.tab_inactive_fg")
                         .add_modifier(Modifier::ITALIC),
                 );
             }
@@ -1423,7 +1476,7 @@ impl Editor {
                 let mut line = StyledLine::new();
                 line.push(
                     message_line.to_string(),
-                    Style::default().fg(self.theme.read().unwrap().popup_text_fg),
+                    Style::default().theme_fg(&self.theme.read().unwrap(), "ui.popup_text_fg"),
                 );
                 out.push(line);
             }
@@ -1843,8 +1896,10 @@ impl Editor {
         popup.position = PopupPosition::BelowCursor;
         popup.width = 60;
         popup.max_height = 20;
-        popup.border_style = Style::default().fg(self.theme.read().unwrap().popup_border_fg);
-        popup.background_style = Style::default().bg(self.theme.read().unwrap().popup_bg);
+        popup.border_style =
+            Style::default().theme_fg(&self.theme.read().unwrap(), "ui.popup_border_fg");
+        popup.background_style =
+            Style::default().theme_bg(&self.theme.read().unwrap(), "ui.popup_bg");
         popup.focus_key_hint = self.popup_focus_key_hint();
 
         // Show the popup
@@ -2094,6 +2149,10 @@ impl Editor {
                         kind
                     };
                     PopupListItem {
+                        // The action's place in what the servers answered:
+                        // the list is built once from that answer and never
+                        // re-ranked, and `data` indexes it the same way.
+                        id: format!("action:{i}"),
                         text: format!("{}. {}", i + 1, title),
                         detail,
                         icon: None,
@@ -2110,8 +2169,10 @@ impl Editor {
         popup.position = PopupPosition::BelowCursor;
         popup.width = 60;
         popup.max_height = 15;
-        popup.border_style = Style::default().fg(self.theme.read().unwrap().popup_border_fg);
-        popup.background_style = Style::default().bg(self.theme.read().unwrap().popup_bg);
+        popup.border_style =
+            Style::default().theme_fg(&self.theme.read().unwrap(), "ui.popup_border_fg");
+        popup.background_style =
+            Style::default().theme_bg(&self.theme.read().unwrap(), "ui.popup_bg");
         // Confirm reads the selected row's `data` as an index into
         // `self.active_window_mut().pending_code_actions` — the heavy lsp_types payload
         // stays on the Editor to keep the view crate LSP-free.
@@ -2479,7 +2540,7 @@ impl Editor {
                 // plugin-side file ops resolve. Fall back to the raw
                 // string for non-`file://` URIs so callers can still
                 // see *something*.
-                let file = if loc.uri.scheme().map(|s| s.as_str()) == Some("file") {
+                let file = if uri_scheme(&loc.uri) == Some("file") {
                     wire.to_host_path(translation.as_ref())
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_else(|| loc.uri.path().as_str().to_string())
@@ -2553,7 +2614,7 @@ impl Editor {
             .iter()
             .map(|loc| {
                 let wire = crate::app::types::LspUri::from_wire(loc.uri.clone());
-                let file = if loc.uri.scheme().map(|s| s.as_str()) == Some("file") {
+                let file = if uri_scheme(&loc.uri) == Some("file") {
                     wire.to_host_path(translation.as_ref())
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_else(|| loc.uri.path().as_str().to_string())
@@ -2620,25 +2681,16 @@ impl Editor {
         // Get cursor_id for this buffer from split view state
         let cursor_id = {
             let split_id = self
+                .active_window_mut()
                 .split_manager_mut()
                 .splits_for_buffer(buffer_id)
                 .into_iter()
                 .next()
-                .unwrap_or_else(|| {
-                    self.windows
-                        .get(&self.active_window)
-                        .and_then(|w| w.buffers.splits())
-                        .map(|(mgr, _)| mgr)
-                        .expect("active window must have a populated split layout")
-                        .active_split()
-                });
-            self.windows
-                .get(&self.active_window)
-                .and_then(|w| w.buffers.splits())
-                .map(|(_, vs)| vs)
-                .expect("active window must have a populated split layout")
+                .unwrap_or_else(|| self.active_window().split_manager().active_split());
+            self.active_window()
+                .split_view_states()
                 .get(&split_id)
-                .map(|vs| vs.cursors.primary_id())
+                .map(|vs| vs.buffer_tab_state().cursors.primary_id())
                 .unwrap_or_else(|| self.active_cursors().primary_id())
         };
 
@@ -2870,7 +2922,7 @@ impl Editor {
                 if let Err(e) = self.open_file(&path) {
                     tracing::warn!("CreateFile: failed to open created file {:?}: {}", path, e);
                 }
-                return Ok(true);
+                Ok(true)
             }
             lsp_types::ResourceOp::Rename(rename) => {
                 let old_path = to_host(&rename.old_uri);
@@ -2923,7 +2975,7 @@ impl Editor {
                 }
                 std::fs::rename(&old_path, &new_path)?;
                 tracing::info!("RenameFile: {:?} -> {:?}", old_path, new_path);
-                return Ok(true);
+                Ok(true)
             }
             lsp_types::ResourceOp::Delete(delete) => {
                 // Fresh does not delete files because a language server asked.
@@ -2942,7 +2994,7 @@ impl Editor {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| path.display().to_string());
                 self.set_status_message(t!("lsp.delete_refused", name = &name).to_string());
-                return Ok(false);
+                Ok(false)
             }
         }
     }
@@ -3129,26 +3181,17 @@ impl Editor {
         // Capture old cursor states from split view state
         // Find a split that has this buffer in its keyed_states
         let split_id_for_cursors = self
+            .active_window_mut()
             .split_manager_mut()
             .splits_for_buffer(buffer_id)
             .into_iter()
             .next()
-            .unwrap_or_else(|| {
-                self.windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(mgr, _)| mgr)
-                    .expect("active window must have a populated split layout")
-                    .active_split()
-            });
+            .unwrap_or_else(|| self.active_window().split_manager().active_split());
         let old_cursors: Vec<(CursorId, usize, Option<usize>)> = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .get(&split_id_for_cursors)
-            .and_then(|vs| vs.keyed_states.get(&buffer_id))
+            .and_then(|vs| vs.buffer_state(buffer_id))
             .map(|bvs| {
                 bvs.cursors
                     .iter()
@@ -3243,7 +3286,7 @@ impl Editor {
 
                 // Apply new cursor positions to split view state
                 if let Some(vs) = vs_map.get_mut(&split_id_for_cursors) {
-                    if let Some(bvs) = vs.keyed_states.get_mut(&buffer_id) {
+                    if let Some(bvs) = vs.buffer_state_mut(buffer_id) {
                         for (cursor_id, new_pos, new_anchor) in &new_cursors {
                             if let Some(cursor) = bvs.cursors.get_mut(*cursor_id) {
                                 cursor.position = *new_pos;
@@ -3725,7 +3768,13 @@ impl Editor {
             .map(|state| {
                 (
                     state.buffer.version(),
-                    state.semantic_tokens.as_ref().map(|s| s.version),
+                    // A stale store (server asked for a refresh) is never
+                    // "already up to date", whatever its version.
+                    state
+                        .semantic_tokens
+                        .as_ref()
+                        .filter(|s| !s.stale)
+                        .map(|s| s.version),
                     state
                         .semantic_tokens
                         .as_ref()

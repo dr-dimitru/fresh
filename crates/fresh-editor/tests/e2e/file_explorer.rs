@@ -50,20 +50,12 @@ fn scope_probe_status(screen: &str) -> Option<ScopeProbeStatus> {
         .split_whitespace()
         .find(|token| token.starts_with("scope-event="))?;
     let mut fields = token.split(';');
-    let events = fields
-        .next()?
-        .strip_prefix("scope-event=")?
-        .parse()
-        .ok()?;
+    let events = fields.next()?.strip_prefix("scope-event=")?.parse().ok()?;
     let revision = match fields.next()?.strip_prefix("revision=")? {
         "null" => None,
         revision => Some(revision.parse().ok()?),
     };
-    let visible_rows = fields
-        .next()?
-        .strip_prefix("rows=")?
-        .parse()
-        .ok()?;
+    let visible_rows = fields.next()?.strip_prefix("rows=")?.parse().ok()?;
     let root_visible = fields.next()?.strip_prefix("root=")?.parse().ok()?;
     Some(ScopeProbeStatus {
         events,
@@ -78,7 +70,8 @@ fn wait_for_non_null_scope(harness: &mut EditorTestHarness) -> ScopeProbeStatus 
     harness
         .wait_until(|h| {
             frames += 1;
-            scope_probe_status(&h.screen_to_string()).is_some_and(|status| status.revision.is_some())
+            scope_probe_status(&h.screen_to_string())
+                .is_some_and(|status| status.revision.is_some())
                 || frames >= 10
         })
         .unwrap();
@@ -179,11 +172,7 @@ fn file_explorer_scope_hook_tracks_scrolling_with_sticky_root() {
     let data_dir = tempfile::TempDir::new().unwrap();
     let _data_dir_pin = crate::common::global_state::pin_data_dir(data_dir.path());
     for index in 0..24 {
-        fs::write(
-            project_root.join(format!("file{index:02}.txt")),
-            "content",
-        )
-        .unwrap();
+        fs::write(project_root.join(format!("file{index:02}.txt")), "content").unwrap();
     }
     let mut config = Config::default();
     install_scope_probe(&mut config, &project_root.join("plugins"));
@@ -194,7 +183,9 @@ fn file_explorer_scope_hook_tracks_scrolling_with_sticky_root() {
 
     let initial = wait_for_non_null_scope(&mut harness);
     for _ in 0..24 {
-        harness.send_key(KeyCode::Down, KeyModifiers::empty()).unwrap();
+        harness
+            .send_key(KeyCode::Down, KeyModifiers::empty())
+            .unwrap();
         harness.render().unwrap();
     }
     let mut frames = 0;
@@ -202,7 +193,9 @@ fn file_explorer_scope_hook_tracks_scrolling_with_sticky_root() {
         .wait_until(|h| {
             frames += 1;
             scope_probe_status(&h.screen_to_string()).is_some_and(|status| {
-                status.revision.is_some_and(|revision| revision > initial.revision.unwrap())
+                status
+                    .revision
+                    .is_some_and(|revision| revision > initial.revision.unwrap())
                     && status.root_visible
             }) || frames >= 10
         })
@@ -2630,10 +2623,10 @@ fn test_file_explorer_new_file_flat_name_in_symlinked_directory() {
     );
 }
 
-/// Now that a new item's name may contain separators, it can address a file
-/// that already exists. `rename` would replace it without asking, so the
-/// contents of an unrelated file would be gone with no way back. The
-/// collision must be refused and the temporary item left alone.
+/// A new item's name may be a relative path, so it can address a file that
+/// already exists. `rename` would replace it without asking, and the contents
+/// of an unrelated file would be gone with no way back, so the collision is
+/// refused — before anything is written, which leaves nothing behind either.
 #[test]
 fn test_file_explorer_new_file_does_not_overwrite_existing_file() {
     let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
@@ -2663,22 +2656,18 @@ fn test_file_explorer_new_file_does_not_overwrite_existing_file() {
         "an existing file must survive a colliding new-item name"
     );
 
-    // The temporary item was not moved, so the user can rename it again.
-    let untitled_files: Vec<_> = fs::read_dir(&project_root)
+    // And nothing was created: the refusal happens before anything is written,
+    // so there is no placeholder to clean up or rename again.
+    let created: Vec<_> = fs::read_dir(&project_root)
         .unwrap()
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("untitled_"))
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name != "src")
         .collect();
-    assert_eq!(
-        untitled_files.len(),
-        1,
-        "the temporary file should stay put after a refused rename"
-    );
-    let screen = harness.screen_to_string();
     assert!(
-        screen.contains("untitled_"),
-        "the temporary file should still be open and visible. Screen:\n{}",
-        screen
+        created.is_empty(),
+        "a refused name should leave nothing behind: {:?}",
+        created
     );
 }
 
@@ -4007,6 +3996,60 @@ fn test_file_explorer_side_right() {
     );
 }
 
+/// With the explorer on the right, the resize grip sits on its LEFT wall —
+/// the one facing the editor — and dragging it left widens the column.
+#[test]
+fn test_file_explorer_side_right_border_drag_resizes() {
+    use fresh::config::{Config, ExplorerWidth, FileExplorerSide};
+
+    let mut config = Config::default();
+    config.file_explorer.side = FileExplorerSide::Right;
+    config.file_explorer.width = ExplorerWidth::Columns(30);
+
+    let mut harness = EditorTestHarness::with_temp_project_and_config(120, 40, config).unwrap();
+    let project_root = harness.project_dir().unwrap();
+    fs::write(project_root.join("test.txt"), "test").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness.render().unwrap();
+
+    let right_col = find_explorer_border_col(&harness);
+    assert_eq!(
+        right_col, 119,
+        "explorer should be flush with the right edge"
+    );
+    let left_col = right_col - 29;
+    assert_eq!(
+        harness.get_row_text(15).chars().nth(left_col as usize),
+        Some('│'),
+        "expected the explorer's left wall at col {}.\nScreen:\n{}",
+        left_col,
+        harness.screen_to_string()
+    );
+
+    // Dragging the outer (terminal-edge) wall must do nothing.
+    harness
+        .mouse_drag(right_col, 15, right_col - 10, 15)
+        .unwrap();
+    assert_eq!(
+        harness.editor().active_window().file_explorer_width,
+        ExplorerWidth::Columns(30),
+        "the outer wall is not a grip.\nScreen:\n{}",
+        harness.screen_to_string()
+    );
+
+    // Dragging the inner wall toward the editor widens the column.
+    harness.mouse_drag(left_col, 15, left_col - 10, 15).unwrap();
+    assert_eq!(
+        harness.editor().active_window().file_explorer_width,
+        ExplorerWidth::Columns(40),
+        "dragging the inner wall left should widen the explorer.\nScreen:\n{}",
+        harness.screen_to_string()
+    );
+    assert_eq!(find_explorer_border_col(&harness), 119);
+}
+
 /// Test that workspace serialization correctly persists file explorer side
 #[test]
 fn test_file_explorer_side_workspace_serialization() {
@@ -4355,16 +4398,6 @@ fn test_file_explorer_duplicate_refreshes_git_decorations() {
                 .any(|line| line.contains("alpha copy.txt") && line.contains('U'))
         })
         .unwrap();
-}
-
-/// Returns `true` when `name` appears on a screen line that also contains a
-/// tree connector, matching the existing `wait_for_file_explorer_item`
-/// heuristic. Reads only rendered output.
-fn explorer_tree_contains(harness: &EditorTestHarness, name: &str) -> bool {
-    harness
-        .screen_to_string()
-        .lines()
-        .any(|line| line.contains(name) && line.contains('│'))
 }
 
 /// The file-explorer sidebar's content rectangle, located from the panel's

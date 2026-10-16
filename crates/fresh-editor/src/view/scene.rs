@@ -298,13 +298,19 @@ pub struct TabBarView {
 
 // ─────────────────────────── status bar ───────────────────────────
 
+/// One status-bar element as the web renders it.
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusSegment {
+    /// Semantic kind: "lsp" | "warning" | "language" | "encoding" |
+    /// "lineEnding" | "remote" | "trust" | "message" | "terminalRestart" |
+    /// "plugin" | "text".
     pub name: &'static str,
+    /// Plugin token key for `name == "plugin"`.
     pub key: Option<String>,
     pub text: String,
     pub x: u16,
     pub w: u16,
+    /// "left" or "right": the side the element was tiled on.
     pub side: &'static str,
 }
 
@@ -449,19 +455,14 @@ impl Editor {
         // Each keyed element (indicators + text) is a segment, and `side` is
         // the description's own left/right tiling carried on the segment, not
         // a midpoint guess from `x`. No cell scraping either way.
-        let segments: Vec<StatusSegment> = self
-            .shell_status_segments()
-            .into_iter()
-            .filter(|s| !s.text.trim().is_empty())
-            .map(|s| StatusSegment {
-                name: s.name,
-                key: s.key,
-                text: s.text.trim().to_string(),
-                x: s.x,
-                w: s.w,
-                side: s.side,
-            })
-            .collect();
+        let segments = match (self.shell_ui.as_ref(), self.shell_frame_status_bar.as_ref()) {
+            (Some(ui), Some(bar)) => {
+                let f = self.active_chrome().last_frame;
+                let size = ratatui::layout::Rect::new(0, 0, f.width, f.height);
+                crate::view::shell::status_bar::segments(ui, bar, size)
+            }
+            _ => Vec::new(),
+        };
 
         Some(StatusView {
             rect: RectView {
@@ -478,10 +479,42 @@ impl Editor {
     /// pipeline's suggestion-popup geometry. `None` unless a picker list (or a
     /// floating overlay) is showing. Single derivation shared by both frontends.
     pub fn palette_view(&self) -> Option<PaletteView> {
-        let chrome = self.active_chrome();
-        let sugg_outer = chrome.suggestions_outer_area;
-        let sugg_area = chrome.suggestions_area;
+        // The popup's own two rectangles, read off the tree that placed them
+        // — like the card's bands below, and unlike the pair of `ChromeLayout`
+        // fields this replaces, which were a copy of exactly this read.
+        let to_rect = |r: fresh_ui::Rect| ratatui::layout::Rect {
+            x: r.x.max(0) as u16,
+            y: r.y.max(0) as u16,
+            width: r.w,
+            height: r.h,
+        };
+        let (sugg_outer, sugg_list) = self
+            .shell_ui
+            .as_ref()
+            .map(|ui| {
+                let spec = ui.spec();
+                (
+                    crate::view::shell::prompt::suggestions_rect(spec).map(to_rect),
+                    crate::view::shell::prompt::suggestions_list_rect(spec).map(to_rect),
+                )
+            })
+            .unwrap_or((None, None));
+        // The list's window, read off the tree that holds it.
+        let sugg_window = self.shell_ui.as_ref().and_then(|ui| {
+            let spec = ui.spec();
+            let list = crate::view::shell::prompt::suggestions_list_rect(spec)?;
+            let (first, visible) = crate::view::shell::prompt::suggestions_window(spec)
+                .unwrap_or((0, list.h as usize));
+            Some((first, visible.max(list.h as usize)))
+        });
         let p = self.active_window().prompt.as_ref()?;
+        // A confirmation is not a prompt row: the TUI draws it only as the
+        // modal card (`Prompt::is_confirm_dialog`), and the web gets that card
+        // through `tree_view`'s `"confirm"` surface. Projecting it here too
+        // showed its question as palette text with none of its buttons.
+        if p.is_confirm_dialog() {
+            return None;
+        }
         // The overlay card's bands, read off the tree that placed them.
         let card_band = |r: crate::view::shell::overlay_prompt::CardRegion| {
             self.shell_ui.as_ref().and_then(|ui| {
@@ -506,11 +539,8 @@ impl Editor {
         // it the web shows no prompt at all while the editor waits for input.
         // Such prompts have no native suggestion list; the frontend renders
         // just the input bar (null `list_rect`/`outer_rect` below).
-        let (scroll_start, visible, total) = sugg_area.map(|(_, s, v, t)| (s, v, t)).unwrap_or((
-            p.scroll_offset,
-            p.suggestions.len(),
-            p.suggestions.len(),
-        ));
+        let total = p.suggestions.len();
+        let (scroll_start, visible) = sugg_window.unwrap_or((0, p.suggestions.len()));
         // Search-option toggles: the row's own content — the same values the
         // TUI describes its toggles with — plus the cell spans the shell's
         // layout assigned them, READ BACK off the laid-out tree rather than
@@ -547,15 +577,12 @@ impl Editor {
             overlay: p.overlay,
             title: p.title.iter().map(|t| t.text.as_str()).collect(),
             status: p.status.clone(),
-            selected: p.selected_suggestion,
+            selected: p.selected_suggestion(),
             scroll_start,
             visible_count: visible,
             total,
             outer_rect: sugg_outer.map(RectView::from),
-            list_rect: sugg_area
-                .map(|(r, _, _, _)| r)
-                .or(prompt_results)
-                .map(RectView::from),
+            list_rect: sugg_list.or(prompt_results).map(RectView::from),
             // The preview pane's content: the band names the pane inside its
             // rule, so this is the rectangle as the tree placed it. Only
             // meaningful for overlay prompts.
@@ -578,7 +605,7 @@ impl Editor {
                 .toolbar
                 .as_ref()
                 .and_then(|k| self.widget_registry.get(k))
-                .map(|panel| panel.spec.clone()),
+                .map(|panel| fresh_core::api::WidgetSpec::clone(&panel.spec)),
             toolbar_focus: p
                 .toolbar
                 .as_ref()
@@ -742,21 +769,57 @@ fn project_popup(
 impl Editor {
     /// All visible popups across the per-buffer and global stacks, projected
     /// semantically. Single derivation shared by the web frontend (native HTML)
-    /// and available to the TUI compositor; geometry comes from the pipeline's
-    /// popup-area caches so clicks/scroll route through the existing hit-tester.
+    /// and available to the TUI compositor.
+    ///
+    /// **Geometry is the tree's, by key.** This read two caches that `render`
+    /// filled — `ChromeLayout::popup_areas` and `global_popup_areas`, the last
+    /// two members of the paint-recorded roster — each of which took the outer
+    /// rect off this very tree and then re-derived the content rect from it by
+    /// hand, in two copy-pasted blocks of border arithmetic. Both are keyed
+    /// nodes (`popup::rects_of`, `popup::inner_rects_of`), the popups' order in
+    /// the description is `Editor::popup_counts`' — the buffer's stack, then
+    /// the top of the global one.
+    ///
+    /// **The scroll offset is the tree's too, where the tree owns it.** It was
+    /// read off the popup for every kind, which is right only for a `List`:
+    /// there the content slot is a plain column and the selection moves
+    /// `Popup::scroll_offset`. `Text` and `Markdown` are drawn through a
+    /// viewport that owns its own window, so that field is never written for
+    /// them and reads 0 for the popup's whole life — publishing it told the
+    /// frontend a hover was at the top no matter where the reader had
+    /// scrolled, and clipped off everything past the first screenful. The
+    /// window the viewport actually has is `popup::scroll_offsets_of`, read
+    /// by key the way `file_explorer::window_rows` reads the explorer's.
     pub fn popups_view(&self) -> Vec<ScenePopup> {
-        let chrome = self.active_chrome();
+        let (buffer_n, total) = self.popup_counts();
+        let outers = self.popup_rects();
+        let inners = self.popup_content_rects();
+        let scrolls = self.popup_scroll_offsets();
+        let at = |i: usize| -> (ratatui::layout::Rect, ratatui::layout::Rect) {
+            (
+                outers.get(i).copied().unwrap_or_default(),
+                inners.get(i).copied().unwrap_or_default(),
+            )
+        };
+        // The viewport's window when the tree owns it, the popup's field when
+        // it does not (a list, whose selection moves it).
+        let scroll_at = |i: usize, p: &crate::view::popup::Popup| -> usize {
+            scrolls.get(i).copied().flatten().unwrap_or(p.scroll_offset)
+        };
         let mut out = Vec::new();
-        let locals = self.active_state().popups.all();
-        for (idx, outer, inner, scroll, _n, _sb, _t) in &chrome.popup_areas {
-            if let Some(p) = locals.get(*idx) {
-                out.push(project_popup(p, *outer, *inner, *scroll));
+        for (idx, p) in self.active_state().popups.all().iter().enumerate() {
+            if idx >= buffer_n {
+                break;
             }
+            let (outer, inner) = at(idx);
+            out.push(project_popup(p, outer, inner, scroll_at(idx, p)));
         }
-        let globals = self.global_popups.all();
-        for (idx, outer, inner, scroll, _n) in &chrome.global_popup_areas {
-            if let Some(p) = globals.get(*idx) {
-                out.push(project_popup(p, *outer, *inner, *scroll));
+        // The description carries at most the top of the global stack, after
+        // the buffer's — so it is the last entry, and only when there is one.
+        if total > buffer_n {
+            if let Some(p) = self.global_popups.top() {
+                let (outer, inner) = at(buffer_n);
+                out.push(project_popup(p, outer, inner, scroll_at(buffer_n, p)));
             }
         }
         out
@@ -778,6 +841,14 @@ pub struct FileRow {
 #[serde(rename_all = "camelCase")]
 pub struct FileExplorerView {
     pub rect: RectView,
+    /// Where the tree put the width grip — the one column a drag resizes the
+    /// panel by. **Projected rather than derived**: it is the column's *inner*
+    /// edge, which is the right wall only while the explorer is on the left
+    /// (`sidebar::grip_strip` puts it on the left wall otherwise), and it
+    /// spans neither the header row nor the bottom border. A frontend that
+    /// recomputed that from `rect` had the arithmetic wrong on both counts.
+    /// `None` when the tree has not placed it.
+    pub grip_rect: Option<RectView>,
     pub title: String,
     pub scroll_offset: usize,
     pub viewport_height: usize,
@@ -788,12 +859,13 @@ pub struct FileExplorerView {
 }
 
 impl Editor {
-    /// Semantic file-explorer sidebar: the flattened visible tree rows (the same
-    /// `get_display_nodes()` the TUI renderer uses) plus selection/scroll and the
+    /// Semantic file-explorer sidebar: the flattened visible tree rows (the
+    /// same projection the TUI's list windows) plus selection/scroll and the
     /// sidebar rect. Rendered natively by the web frontend; row clicks route
     /// back through `handle_mouse` at the sidebar's content cells, where the
-    /// shell's own row nodes answer them — `viewport_rows[n]` and the tree's
-    /// n-th row key are the same number by construction.
+    /// shell's own row nodes answer them. `viewport_rows` is read off the
+    /// layout — the rows keyed by path that the list placed, pins first —
+    /// and mapped back to row indices through the projection.
     pub fn file_explorer_view(&self) -> Option<FileExplorerView> {
         // **Derived, not recorded.** The sidebar's rectangle is
         // `HostRegion::Explorer`'s, which is a keyed node — so this asks the
@@ -809,29 +881,49 @@ impl Editor {
             crate::view::shell::frame::HostRegion::Explorer,
         ))?;
         let tree = view.tree();
-        let rows = view
-            .get_display_nodes()
-            .into_iter()
-            .filter_map(|(id, indent)| {
-                tree.get_node(id).map(|n| FileRow {
-                    name: n.entry.name.clone(),
-                    depth: indent,
-                    is_dir: n.is_dir(),
-                    expanded: n.is_expanded(),
-                })
+        let projection = view.projection();
+        let rows = projection
+            .rows
+            .iter()
+            .map(|r| FileRow {
+                name: r.entry.name.clone(),
+                depth: r.indent,
+                is_dir: r.is_dir(),
+                expanded: r.is_expanded(),
             })
             .collect();
         let title = tree
             .get_node(tree.root_id())
             .map(|n| n.entry.name.clone())
             .unwrap_or_default();
+        // The window is the list's: which rows are on screen, pins and
+        // all, and how tall the body is, are read off the layout that placed
+        // them.
+        let (scroll_offset, viewport_height, viewport_rows) = self
+            .shell_ui
+            .as_ref()
+            .and_then(|ui| {
+                crate::view::shell::file_explorer::window_rows(ui, self.active_window().id.0)
+            })
+            .map(|(first, height, paths)| {
+                let rows = paths
+                    .iter()
+                    .filter_map(|p| tree.get_node_by_path(p))
+                    .filter_map(|n| projection.index_of(n.id))
+                    .collect::<Vec<_>>();
+                (first, height, rows)
+            })
+            .unwrap_or_default();
         Some(FileExplorerView {
             rect: RectView::from(rect),
+            grip_rect: self
+                .panel_rect(&crate::view::shell::sidebar::grip_key())
+                .map(RectView::from),
             title,
-            scroll_offset: view.get_scroll_offset(),
-            viewport_height: view.viewport_height,
+            scroll_offset,
+            viewport_height,
             selected: view.get_selected_index(),
-            viewport_rows: view.viewport_display_indices(),
+            viewport_rows,
             rows,
         })
     }
@@ -1043,11 +1135,9 @@ impl Editor {
         // The window the tree is showing: the rows the TUI has on screen, at
         // the grid rows it put them on.
         let rows = match &b.listing {
-            fb::Listing::Entries(entries) => entries
-                .iter()
-                .enumerate()
-                .skip(window.first)
+            fb::Listing::Entries(entries) => (window.first..)
                 .take(window.visible)
+                .filter_map(|index| entries.at(index).map(|e| (index, e)))
                 .map(|(index, e)| FileBrowserRowView {
                     index,
                     row: list_rect.y + (index - window.first) as u16,
@@ -1076,7 +1166,7 @@ impl Editor {
             scroll_offset: window.first,
             visible_rows: window.visible,
             total: state.entries.len(),
-            selected: state.selected_index,
+            selected: state.selected_index(),
             active_section: if files_active { "files" } else { "navigation" },
             loading: state.loading,
             error: state.error.clone(),
@@ -1113,6 +1203,25 @@ pub struct TrustDialogView {
 }
 
 impl Editor {
+    /// Where the shell's layout put the element keyed `key`, in screen cells,
+    /// or `None` when it has no area (not built, collapsed, or scrolled out of
+    /// a virtualized list).
+    ///
+    /// The web's key-addressed input (`node` messages in `webui`) resolves
+    /// through this: a natively laid-out control names the tree node it
+    /// mirrors, and the press lands on that node's cells, so the tree stays
+    /// the only router and the node's own handlers decide what a press means.
+    pub fn node_rect(&self, key: &fresh_ui::Key) -> Option<ratatui::layout::Rect> {
+        let frame = self.active_chrome().last_frame;
+        let size = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: frame.width,
+            height: frame.height,
+        };
+        crate::view::shell::rect_of(self.shell_ui.as_ref()?, key, size)
+    }
+
     /// Semantic workspace-trust dialog (the blocking "trust this folder?" modal).
     /// `None` unless it's showing.
     ///
@@ -1211,7 +1320,7 @@ impl Editor {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TreeSurfaceView {
-    /// `"dock"`, `"floating"` or `"sidebar"`.
+    /// `"dock"`, `"floating"`, `"sidebar"` or `"confirm"`.
     pub kind: &'static str,
     pub x: i32,
     pub y: i32,
@@ -1245,6 +1354,16 @@ pub struct TreeSurfaceView {
 pub struct TreeItemView {
     /// The index into `surfaces` of the subtree this item belongs to.
     pub surface: usize,
+    /// Inside a plugin panel's interior — its spec's content, as opposed to
+    /// the panel's own frame (title, close box, border). A page that lays
+    /// the interior out itself from `regions.native` hides these.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub interior: bool,
+    /// Inside a page's viewport (a pane panel the editor scrolls as a whole,
+    /// the welcome screen). The web lays the page out natively but follows
+    /// the editor's scroll, so this viewport's scrollbar is the page's.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub page: bool,
     /// Painted by a layer the subtree raised — a pop-over, a scrim — rather
     /// than by the subtree's own flow. Layers paint after everything in flow.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -1334,7 +1453,7 @@ pub struct TreeView {
     pub cursor: Option<[i32; 2]>,
 }
 
-fn css_color(c: ratatui::style::Color) -> Option<String> {
+pub(crate) fn css_color(c: ratatui::style::Color) -> Option<String> {
     use ratatui::style::Color;
     // The xterm 256-colour cube and ramp, so an indexed colour a theme names
     // reads the same in a browser as in a terminal.
@@ -1459,6 +1578,25 @@ impl Editor {
                 true,
             );
         }
+        // The confirmation modal (`shell::confirm`). Rooted at its modal key
+        // seam with the items taken from the parent — the layer — for the same
+        // reason as a floating panel: the dimming scrim is the layer's own
+        // item. Clicks need nothing extra: a press on a button's cells is
+        // routed over the tree exactly as a terminal click is.
+        if self
+            .active_window()
+            .prompt
+            .as_ref()
+            .is_some_and(|p| p.is_confirm_dialog())
+        {
+            push(
+                "confirm",
+                crate::view::shell::modal::keys_key(crate::view::shell::modal::KeySlot::Confirm),
+                false,
+                None,
+                true,
+            );
+        }
         for (i, s) in self.sidebar_sections.iter().enumerate() {
             if s.panel.is_some() {
                 push(
@@ -1470,11 +1608,37 @@ impl Editor {
                 );
             }
         }
+        // Panels mounted into panes (Search & Replace, the welcome page, a
+        // review diff): their pane's cells are left to the tree, so without a
+        // surface here the web showed those panes empty.
+        let pane_interiors = self.pane_interiors();
+        let mut pane_leaves: Vec<_> = pane_interiors.keys().copied().collect();
+        pane_leaves.sort_by_key(|leaf| leaf.0 .0);
+        for leaf in &pane_leaves {
+            push(
+                "pane",
+                crate::view::shell::panel::interior_key(Slot::Pane(*leaf)),
+                false,
+                None,
+                false,
+            );
+        }
         if roots.is_empty() {
             return TreeView::default();
         }
         let palette = self.shell_palette();
         let spec = ui.spec();
+        // The panels' interiors: what `view::native` projects as content.
+        let interiors: Vec<_> = [Slot::Dock, Slot::Floating]
+            .into_iter()
+            .chain((0..self.sidebar_sections.len()).map(Slot::Sidebar))
+            .chain(pane_leaves.iter().copied().map(Slot::Pane))
+            .filter_map(|slot| ui.find_by_key(&crate::view::shell::panel::interior_key(slot)))
+            .collect();
+        let pages: Vec<_> = pane_interiors
+            .values()
+            .filter_map(|i| i.page.as_ref()?.target())
+            .collect();
         let mut items = Vec::new();
         for (index, item) in spec.items.iter().enumerate() {
             let Some(surface) = roots.iter().position(|r| ui.contains(*r, item.id)) else {
@@ -1522,6 +1686,23 @@ impl Editor {
                     None,
                     false,
                 ),
+                // "There is more this way", as a kind the DOM can draw as it
+                // likes — a chevron, a fade at the edge. The glyph the
+                // terminal uses is not carried: unlike a rule, there is no
+                // single character this *is*.
+                Draw::Overflow { axis, end, .. } => {
+                    horizontal = matches!(axis, fresh_ui::Axis::Horizontal);
+                    (
+                        match end {
+                            fresh_ui::End::Before => "overflow-before",
+                            fresh_ui::End::After => "overflow-after",
+                        },
+                        None,
+                        None,
+                        None,
+                        false,
+                    )
+                }
                 Draw::Scrim(Scrim::Opaque) => ("scrim", None, None, None, false),
                 Draw::Scrim(Scrim::Dim) => ("scrim", None, None, None, true),
                 Draw::Lines(ls) => (
@@ -1567,6 +1748,8 @@ impl Editor {
             };
             items.push(TreeItemView {
                 surface,
+                interior: interiors.iter().any(|r| ui.contains(*r, item.id)),
+                page: pages.iter().any(|r| ui.contains(*r, item.id)),
                 layer: index >= spec.layers_from,
                 key: item.key.as_ref().map(|k| k.to_string()),
                 kind,
@@ -1856,13 +2039,19 @@ impl Editor {
             BindingSource, ContextFilter, DisplayRow, SearchMode, SourceFilter,
         };
         let kb = self.keybinding_editor.as_ref()?;
+        // The table's window, read off the tree that holds it.
+        let window = self
+            .shell_ui
+            .as_ref()
+            .and_then(|ui| crate::view::shell::keybinding::table_window(ui.spec()))
+            .unwrap_or((0, 0));
 
         let rows = kb
             .display_rows
             .iter()
             .enumerate()
             .map(|(i, dr)| {
-                let selected = i == kb.selected;
+                let selected = i == kb.selected();
                 match dr {
                     DisplayRow::SectionHeader {
                         plugin_name,
@@ -1955,9 +2144,9 @@ impl Editor {
             count: format!("{} / {}", kb.filtered_indices.len(), kb.bindings.len()),
             has_changes: kb.has_changes,
             rows,
-            selected: kb.selected,
-            scroll_offset: kb.scroll.offset,
-            viewport: kb.scroll.viewport,
+            selected: kb.selected(),
+            scroll_offset: window.0 as u16,
+            viewport: window.1 as u16,
             showing_help: kb.showing_help,
             edit_dialog,
             confirm,
@@ -2074,6 +2263,9 @@ pub struct SettingsCategoryView {
     pub expandable: bool,
     pub expanded: bool,
     pub sections: Vec<String>,
+    /// Listed under another category's row (a plugin's page under
+    /// "Plugins"), so drawn indented and without a chevron.
+    pub nested: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2246,7 +2438,7 @@ fn setting_control_view(
                     .collect(),
                 column: display_field
                     .as_deref()
-                    .map(crate::view::settings::widget_map::column_title),
+                    .map(|f| crate::view::settings::widget_map::column_title(path, f)),
                 no_add: *no_add,
                 focused: cursor.filter(|r| *r < entries.len()),
                 add_focused: cursor.is_some() && cursor == c.add_row(),
@@ -2299,7 +2491,7 @@ fn setting_item_view(
         path: item.path.clone(),
         name: item.name.clone(),
         description: item.description.clone(),
-        section: item.section.clone(),
+        section: item.section_label.clone(),
         section_start: item.is_section_start,
         modified: item.modified,
         read_only: item.read_only,
@@ -2322,17 +2514,34 @@ impl Editor {
             return None;
         }
 
+        // The rows the TUI's tree shows, in its order: nested pages appear
+        // only under an expanded parent, and a category lists its sections
+        // only when it has more than one.
         let categories = st
-            .pages
-            .iter()
-            .enumerate()
-            .map(|(i, p)| SettingsCategoryView {
-                index: i,
-                name: p.name.clone(),
-                selected: i == st.selected_category,
-                expandable: !p.subpages.is_empty() || p.sections.len() > 1,
-                expanded: st.expanded_categories.contains(&i),
-                sections: p.sections.iter().map(|s| s.name.clone()).collect(),
+            .visible_tree()
+            .into_iter()
+            .filter_map(|row| match row {
+                crate::view::settings::state::TreeRow::Category {
+                    idx,
+                    expandable,
+                    expanded,
+                    nested,
+                } => {
+                    let p = &st.pages[idx];
+                    Some(SettingsCategoryView {
+                        index: idx,
+                        name: p.display_name.clone(),
+                        selected: idx == st.selected_category,
+                        expandable,
+                        expanded,
+                        sections: match p.sections.len() > 1 {
+                            true => p.sections.iter().map(|s| s.display_name.clone()).collect(),
+                            false => Vec::new(),
+                        },
+                        nested,
+                    })
+                }
+                crate::view::settings::state::TreeRow::Section { .. } => None,
             })
             .collect();
 

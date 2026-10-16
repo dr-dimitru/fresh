@@ -327,10 +327,6 @@ pub struct SerializedSplitViewState {
     /// Per-file cursor and scroll state
     #[serde(default)]
     pub file_states: HashMap<PathBuf, SerializedFileState>,
-
-    /// Tab scroll offset
-    #[serde(default)]
-    pub tab_scroll_offset: usize,
 }
 
 // **A split has no view mode and no compose width.** Both were written here
@@ -611,6 +607,27 @@ pub struct WorkspaceHistories {
     pub goto_line: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_file: Vec<String>,
+}
+
+impl WorkspaceHistories {
+    /// `newer` layered over `self`: each list keeps this one's entries as
+    /// the older ones and `newer`'s as the most recent, an entry in both
+    /// appearing once, in its `newer` position. Capped like the live rings.
+    pub fn merged_with(&self, newer: &WorkspaceHistories) -> WorkspaceHistories {
+        fn merge(older: &[String], newer: &[String]) -> Vec<String> {
+            let mut ring = crate::input::input_history::InputHistory::new();
+            ring.merge_newer(older);
+            ring.merge_newer(newer);
+            ring.items().to_vec()
+        }
+        WorkspaceHistories {
+            search: merge(&self.search, &newer.search),
+            replace: merge(&self.replace, &newer.replace),
+            command_palette: merge(&self.command_palette, &newer.command_palette),
+            goto_line: merge(&self.goto_line, &newer.goto_line),
+            open_file: merge(&self.open_file, &newer.open_file),
+        }
+    }
 }
 
 /// Search options that persist across searches within a workspace
@@ -1112,6 +1129,17 @@ fn candidate_files_for_root(working_dir: &Path) -> io::Result<Vec<WorkspaceFileI
                 path,
                 working_dir
             );
+            // Move it out of the way, keeping every byte under a new name.
+            // Left where it is, it is a file this directory can never use
+            // again and never stops finding: the window takes a fresh
+            // identity and saves beside it, so each damaged start leaves
+            // another dead file claiming the same root. Renaming is also
+            // what lets a reader tell the live workspace from the wreckage.
+            let aside = path.with_extension("json.corrupt");
+            match std::fs::rename(&path, &aside) {
+                Ok(()) => tracing::warn!("Moved it aside to {:?}", aside),
+                Err(e) => tracing::warn!("Could not move {:?} aside: {e}", path),
+            }
             continue;
         };
         // Authoritative check: the file must itself claim this directory.
@@ -1180,16 +1208,6 @@ pub fn find_workspace_file_by_root(working_dir: &Path) -> io::Result<Option<Path
         }
     }
     Ok(best.map(|b| b.path))
-}
-
-/// The retired daemon-scoped workspace directory.
-///
-/// Workspaces are one set now, shared by direct mode and every daemon, so
-/// nothing writes here any more. The path survives only so boot migration can
-/// find pre-existing snapshots and fold them into the real store — see
-/// `orchestrator_persistence::migrate_session_workspaces_into_store`.
-pub fn get_session_workspaces_dir() -> io::Result<PathBuf> {
-    Ok(get_data_dir()?.join("session-workspaces"))
 }
 
 /// Workspace error types
@@ -1980,7 +1998,6 @@ mod tests {
                 open_files: vec![PathBuf::from("README.md"), PathBuf::from("src/lib.rs")],
                 active_file_index: 0,
                 file_states: HashMap::new(),
-                tab_scroll_offset: 0,
             },
         );
 

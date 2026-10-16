@@ -128,7 +128,11 @@ pub struct Row {
 /// that skips empties has silently normalised `"    sep  a string"` to
 /// `"sep a string"` — which is how the migrated popups lost the indent on
 /// their *first* row as well as their continuations.
+///
+/// A word also ends at a [`wide_breaks`] point, where it has no space to
+/// carry.
 fn chunks(para: &str) -> Vec<&str> {
+    let breaks = wide_breaks(para);
     let mut out: Vec<&str> = Vec::new();
     let mut start = 0usize;
     let mut seen_word = false;
@@ -140,6 +144,10 @@ fn chunks(para: &str) -> Vec<&str> {
                 seen_word = false;
             }
         } else {
+            if seen_word && breaks.binary_search(&i).is_ok() {
+                out.push(&para[start..i]);
+                start = i;
+            }
             seen_word = true;
         }
     }
@@ -147,6 +155,36 @@ fn chunks(para: &str) -> Vec<&str> {
         out.push(&para[start..]);
     }
     out
+}
+
+/// Where a line may break between two glyphs with no space between them: the
+/// Unicode line-breaking algorithm's (UAX #14) opportunities next to a wide
+/// glyph, in byte order.
+///
+/// Chinese and Japanese put no spaces between words, so without these a
+/// sentence is a single word: moved whole to the next row, stranding what
+/// came before it, or cut wherever the row ends. The algorithm also knows
+/// which of those breaks to refuse: none before `。`, `）` or `ー`, none
+/// after `（`. Narrow text still breaks only at spaces, as it did: the
+/// algorithm's other opportunities would also break it after a hyphen or a
+/// slash.
+fn wide_breaks(para: &str) -> Vec<usize> {
+    use unicode_width::UnicodeWidthChar;
+    let wide = |c: char| c.width() == Some(2);
+    if !para.chars().any(wide) {
+        return Vec::new();
+    }
+    unicode_linebreak::linebreaks(para)
+        .map(|(i, _)| i)
+        .filter(|&i| {
+            let before = para[..i].chars().next_back();
+            let after = para[i..].chars().next();
+            match (before, after) {
+                (Some(b), Some(a)) => b != ' ' && a != ' ' && (wide(b) || wide(a)),
+                _ => false,
+            }
+        })
+        .collect()
 }
 
 /// Greedy word wrap, breaking a word too long for a line of its own.
@@ -234,8 +272,13 @@ pub fn wrap_rows(text: &str, width: u16, mode: Wrap) -> Vec<Row> {
             // A chunk too long for a row of its own is cut, and the remainder
             // opens the next row — still behind the indent.
             while w(&row.text) > width {
-                let head: String = row.text.chars().take(width).collect();
-                let tail: String = row.text.chars().skip(width).collect();
+                let split = fitting_prefix(&row.text, width);
+                // A lone glyph wider than the row: nothing left to cut.
+                if split == row.text.len() {
+                    break;
+                }
+                let (head, tail) = row.text.split_at(split);
+                let (head, tail) = (head.to_string(), tail.to_string());
                 // The indent is spaces, so `head` is `row.indent` added bytes
                 // followed by that many fewer bytes of source: the cut lands
                 // on a source boundary as well as a char one.
@@ -263,6 +306,27 @@ pub fn wrap_rows(text: &str, width: u16, mode: Wrap) -> Vec<Row> {
         });
     }
     out
+}
+
+/// The byte length of the longest prefix of `s` that fits in `width` cells.
+///
+/// Measured by grapheme cluster, as [`glyph`](super::glyph) paints: a wide
+/// glyph (CJK) takes two cells, so cutting after `width` *chars* overfills the
+/// row and paint clips what does not fit. The prefix holds at least one
+/// cluster, so a glyph wider than the whole row still makes progress.
+fn fitting_prefix(s: &str, width: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut used = 0usize;
+    let mut end = 0usize;
+    for (i, g) in s.grapheme_indices(true) {
+        let gw = super::glyph::width(g) as usize;
+        if i > 0 && used + gw > width {
+            break;
+        }
+        used += gw;
+        end = i + g.len();
+    }
+    end
 }
 
 /// The rows an unwrapped string is: its lines, and nothing added or dropped
@@ -579,15 +643,15 @@ fn wrap_in(
     let mut lines: Vec<(usize, usize)> = Vec::new(); // [start, end)
     let mut start = 0usize;
     let mut used = 0u16;
-    for i in 0..n {
+    for (i, &main) in mains.iter().enumerate().take(n) {
         let with_gap = match i == start {
-            true => mains[i],
-            false => mains[i].saturating_add(gap),
+            true => main,
+            false => main.saturating_add(gap),
         };
         if i > start && used.saturating_add(with_gap) > avail {
             lines.push((start, i));
             start = i;
-            used = mains[i];
+            used = main;
         } else {
             used = used.saturating_add(with_gap);
         }
@@ -815,9 +879,17 @@ impl RenderObject for BoxRender {
             o
         };
 
+        // **A table row's cells are as wide as their columns** — fitted to this
+        // row's room, the same numbers every row sharing the columns gets —
+        // whatever the cells' own sizing says. See `Node::columns`.
+        let column_widths: Vec<u16> = match (&p.columns, dir) {
+            (Some(cols), Dir::Row) => cols.fit(avail),
+            _ => Vec::new(),
+        };
         // Everything that is not flex resolves first; flex divides what is left.
         for i in order {
             let (sw, sh) = cx.sizing(kids[i]);
+            let sw = column_widths.get(i).map_or(sw, |&w| Sizing::Cells(w));
             let (s_main, s_cross) = match dir {
                 Dir::Row => (sw, sh),
                 Dir::Col => (sh, sw),
@@ -1407,6 +1479,9 @@ pub struct ViewportRender {
     /// window, and a controlled offset is never below it (see
     /// [`Scroll::At`](crate::desc::Scroll::At)).
     ceiling: u32,
+    /// Items the box holds, pins and run together, as last laid out. An
+    /// index-scrolled window's only.
+    rows: u32,
     /// Whether the description's initial offset has been applied, for a
     /// framework-owned offset ([`Scroll::Own`](crate::desc::Scroll::Own)):
     /// it is the initial value only.
@@ -1428,7 +1503,36 @@ pub struct ViewportRender {
     band: Option<(u16, u32, u16)>,
 }
 
+/// How many items a window at `y` is asked to pin: the owner's function of
+/// the offset when it gave one ([`Node::pinned_at`](crate::Node::pinned_at)),
+/// else the fixed list. Never asked past the last item: an offset the wheel
+/// took beyond the end is about to be clamped, and the owner's function need
+/// not answer for rows that do not exist.
+fn pins_named(props: &ViewportProps, n: u32, y: u32) -> u32 {
+    match &props.pinned_at {
+        Some(f) => f.at(y.min(n.saturating_sub(1))).len() as u32,
+        None => props.pinned.len() as u32,
+    }
+}
+
 impl ViewportRender {
+    /// The run a window at offset `y` shows under the pins that offset has:
+    /// its rows less the pins, one row always left to the run. For an
+    /// index-scrolled window that has been laid out; `None` otherwise.
+    ///
+    /// **Asked of the offset a move lands on, not the one it leaves.** Pins
+    /// that depend on the offset change as the window moves, so the run the
+    /// window has now is not the run it will have there.
+    pub(crate) fn run_at(&self, y: u32) -> Option<u32> {
+        match self.props.mode {
+            crate::desc::ScrollMode::Items { .. } if self.rows > 0 => {
+                let pins = pins_named(&self.props, self.items, y).min(self.rows - 1);
+                Some(self.rows - pins)
+            }
+            _ => None,
+        }
+    }
+
     pub fn new(props: ViewportProps) -> Self {
         ViewportRender {
             props,
@@ -1436,6 +1540,7 @@ impl ViewportRender {
             content: Size::ZERO,
             items: 0,
             ceiling: 0,
+            rows: 0,
             placed: false,
             gutter: false,
             band: None,
@@ -1481,6 +1586,11 @@ impl ViewportRender {
             translate: false,
             band: Some(crate::render::object::Band::Measuring),
             pinned: 0,
+            // An index-scrolled window counts items down; there is no
+            // horizontal form of it.
+            axis: crate::event::Axis::Vertical,
+            step: 0,
+            cap: 0,
         });
         let probe = Constraints::new(w, w, 0, u16::MAX);
         let mut cells = 0u16;
@@ -1523,7 +1633,7 @@ impl RenderObject for ViewportRender {
                 if !self.placed {
                     self.placed = true;
                     if x != 0 || y != 0 {
-                        cx.set_offset(Point::new(x as i32, y as i32));
+                        cx.set_offset(Point::new(x as i32, y.min(i32::MAX as u32) as i32));
                     }
                 }
                 None
@@ -1538,6 +1648,7 @@ impl RenderObject for ViewportRender {
             }
         };
         let scroll = cx.scroll();
+        let horizontal = self.props.axis == crate::event::Axis::Horizontal;
 
         let mut own = own;
         match self.props.mode {
@@ -1556,8 +1667,22 @@ impl RenderObject for ViewportRender {
                     // nothing to pin.
                     band: None,
                     pinned: 0,
+                    axis: self.props.axis,
+                    step: self.props.step,
+                    cap: self.props.cap,
                 });
-                let inner = if c.min_w == c.max_w {
+                // **The scrolled axis is measured loose; the other is the
+                // window's.** A window exists to show part of something
+                // bigger, so the axis it scrolls must be free to exceed it —
+                // a vertical window gives its child a definite width and lets
+                // the rows run on, and a horizontal one gives a definite
+                // height and lets the columns.
+                let inner = if horizontal {
+                    match c.min_h == c.max_h {
+                        true => Constraints::new(0, u16::MAX, own.h, own.h),
+                        false => Constraints::new(0, u16::MAX, 0, own.h),
+                    }
+                } else if c.min_w == c.max_w {
                     Constraints::new(w, w, 0, u16::MAX)
                 } else {
                     Constraints::new(0, w, 0, u16::MAX)
@@ -1584,6 +1709,50 @@ impl RenderObject for ViewportRender {
                 // was also asked for a stable gutter, which is how a window
                 // whose content reaches its last column gets a bar that
                 // neither covers it nor moves it.
+                // **A horizontal window's affordance is a cell at each end,
+                // not a gutter down one side.** Its content is on the rows a
+                // bar would need, so what it offers is a `Draw::Overflow` cap
+                // over the first and last column — reserved whenever the
+                // content overflows, and *not* per end, because which ends
+                // have more behind them depends on the offset and the offset
+                // depends on the window: reserving by end would be a layout
+                // that fed itself. The caps' cells are held either way and the
+                // glyphs come and go inside them, so the content does not jump
+                // by a column the moment you scroll off the start.
+                if horizontal {
+                    let caps = match self.props.scrollbar
+                        && (self.props.stable_gutter || content.w > own.w)
+                    {
+                        true => self.props.cap.max(1),
+                        false => 0,
+                    };
+                    let view_w = own.w.saturating_sub(caps.saturating_mul(2));
+                    // The content does not reflow when the window narrows —
+                    // its width is its own — so there is no second measure
+                    // here, only a re-place past the leading cap.
+                    if caps > 0 {
+                        for k in cx.children() {
+                            cx.place(k, Point::new(caps as i32, 0));
+                        }
+                    }
+                    self.window = Rect::at(scroll, Size::new(view_w, own.h));
+                    self.ceiling = content.w.saturating_sub(view_w) as u32;
+                    cx.set_scroll(ScrollInfo {
+                        window: self.window,
+                        content,
+                        max: Point::new(
+                            content.w.saturating_sub(view_w) as i32,
+                            content.h.saturating_sub(own.h) as i32,
+                        ),
+                        translate: true,
+                        band: None,
+                        pinned: 0,
+                        axis: self.props.axis,
+                        step: self.props.step,
+                        cap: self.props.cap,
+                    });
+                    return own;
+                }
                 let gutter = u16::from(
                     self.props.scrollbar
                         && (self.props.stable_gutter || (!self.props.overlay && content.h > own.h)),
@@ -1618,6 +1787,9 @@ impl RenderObject for ViewportRender {
                     // nothing to pin.
                     band: None,
                     pinned: 0,
+                    axis: self.props.axis,
+                    step: self.props.step,
+                    cap: self.props.cap,
                 });
             }
             ScrollMode::Items {
@@ -1629,7 +1801,13 @@ impl RenderObject for ViewportRender {
                 // How many of the pinned rows a window of `rows` honours:
                 // never all of them, so one row of the run stays on screen
                 // and the offset still names something.
-                let pinned_n = self.props.pinned.len() as u32;
+                // The pins at an offset: the owner's function of it when it
+                // gave one (`Node::pinned_at`), else the fixed list.
+                let pinned_at = self.props.pinned_at.clone();
+                let props = self.props.clone();
+                let pins_at = |y: u32| pins_named(&props, n, y);
+                let here = scroll.y.max(0) as u32;
+                let pinned_n = pins_at(here);
                 let pinned_of = |rows: u32| pinned_n.min(rows.saturating_sub(1));
                 // The child renders only the window, so nothing is translated
                 // and the offset is an index. A cell extent over a million rows
@@ -1714,6 +1892,7 @@ impl RenderObject for ViewportRender {
                 }
                 self.gutter = gutter == 1;
                 self.items = n;
+                self.rows = rows;
                 let inner_w = own.w.saturating_sub(gutter);
                 // **The window is the run under the pinned rows.** The pinned
                 // rows take the top of the box; what is published — to the
@@ -1726,9 +1905,28 @@ impl RenderObject for ViewportRender {
                 // below it; a framework-owned one is clamped to it here,
                 // before the window is published, so the builder never sees
                 // a window the clamp is about to move.
-                let run = rows - pinned_of(rows);
-                let ceiling = n.saturating_sub(run).max(held.map_or(0, |y| y as u32));
-                let y = (scroll.y.max(0) as u32).min(ceiling);
+                // With pins that depend on the offset, the ceiling is searched
+                // for: the first offset past `n - rows` whose run, under its
+                // own pins, reaches the end. Each step down the tree can pin
+                // at most one more ancestor, so the search is as long as the
+                // deepest pin stack, not the tree.
+                let ceiling_of = |rows: u32| -> u32 {
+                    let fits = |c: u32| c + rows - pins_at(c).min(rows.saturating_sub(1)) >= n;
+                    let mut c = n.saturating_sub(rows);
+                    while c < n && !fits(c) {
+                        c += 1;
+                    }
+                    c
+                };
+                let ceiling = match &pinned_at {
+                    Some(_) => ceiling_of(rows),
+                    None => n.saturating_sub(rows - pinned_of(rows)),
+                }
+                .max(held.map_or(0, |y| y as u32));
+                let y = here.min(ceiling);
+                // The run is under the pins of the offset the window lands on.
+                let pinned_y = pins_at(y).min(rows.saturating_sub(1));
+                let run = rows - pinned_y;
                 if y as i32 != scroll.y {
                     cx.set_offset(Point::new(scroll.x, y as i32));
                 }
@@ -1744,7 +1942,10 @@ impl RenderObject for ViewportRender {
                     // band is known only here, and a row built at the wrong
                     // height puts every index below it on the wrong cell.
                     band: Some(crate::render::object::Band::Cells(height)),
-                    pinned: pinned_of(rows) as u16,
+                    pinned: pinned_y as u16,
+                    axis: crate::event::Axis::Vertical,
+                    step: 0,
+                    cap: 0,
                 });
                 let inner = Constraints::new(inner_w, inner_w, 0, own.h);
                 for k in cx.children() {
@@ -1785,6 +1986,51 @@ impl RenderObject for ViewportRender {
         // the end" for a window the owner put there (see `Scroll::At`).
         // `hit.rs` reads the bar's extents the same way, so a press on the
         // track and the thumb it lands on agree by construction.
+        // **A horizontal window caps its ends instead of growing a bar.**
+        // One cell at each edge that still has content behind it, in the cells
+        // the measure reserved — so a cap appearing never moves the content,
+        // and an edge with nothing past it simply has no item. Which glyph
+        // stands for "more this way" is the backend's; see `Draw::Overflow`.
+        if self.props.axis == crate::event::Axis::Horizontal {
+            if self.ceiling == 0 {
+                return;
+            }
+            let offset = self.window.x.max(0) as i64;
+            let caps = crate::render::object::overflow_caps(
+                g.rect,
+                offset,
+                self.ceiling as i64,
+                self.props.cap,
+            );
+            for (end, more, rect) in caps {
+                if !more {
+                    continue;
+                }
+                // The same rectangle a press hit-tests, so the cap lights
+                // exactly where it acts.
+                let hovered = g.pointer.is_some_and(|p| rect.contains(p));
+                let draw = Draw::Overflow {
+                    axis: crate::event::Axis::Horizontal,
+                    end,
+                    hovered,
+                };
+                let ink = match hovered {
+                    true => self
+                        .props
+                        .bar_hover_theme
+                        .as_ref()
+                        .or(self.props.bar_theme.as_ref()),
+                    false => self.props.bar_theme.as_ref(),
+                };
+                match ink {
+                    Some(t) => {
+                        out.push_themed(draw, rect, g.clip, crate::ThemeKey(Some(t.clone())))
+                    }
+                    None => out.push_at(draw, rect, g.clip),
+                }
+            }
+            return;
+        }
         let offset = self.window.y.max(0) as u32;
         let window = self.window.h;
         let content = self.ceiling.saturating_add(window as u32);
@@ -1918,7 +2164,7 @@ impl RenderObject for LayerRender {
     /// no scope: it never claimed the keyboard, and grouping focusables under
     /// it would confine traversal to a layer that has no business holding it.
     fn focus_reg(&self) -> Option<FocusReg> {
-        self.geom.modality.owns_keyboard().then(|| FocusReg {
+        self.geom.modality.owns_keyboard().then_some(FocusReg {
             ordinal: None,
             skip: true,
             scope: true,
@@ -2257,6 +2503,70 @@ mod byte_mapping_tests {
             Some(3),
             "an empty row is one cell"
         );
+    }
+
+    #[test]
+    fn an_over_long_run_of_wide_glyphs_is_cut_by_cells() {
+        // Two wide glyphs per four-cell row, not four glyphs overflowing it.
+        let text = "日本語の文章";
+        let rows = rows_of(text, 4, Wrap::Word);
+        assert_eq!(
+            shape(&rows),
+            vec![("日本", 0, 0..6), ("語の", 0, 6..12), ("文章", 0, 12..18)]
+        );
+        // A wide glyph wider than the row still gets a row of its own.
+        let rows = rows_of("日本", 1, Wrap::Word);
+        assert_eq!(shape(&rows), vec![("日", 0, 0..3), ("本", 0, 3..6)]);
+        // The cut falls between grapheme clusters: a combining accent stays
+        // with its base letter, in the one cell they share.
+        let rows = rows_of("e\u{301}e\u{301}e\u{301}", 2, Wrap::Word);
+        assert_eq!(
+            shape(&rows),
+            vec![("e\u{301}e\u{301}", 0, 0..6), ("e\u{301}", 0, 6..9)]
+        );
+    }
+
+    #[test]
+    fn a_sentence_with_no_spaces_breaks_between_its_glyphs() {
+        // The run after the space fits the row's remainder glyph by glyph, so
+        // it fills the row instead of moving whole to the next one and
+        // leaving `1` alone above it.
+        let text = "持つ 1 つのエディタに再接続";
+        let rows = rows_of(text, 14, Wrap::Word);
+        assert_eq!(
+            shape(&rows),
+            vec![("持つ 1 つのエ", 0, 0..18), ("ディタに再接続", 0, 18..39),]
+        );
+    }
+
+    #[test]
+    fn a_wide_break_keeps_punctuation_with_its_text() {
+        // `。` and `）` never open a row and `（` never ends one: the row ends
+        // before the glyph the punctuation belongs to instead.
+        let rows = rows_of("ああ。いい", 6, Wrap::Word);
+        assert_eq!(shape(&rows), vec![("ああ。", 0, 0..9), ("いい", 0, 9..15)]);
+        let rows = rows_of("ああああ。", 8, Wrap::Word);
+        assert_eq!(shape(&rows), vec![("あああ", 0, 0..9), ("あ。", 0, 9..15)]);
+        let rows = rows_of("ああ（いい）", 6, Wrap::Word);
+        assert_eq!(
+            shape(&rows),
+            vec![("ああ", 0, 0..6), ("（い", 0, 6..12), ("い）", 0, 12..18)]
+        );
+    }
+
+    #[test]
+    fn narrow_text_still_breaks_only_at_spaces() {
+        // The line-breaking algorithm would break after the hyphen; a word of
+        // narrow glyphs is kept whole, as before.
+        let rows = rows_of("ab well-known", 8, Wrap::Word);
+        assert_eq!(
+            shape(&rows),
+            vec![("ab", 0, 0..2), ("well-kno", 0, 3..11), ("wn", 0, 11..13)]
+        );
+        // Next to a wide glyph a narrow one may break: `UI` and `の` share no
+        // space, but the row can end between them.
+        let rows = rows_of("ab UIの言語", 6, Wrap::Word);
+        assert_eq!(shape(&rows), vec![("ab UI", 0, 0..5), ("の言語", 0, 5..14)]);
     }
 
     #[test]

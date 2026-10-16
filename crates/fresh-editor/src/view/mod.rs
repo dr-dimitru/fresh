@@ -21,8 +21,6 @@ pub mod animation;
 #[cfg(any(feature = "runtime", feature = "wasm"))]
 pub use fresh_editor_core::color_support;
 #[cfg(any(feature = "runtime", feature = "wasm"))]
-pub mod compose_only;
-#[cfg(any(feature = "runtime", feature = "wasm"))]
 pub mod composite_view;
 #[cfg(any(feature = "runtime", feature = "wasm"))]
 pub mod conceal;
@@ -35,6 +33,8 @@ pub mod folding;
 pub mod line_wrap_cache;
 #[cfg(any(feature = "runtime", feature = "wasm"))]
 pub mod margin;
+#[cfg(any(feature = "runtime", feature = "wasm"))]
+pub mod move_preview;
 #[cfg(any(feature = "runtime", feature = "wasm"))]
 pub mod overlay;
 #[cfg(any(feature = "runtime", feature = "wasm"))]
@@ -83,6 +83,10 @@ pub use fresh_editor_core::markdown;
 #[cfg(feature = "runtime")]
 #[cfg(feature = "runtime")]
 pub mod confirm;
+#[cfg(feature = "runtime")]
+pub mod keyed_selection;
+#[cfg(feature = "web")]
+pub mod native;
 #[cfg(feature = "runtime")]
 pub mod popup;
 #[cfg(feature = "runtime")]

@@ -264,6 +264,10 @@ pub fn apply_step(editor: &mut Editor, step: &Value) {
         apply_key(editor, step);
     } else if step.get("kind").is_some() {
         apply_mouse(editor, step);
+    } else if step.get("node").is_some() {
+        // A key-addressed press, as a natively laid-out control sends it.
+        let msg = json!({ "key": step["node"], "action": step.get("action") });
+        apply_node(editor, &msg);
     } else if let Some(name) = step.get("action").and_then(|a| a.as_str()) {
         // Optional `args` object for parameterised actions
         // (e.g. {"action": "menu_open", "args": {"name": "File"}}).
@@ -430,11 +434,6 @@ impl WebBridge {
         !self.ws.is_empty() || !self.pending.is_empty()
     }
 
-    /// How many browsers are connected.
-    pub fn client_count(&self) -> usize {
-        self.ws.len()
-    }
-
     /// The grid size that fits every connected browser: the element-wise MIN of
     /// their wanted (cols, rows), so each can see the whole grid (bigger
     /// windows letterbox). Clients that haven't reported a size yet
@@ -547,7 +546,8 @@ impl WebBridge {
                         &self.bind_host,
                         self.allow_reset,
                     ) {
-                        Ok(Served::WsClient(mut session)) => {
+                        Ok(Served::WsClient(session)) => {
+                            let mut session = *session;
                             // A new client mirrors the same editor. Seed its
                             // wanted size from the current effective grid so it
                             // doesn't momentarily shrink everyone to the default
@@ -836,7 +836,8 @@ fn try_parse_request(buf: &[u8]) -> Option<HttpRequest> {
 /// Outcome of serving one complete request.
 enum Served {
     /// The request was a successful `/ws` upgrade — this is the new client.
-    WsClient(WsSession),
+    /// Boxed: a session is large, and every other request answers `Http`.
+    WsClient(Box<WsSession>),
     /// A plain HTTP exchange; `mutated` = the route may have changed editor
     /// state (input routes, /step, /reset), so a connected WS client should
     /// get a diff pushed without waiting for the tick deadline.
@@ -875,7 +876,7 @@ fn serve_request(
             .is_some_and(|u| u.to_ascii_lowercase().contains("websocket"));
     if wants_ws {
         return match upgrade_ws(stream, req, editor, *cols, *rows, clip, bind_host)? {
-            Some(session) => Ok(Served::WsClient(session)),
+            Some(session) => Ok(Served::WsClient(Box::new(session))),
             None => Ok(Served::Http { mutated: false }),
         };
     }
@@ -957,7 +958,7 @@ fn handle_http(
         (
             "POST",
             p @ ("/key" | "/paste" | "/mouse" | "/action" | "/widget" | "/settings" | "/kbedit"
-            | "/resize"),
+            | "/resize" | "/quit" | "/node" | "/open"),
         ) => {
             apply_message(editor, &p[1..], &body_json(), cols, rows);
             let s = tick_scene(editor, *cols, *rows, clip).to_string();
@@ -1029,6 +1030,9 @@ fn apply_message(
         "settings" => apply_settings(editor, v),
         "kbedit" => apply_kbedit(editor, v),
         "resize" => apply_resize(editor, v, cols, rows),
+        "quit" => apply_quit(editor),
+        "node" => apply_node(editor, v),
+        "open" => apply_open(editor, v),
         _ => return false,
     }
     true
@@ -1050,6 +1054,97 @@ fn apply_action(editor: &mut Editor, v: &Value) {
     }
 }
 
+/// The wire form of a tree key: a string is `Key::Str`, `{"ns", "i"}` a
+/// `Key::Pair`, a number a `Key::Int` — what [`key_json`] writes.
+fn parse_key(v: &Value) -> Option<fresh_ui::Key> {
+    match v {
+        Value::String(s) => Some(fresh_ui::Key::from(s.as_str())),
+        Value::Number(n) => n.as_u64().map(fresh_ui::Key::Int),
+        Value::Object(o) => Some(fresh_ui::Key::Pair(
+            o.get("ns")?.as_str()?.into(),
+            o.get("i")?.as_u64()?,
+        )),
+        _ => None,
+    }
+}
+
+/// Whether the tree key in wire form `key` names a node the shell's layout
+/// gave area — what a `node` message needs to land. For the parity tests:
+/// every key a native projection hands the web must pass.
+pub fn node_has_area(editor: &Editor, key: &Value) -> bool {
+    parse_key(key).is_some_and(|k| editor.node_rect(&k).is_some())
+}
+
+/// Key-addressed input: `{"key", "action"}` for a control the page laid out
+/// itself (a natively rendered panel or card) and so cannot address by cell.
+/// The press lands on the cells where the shell's layout put the keyed node,
+/// so the tree routes it exactly as a terminal click there — the node's own
+/// handlers stay the only answer to what a press means, and the web cannot
+/// reach anything a terminal user could not click.
+///
+/// `action`: `press` (default), `context` (right button), `double`, or
+/// `hover`. A node with no laid-out area (scrolled out of a virtualized list,
+/// say) is skipped.
+fn apply_node(editor: &mut Editor, v: &Value) {
+    let Some(key) = v.get("key").and_then(parse_key) else {
+        return;
+    };
+    let Some(r) = editor.node_rect(&key) else {
+        return;
+    };
+    // The middle of the node: clear of a button's bracket or border cells,
+    // which belong to the same node but read as its edge.
+    let (col, row) = (r.x + r.width / 2, r.y + r.height / 2);
+    let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("press");
+    let at = |kind: &str, button: &str, count: u64| json!({"kind": kind, "col": col, "row": row, "button": button, "count": count});
+    match action {
+        "hover" => apply_mouse(editor, &at("moved", "left", 1)),
+        "context" => {
+            apply_mouse(editor, &at("down", "right", 1));
+            apply_mouse(editor, &at("up", "right", 1));
+        }
+        "double" => {
+            for count in [1, 2] {
+                apply_mouse(editor, &at("down", "left", count));
+                apply_mouse(editor, &at("up", "left", count));
+            }
+        }
+        _ => {
+            apply_mouse(editor, &at("down", "left", 1));
+            apply_mouse(editor, &at("up", "left", 1));
+        }
+    }
+}
+
+/// Files the page's host was asked to open (a desktop app's second launch, a
+/// file dropped on its icon): `{"files": [absolute paths]}`, queued exactly as
+/// `fresh --cmd session open-file` queues them in a daemon. A host that owns
+/// this bridge hands files over here rather than through the session socket,
+/// whose liveness probe can lose a race with a daemon still starting up and
+/// then hand the files to a second, headless daemon instead.
+fn apply_open(editor: &mut Editor, v: &Value) {
+    let Some(files) = v.get("files").and_then(|f| f.as_array()) else {
+        return;
+    };
+    for f in files.iter().filter_map(|f| f.as_str()) {
+        let path = std::path::PathBuf::from(f);
+        if path.is_absolute() {
+            editor.queue_file_open(path, None, None, None, None, None, None);
+        }
+    }
+}
+
+/// A request from the page's host to close it — a desktop window's close
+/// button, say. Unlike the `quit` action, which in a session daemon asks
+/// whether to detach the client or stop the session, closing the window that
+/// IS the session's only front end means stopping it: what remains to ask
+/// about is the unsaved work hot exit cannot keep (and the clean-quit
+/// confirmation, for whoever opted into it).
+fn apply_quit(editor: &mut Editor) {
+    let confirm_clean = editor.config().editor.confirm_quit;
+    editor.quit_with_prompts(confirm_clean);
+}
+
 /// Inbound OS clipboard (docs/internal/web-ui.md §3.5/§4). The frontend's
 /// document `paste` listener sends the clipboard text in ONE message — long
 /// pastes never loop through per-char key events. Delivery reuses the exact
@@ -1069,20 +1164,50 @@ fn apply_paste(editor: &mut Editor, v: &Value) {
 /// in-spec and fires the plugin's `widget_event` — the exact path a TUI
 /// toolbar click takes.
 ///
-/// **The `"panel"` surface is gone with the web's plugin panels.** It resolved
-/// a click against the recorded hit list the scene shipped — by identity, with
-/// the index as a tiebreaker — and placed a caret from a byte the browser had
-/// measured. Both read `WidgetPanelState::hits`, which existed for a described
-/// panel only to be sent here. A request naming it now falls through the
-/// wildcard and does nothing, which is what it should do while there is no
-/// panel on the page to have clicked. See
-/// `docs/internal/retained-mode-ui.md` "The web".
+/// The `"panel"` surface is a natively laid-out plugin panel
+/// (`regions.native.panels`): `{slot, widgetKey, eventType, payload,
+/// textCursor?, clicks?, col?, row?}`, the pressed control's identity. It is
+/// resolved against the mounted spec into the event the tree builds for the
+/// same control (`app::native_panels`) — the page names a control, it never
+/// supplies what the press means.
 fn apply_widget(editor: &mut Editor, v: &Value) {
     match v.get("surface").and_then(|s| s.as_str()) {
         Some("toolbar") => {
             if let Some(key) = v.get("key").and_then(|k| k.as_str()) {
                 editor.toggle_overlay_toolbar_widget(key);
             }
+        }
+        Some("panel") => {
+            use crate::view::shell::widgets::Slot;
+            let slot = match v.get("slot").and_then(|s| s.as_str()) {
+                Some("dock") => Slot::Dock,
+                Some("floating") => Slot::Floating,
+                Some("sidebar") => match v.get("section").and_then(|i| i.as_u64()) {
+                    Some(i) => Slot::Sidebar(i as usize),
+                    None => return,
+                },
+                Some("pane") => match v.get("pane").and_then(|i| i.as_u64()) {
+                    Some(i) => {
+                        Slot::Pane(crate::model::event::LeafId(fresh_core::SplitId(i as usize)))
+                    }
+                    None => return,
+                },
+                _ => return,
+            };
+            let str_of = |k: &str| v.get(k).and_then(|s| s.as_str()).unwrap_or("").to_string();
+            let num_of = |k: &str| v.get(k).and_then(|n| n.as_u64());
+            let press = crate::app::native_panels::NativeWidgetPress {
+                widget_key: str_of("widgetKey"),
+                event_type: str_of("eventType"),
+                payload: v.get("payload").cloned().unwrap_or_else(|| json!({})),
+                text_cursor: num_of("textCursor").map(|b| b as usize),
+                clicks: num_of("clicks").unwrap_or(1).min(3) as u8,
+                at: (
+                    num_of("col").unwrap_or(0) as u16,
+                    num_of("row").unwrap_or(0) as u16,
+                ),
+            };
+            editor.press_native_widget(slot, press);
         }
         _ => {}
     }
@@ -1596,8 +1721,7 @@ impl WsSession {
     /// buffering unboundedly.
     fn flush(&mut self) -> std::io::Result<()> {
         if self.outbuf.len() > WS_OUTBUF_CAP {
-            return Err(std::io::Error::new(
-                ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "ws outbound backlog exceeded cap; peer not draining",
             ));
         }
@@ -1941,8 +2065,12 @@ fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
                 // buffer text after the gutter; `gutter` is the line-number
                 // column. When line numbers are off, gutterWidth is 0 and
                 // `cells` is the whole pane.
-                let gw = editor
-                    .leaf_gutter_width(*leaf, *bufid)
+                // A pane showing a group tab has no buffer and no gutter:
+                // its content is the group's grid, whose panels are panes
+                // of their own in this list.
+                let bufid = bufid.as_buffer();
+                let gw = bufid
+                    .map_or(0, |b| editor.leaf_gutter_width(*leaf, b))
                     .min(content_rect.width);
                 let gutter_rect =
                     Rect::new(content_rect.x, content_rect.y, gw, content_rect.height);
@@ -1954,7 +2082,7 @@ fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
                 );
                 json!({
                     "leaf": leaf.0 .0,
-                    "buffer": bufid.0,
+                    "buffer": bufid.map(|b| b.0),
                     "content": rect_json(*content_rect),
                     "gutterWidth": gw,
                     "gutter": if gw > 0 { cells_json(&buf, gutter_rect) } else { Value::Null },
@@ -2077,6 +2205,9 @@ fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
         // The plugin panels, as the display list the tree produced for them
         // (`Editor::tree_view`); the web folds it into DOM.
         "tree": serde_json::to_value(editor.tree_view()).unwrap_or_else(|_| json!({})),
+        // The same surfaces as content, for a page that lays them out itself
+        // (`view::native`); pressed back through `node` messages by key.
+        "native": serde_json::to_value(editor.native_view()).unwrap_or_else(|_| json!({})),
         "palette": palette,
         "trustDialog": trust_dialog,
         "contextMenu": context_menu,
@@ -2363,6 +2494,65 @@ mod tests {
     use super::{
         digit_row_char, host_only, origin_host_matches, try_parse_request, HTTP_REQUEST_CAP,
     };
+
+    /// Whether the scene shows a confirmation card.
+    fn confirm_open(editor: &mut crate::app::Editor) -> bool {
+        super::scene_value(editor, 120, 40)["regions"]["tree"]["surfaces"]
+            .as_array()
+            .is_some_and(|s| s.iter().any(|s| s["kind"] == "confirm"))
+    }
+
+    #[test]
+    fn quit_message_stops_a_clean_editor_and_asks_about_unsaved_work() {
+        // The desktop app's window close: a clean editor quits outright —
+        // no Detach/Quit question, since the window is the session's only
+        // front end — while a modified file is asked about first.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, "unchanged\n").expect("write temp file");
+        let (mut cols, mut rows) = (120, 40);
+        let quit = serde_json::json!({});
+
+        let mut clean = super::build_editor(cols, rows, std::slice::from_ref(&file), false)
+            .expect("build editor");
+        assert!(super::apply_message(
+            &mut clean, "quit", &quit, &mut cols, &mut rows
+        ));
+        assert!(clean.should_quit(), "a clean editor quits at once");
+
+        let mut dirty = super::build_editor(cols, rows, std::slice::from_ref(&file), false)
+            .expect("build editor");
+        super::apply_step(&mut dirty, &serde_json::json!({"type": "x"}));
+        super::apply_message(&mut dirty, "quit", &quit, &mut cols, &mut rows);
+        assert!(!dirty.should_quit(), "unsaved work must be asked about");
+        assert!(
+            confirm_open(&mut dirty),
+            "the unsaved-changes card is shown"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "unchanged\n");
+    }
+
+    #[test]
+    fn open_message_opens_absolute_paths_and_ignores_the_rest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
+        std::fs::write(&a, "a\n").unwrap();
+        std::fs::write(&b, "b\n").unwrap();
+        let (mut cols, mut rows) = (120, 40);
+        let mut ed =
+            super::build_editor(cols, rows, std::slice::from_ref(&a), false).expect("build editor");
+        let msg = serde_json::json!({ "files": [b.to_string_lossy(), "relative.txt"] });
+        assert!(super::apply_message(
+            &mut ed, "open", &msg, &mut cols, &mut rows
+        ));
+        super::apply_step(&mut ed, &serde_json::json!({}));
+        let tabs = super::scene_value(&mut ed, cols, rows)["regions"]["panes"].to_string();
+        assert!(tabs.contains("b.txt"), "b.txt opened: {tabs}");
+        assert!(
+            !tabs.contains("relative.txt"),
+            "a relative path is not opened"
+        );
+    }
 
     #[test]
     fn digit_row_is_recovered_from_the_physical_key() {

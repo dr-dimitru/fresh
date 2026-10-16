@@ -366,31 +366,42 @@ if (webDockPanels) {
   }
 
   console.log('\n[dock clicks are cells routed over the tree]');
-  // The "show empty" toggle: its row's marker changes state when clicked, and
-  // again when clicked once more. It lives behind the header's `⋯` since the
-  // dock collapsed four header controls to two (`+ New` and `⋯`), so each
-  // click needs the menu opened first — the menu closes on activation, which
-  // is itself the plugin reacting to a cell click.
+  // The "Empty workspaces" toggle: its row's marker changes state when
+  // clicked, and again when clicked once more. It lives in the menu the
+  // header's `Menu ▾` button opens, which is an anchored layer over the
+  // editor (a `floating` surface), not rows inside the dock column. A
+  // settings row leaves the menu open, so both clicks land on the same menu.
+  const DOCK_MENU = /Menu ▾/;
   const openDockMenu = async () => {
-    const dots = findLine(await treeOf(), 'dock', /⋯/);
-    if (dots) await clickLine(dots);
-    await waitTree((t, lines) => lines('dock').some(l => /empty/i.test(l)), null, 5000);
+    const trigger = findLine(await treeOf(), 'dock', DOCK_MENU);
+    if (trigger) await clickLine(trigger);
+    await waitTree((t, lines) => lines('floating').some(l => /empty/i.test(l)), null, 5000);
   };
-  const toggleText = async () => { const it = findLine(await treeOf(), 'dock', /empty/i); return it ? it.text : null; };
+  const toggleLine = async () => findLine(await treeOf(), 'floating', /empty/i);
+  const toggleText = async () => { const it = await toggleLine(); return it ? it.text : null; };
+  // The toggle's own row, within the menu's text: the item is the whole menu.
+  const clickToggle = async () => {
+    const it = await toggleLine();
+    if (!it) return;
+    // The menu is two columns side by side: click the label's own cell.
+    const rows = it.text.split('\n');
+    const row = rows.findIndex(l => /empty/i.test(l));
+    await clickCell(it.x + rows[row].search(/empty/i), it.y + row);
+  };
   await openDockMenu();
   const t0 = await toggleText();
-  let tg = findLine(await treeOf(), 'dock', /empty/i); if (tg) await clickLine(tg);
-  await waitTree((t, lines, v0) => lines('dock').some(l => /empty/i.test(l) && l !== v0), t0, 5000);
+  await clickToggle();
+  await waitTree((t, lines, v0) => lines('floating').some(l => /empty/i.test(l) && l !== v0), t0, 5000);
   const t1 = await toggleText();
   check('dock toggle click flips real plugin state', t1 !== null && t1 !== t0, `${JSON.stringify(t0)} -> ${JSON.stringify(t1)}`);
-  tg = findLine(await treeOf(), 'dock', /empty/i); if (tg) await clickLine(tg);
-  await waitTree((t, lines, v1) => lines('dock').some(l => /empty/i.test(l) && l !== v1), t1, 5000);
+  await clickToggle();
+  await waitTree((t, lines, v1) => lines('floating').some(l => /empty/i.test(l) && l !== v1), t1, 5000);
   const t2 = await toggleText();
   check('a second click flips it back (the frame the click landed on was rebuilt)', t2 === t0, `${JSON.stringify(t1)} -> ${JSON.stringify(t2)}`);
-  // A settings row leaves the menu open (unlike an action row, which closes
-  // it); Esc puts the dock back to its plain state for what follows.
+  // Esc closes the menu and puts the dock back to its plain state for what
+  // follows.
   await page.keyboard.press('Escape');
-  await waitTree((t, lines) => !lines('dock').some(l => /Manage workspaces/i.test(l)), null, 5000);
+  await waitTree((t) => !t.surfaces.some(s => s.kind === 'floating'), null, 5000);
 
   console.log('\n[dock right-click = plugin context menu (anchored popup, like the TUI)]');
   // Right-click on a session row fires the plugin's `context` event exactly as
@@ -444,26 +455,23 @@ if (webDockPanels) {
     await page.keyboard.press('Escape'); await page.waitForTimeout(200);
   }
 
-  console.log('\n[dock dropdowns are layers over the column]');
-  // The header's `⋯` opens the dock's menu as a layer inside the dock's own
-  // subtree; its rows are display-list items below the trigger. (It replaced
-  // the old "New Task… ▾" dropdown when the header collapsed to two controls:
-  // `+ New` now goes straight to the dialog, and every setting moved here.)
-  const dotsTrigger = findLine(await treeOf(), 'dock', /⋯/);
-  if (dotsTrigger) await clickLine(dotsTrigger);
-  await waitTree((t, lines) => lines('dock').some(l => /Manage workspaces/i.test(l)), null, 5000);
-  const opened = await treeOf();
-  const option = treeLines(opened, 'dock').find(i => /Manage workspaces/i.test(i.text));
-  check('dock menu rows are items below the trigger', !!option && !!dotsTrigger && option.y > dotsTrigger.y, JSON.stringify({ trigger: dotsTrigger && dotsTrigger.y, option: option && option.y }));
+  console.log('\n[the dock menu is an anchored layer under its trigger]');
+  // The header's `Menu ▾` opens the dock's menu as a floating layer anchored
+  // to the button; its rows are display-list items below the trigger.
+  const menuTrigger = findLine(await treeOf(), 'dock', DOCK_MENU);
+  if (menuTrigger) await clickLine(menuTrigger);
+  await waitTree((t, lines) => lines('floating').some(l => /Import sessions/i.test(l)), null, 5000);
+  const option = findLine(await treeOf(), 'floating', /Import sessions/i);
+  const optionRow = option ? option.y + option.text.split('\n').findIndex(l => /Import sessions/i.test(l)) : null;
+  check('dock menu rows are items below the trigger', !!option && !!menuTrigger && optionRow > menuTrigger.y, JSON.stringify({ trigger: menuTrigger && menuTrigger.y, option: optionRow }));
   // One row is checked for the clipping a `list` inside a narrow column
   // silently does: it came back as "Discover agent ses" until the rows were
-  // padded to the widest, which is what makes the list ask for the width it
-  // needs. "Manage workspaces…" because it is long enough to have been
-  // clipped at the ~20 columns the dock gave, and its wording is not in play.
-  check('⋯ menu rows are not clipped by the dock column',
-    !!option && /Manage workspaces…/.test(option.text), JSON.stringify(option && option.text));
+  // padded to the widest. "Import sessions…" because it is long enough to
+  // have been clipped, and its wording is not in play.
+  check('dock menu rows are not clipped',
+    !!option && /Import sessions…/.test(option.text), JSON.stringify(option && option.text));
   await page.keyboard.press('Escape');
-  await waitTree((t, lines, n) => lines('dock').length <= n, treeLines(opened, 'dock').length - 1, 5000);
+  await waitTree((t) => !t.surfaces.some(s => s.kind === 'floating'), null, 5000);
   await page.keyboard.press('Escape'); await page.waitForTimeout(150);
 } else {
   skip('the dock panel sections (clicks, context menu, text field, dropdowns)');
@@ -495,6 +503,16 @@ check('Add-binding dialog renders natively (fields)', (await page.locator('.kbed
 await page.screenshot({ path: `${SHOTS}/29-native-keybindings.png` });
 await page.keyboard.press('Escape'); await page.waitForTimeout(150); await page.keyboard.press('Escape'); await page.waitForTimeout(200);
 
+// Select a Settings category by clicking its row in the tree.
+async function openSettingsCategory(name) {
+  await page.locator('.settings-modal .set-cat', { hasText: name }).first().click();
+  await page.waitForFunction(n => {
+    const s = window.fresh.scene.regions.settings;
+    return s && s.categories.some(c => c.selected && c.name === n);
+  }, name, { timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(150);
+}
+
 console.log('\n[Settings = full native modal incl. entry dialog]');
 await page.keyboard.press('Escape'); await page.waitForTimeout(120);
 await page.request.post(URL + '/action', { data: { action: 'open_settings' } });
@@ -502,6 +520,8 @@ await page.waitForFunction(() => !!window.fresh.scene.regions.settings, { timeou
 await page.waitForTimeout(300);
 check('Settings is a native modal (categories+items)', (await page.locator('.settings-modal .set-cat').count()) >= 5 && (await page.locator('.settings-modal .set-item').count()) >= 3);
 check('NO svg/cells in the settings modal', (await page.locator('.settings-modal svg').count()) === 0);
+// The Languages map lives on the "Syntax & Languages" page.
+await openSettingsCategory('Syntax & Languages');
 await page.keyboard.press('Tab'); await page.waitForTimeout(120);
 for (let i = 0; i < 4; i++) { await page.keyboard.press('ArrowDown'); await page.waitForTimeout(80); }
 await page.keyboard.press('Enter');
@@ -570,6 +590,7 @@ console.log('\n[Settings map entry rows: mouse + keyboard, TUI-parity interactio
 await page.request.post(URL + '/action', { data: { action: 'open_settings' } });
 await page.waitForFunction(() => !!window.fresh.scene.regions.settings, { timeout: 8000 }).catch(() => {});
 await page.waitForTimeout(250);
+await openSettingsCategory('Syntax & Languages');
 const langIdx = await page.evaluate(() => [...document.querySelectorAll('.set-items > .set-item')]
   .findIndex(r => (r.querySelector('.set-name') || {}).textContent === 'Languages'));
 const langRowsLoc = page.locator('.set-items > .set-item').nth(langIdx).locator('.set-list-row:not(.set-list-head)');
@@ -1312,7 +1333,9 @@ await page.keyboard.press('Escape'); await page.waitForTimeout(120);
 // Skin is read from localStorage at boot; single-client bridge → /reset first,
 // then set the skin and reload so the vibrancy modal is in play.
 await page.request.post(URL + '/reset', { data: {} });
-await page.evaluate(() => { try { localStorage.setItem('fresh.webtheme', 'macos'); } catch (_) {} });
+// Cell-drawn: these checks press the display list's cells where the tree
+// placed them (the native layout is checked by role further down).
+await page.evaluate(() => { try { localStorage.setItem('fresh.webtheme', 'macos'); localStorage.setItem('fresh.nativePanels', 'off'); } catch (_) {} });
 await page.reload({ waitUntil: 'networkidle' });
 await page.waitForFunction(() => window.fresh && window.fresh.wsOpen && window.fresh.scene && window.fresh.scene.regions.panes.length > 0, null, { timeout: 20000 });
 await page.waitForTimeout(400);
@@ -1358,6 +1381,7 @@ await page.keyboard.press('Escape'); await page.waitForTimeout(200);
 await page.request.post(URL + '/action', { data: { action: 'open_settings' } });
 await page.waitForFunction(() => !!window.fresh.scene.regions.settings, { timeout: 8000 }).catch(() => {});
 await page.waitForTimeout(300);
+await openSettingsCategory('Syntax & Languages');
 const langPill = page.locator('.settings-modal .set-item', { hasText: 'Default Language' }).locator('.set-pill');
 await langPill.scrollIntoViewIfNeeded().catch(() => {});
 const lpBox = await langPill.boundingBox();
@@ -1383,6 +1407,167 @@ if (lpBox) {
   check('Settings dropdown is NOT clipped — fully inside the dialog', !!sd && sd.insideModal, JSON.stringify(sd));
 }
 await page.keyboard.press('Escape'); await page.waitForTimeout(120);
+
+// Native panels (js/73-native.js): in the themes that lay the shell's
+// surfaces out themselves, a plugin panel is its spec drawn by the page and a
+// confirmation is a real dialog. Every press goes back as the control's
+// identity, so these checks drive the real editor through them.
+console.log('\n[native panels (Compact): laid out by the page, pressed by identity]');
+await page.request.post(URL + '/reset', { data: {} });
+await page.evaluate(() => { try { localStorage.setItem('fresh.webtheme', 'compact'); localStorage.removeItem('fresh.nativePanels'); } catch (_) {} });
+await page.reload({ waitUntil: 'networkidle' });
+await page.waitForFunction(() => window.fresh && window.fresh.wsOpen && window.fresh.scene && window.fresh.scene.regions.panes.length > 0, null, { timeout: 20000 });
+const nerrs = []; page.on('pageerror', e => nerrs.push(String(e)));
+check('Compact lays the shell\'s surfaces out natively',
+  await page.evaluate(() => document.body.classList.contains('native-panels')));
+if (!(await page.evaluate(() => (window.fresh.scene.regions.native.panels || []).some(p => p.kind === 'dock')))) {
+  await page.request.post(URL + '/action', { data: { action: 'orchestrator_dock_toggle' } });
+}
+await page.waitForSelector('.native-panel.np-dock', { timeout: 8000 }).catch(() => {});
+check('the dock is a native panel', !!(await page.$('.native-panel.np-dock')));
+check('the dock\'s cell items are hidden under it', await page.evaluate(() => {
+  const items = [...document.querySelectorAll('.tree-item[data-surface-kind="dock"]')];
+  return items.length > 0 && items.every(e => getComputedStyle(e).visibility === 'hidden');
+}));
+// Found by role and name, as assistive tech finds them: what a native
+// surface draws must say what it is, not only look like it.
+const newBtn = page.locator('.np-dock').getByRole('button', { name: /New$/ }).first();
+check('the dock is a labelled region with real buttons', (await page.getByRole('region').count()) >= 1 && (await newBtn.count()) === 1);
+if (await newBtn.count()) {
+  await newBtn.click();
+  await page.getByRole('dialog', { name: 'New Workspace' }).waitFor({ timeout: 8000 }).catch(() => {});
+}
+const card = page.getByRole('dialog', { name: 'New Workspace' });
+check('a dock button opens a floating panel, a dialog named by its title', (await card.count()) === 1
+  && (await card.evaluate(e => e.classList.contains('card') && e.getAttribute('aria-modal') === 'true').catch(() => false)));
+if (await card.count()) {
+  await page.screenshot({ path: `${SHOTS}/40-native-floating.png` });
+  check('its choices are a radio group with one checked',
+    (await card.getByRole('radio', { checked: true }).count()) === 1 && (await card.getByRole('radio').count()) >= 2);
+  check('its agent picker is a combobox', (await card.getByRole('combobox').count()) >= 1);
+  check('its prompt is a labelled text box', (await card.getByRole('textbox', { name: /Describe the task/ }).count()) === 1);
+  await card.getByRole('button', { name: 'Close' }).click();
+  await page.waitForSelector('.native-panel.np-floating', { state: 'detached', timeout: 8000 }).catch(() => {});
+  check('its close button closes it', (await page.getByRole('dialog').count()) === 0);
+}
+await page.evaluate(() => window.fresh.sendKey({ key: 'Q', code: 'KeyQ', ctrl: false, meta: false, shift: true, alt: false }));
+await page.waitForTimeout(300);
+await page.request.post(URL + '/action', { data: { action: 'close' } });
+const confirm = page.getByRole('alertdialog');
+await confirm.waitFor({ timeout: 8000 }).catch(() => {});
+check('an unsaved-changes question is a native alert dialog, named by its question',
+  (await confirm.count()) === 1 && ((await confirm.getAttribute('aria-label')) || '').length > 0);
+const cancel = confirm.getByRole('button', { name: 'Cancel' });
+if (await cancel.count()) {
+  await page.screenshot({ path: `${SHOTS}/41-native-confirm.png` });
+  await cancel.click();
+  await page.waitForFunction(() => !window.fresh.scene.regions.native.confirm, null, { timeout: 8000 }).catch(() => {});
+  check('its Cancel answers the editor\'s question', await page.evaluate(() => !window.fresh.scene.regions.native.confirm && !document.querySelector('.native-confirm')));
+}
+// The menu bar, by role: a menubar of titles, each opening a menu.
+const fileTitle = page.getByRole('menubar').getByRole('menuitem', { name: 'File', exact: true });
+check('the menu bar is a menubar of titles', (await fileTitle.count()) === 1
+  && (await fileTitle.getAttribute('aria-expanded')) === 'false');
+await fileTitle.click();
+await page.getByRole('menu').first().waitFor({ timeout: 5000 }).catch(() => {});
+check('a title opens a menu of items, and says so',
+  (await fileTitle.getAttribute('aria-expanded')) === 'true'
+  && (await page.getByRole('menuitem', { name: 'New File' }).count()) === 1);
+await page.keyboard.press('Escape'); await page.waitForTimeout(150);
+// A panel mounted into a pane (Search & Replace): drawn natively over its
+// pane, and — for the themes that fold the display list — a surface of it,
+// so the pane is never left blank.
+await page.request.post(URL + '/action', { data: { action: 'start_search_replace' } });
+const searchBox = page.getByRole('textbox', { name: 'Search' });
+await searchBox.waitFor({ timeout: 8000 }).catch(() => {});
+check('a pane-mounted panel is drawn natively, its fields labelled text boxes',
+  (await searchBox.count()) === 1 && (await page.getByRole('textbox', { name: 'Replace' }).count()) === 1);
+check('and is a surface of the display list too', await page.evaluate(() =>
+  (window.fresh.scene.regions.tree.surfaces || []).some(s => s.kind === 'pane')));
+check('the search and files fields line up', await page.evaluate(() => {
+  const x = n => [...document.querySelectorAll('.np-pane .w-text-input')].find(i => i.getAttribute('aria-label') === n)?.getBoundingClientRect().left;
+  const a = x('Search'), b = x('Files');
+  return a != null && b != null && Math.abs(a - b) < 1;
+}));
+const caseSwitch = page.getByRole('switch', { name: /^Case/ });
+const before = await caseSwitch.getAttribute('aria-checked').catch(() => null);
+if (before != null) {
+  await caseSwitch.click();
+  await page.waitForFunction(b => document.querySelector('.np-pane [role=switch][aria-label^="Case"]')?.getAttribute('aria-checked') !== b,
+    before, { timeout: 5000 }).catch(() => {});
+}
+check('a switch says whether it is on, and pressing it turns it', before != null
+  && (await caseSwitch.getAttribute('aria-checked')) === String(before !== 'true'));
+await page.screenshot({ path: `${SHOTS}/42-native-pane-panel.png` });
+// A page (the Welcome screen): laid out in the page's own column, as the
+// terminal sets it, and scrolled by the editor — the web follows the
+// editor's window, so a card's jump, the wheel and the page keys are one
+// scroll position.
+await page.request.post(URL + '/action', { data: { action: 'welcome_open' } });
+const welcome = page.locator('.native-panel.np-pane.paged').first();
+await welcome.waitFor({ timeout: 8000 }).catch(() => {});
+check('the Welcome screen is a native page the editor scrolls', (await welcome.count()) === 1);
+// The doors are the sized cards that end in a jump (the code sample is
+// sized too); the page is wide enough here for the terminal to set them in a
+// row.
+const doors = await page.evaluate(() => [...document.querySelectorAll('.native-panel.paged .w-section.sized')]
+  .filter(e => /jump/.test(e.textContent)).map(e => e.getBoundingClientRect())
+  .map(r => ({ top: Math.round(r.top), h: Math.round(r.height) })));
+check('its door cards stand side by side, alike', doors.length === 3
+  && doors.every(d => d.top === doors[0].top && d.h === doors[0].h), JSON.stringify(doors));
+const pageOffset = () => page.evaluate(() =>
+  (window.fresh.scene.regions.native.panels.find(x => x.page) || {}).page?.offset ?? -1);
+const offsetPast = (cmp, o) => page.waitForFunction(([c, o]) => {
+  const v = (window.fresh.scene.regions.native.panels.find(x => x.page) || {}).page?.offset ?? -1;
+  return c === 'gt' ? v > o : c === 'lt' ? v >= 0 && v < o : v === o;
+}, [cmp, o], { timeout: 5000 }).catch(() => {});
+// A door card is one target: a blank row of it jumps as its button does.
+// Pressed on the row itself — whether the page shows the doors at the top
+// depends on the pane's height.
+const gapW = await page.evaluate(() => {
+  const g = document.querySelector('.native-panel.paged .w-section.sized .w-para-gap[data-wkey]');
+  if (!g) return 0;
+  g.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+  return g.getBoundingClientRect().width;
+});
+await offsetPast('gt', 0);
+const gapJump = await pageOffset();
+check('a blank row of a door card jumps the page', gapW > 0 && gapJump > 0, `width=${gapW} offset=${gapJump}`);
+// The wheel over the page scrolls it in the editor: back up to the top.
+const wbox = await welcome.boundingBox();
+if (wbox) {
+  await page.mouse.move(wbox.x + wbox.width / 2, wbox.y + wbox.height / 2);
+  for (let i = 0; i < 6 && (await pageOffset()) > 0; i++) { await page.mouse.wheel(0, -800); await offsetPast('lt', gapJump); }
+}
+const wheeled = await pageOffset();
+check('the wheel over the page scrolls it in the editor', wheeled >= 0 && wheeled < gapJump, `${gapJump} → ${wheeled}`);
+await page.waitForFunction(() => ((window.fresh.scene.regions.native.panels.find(x => x.page) || {}).page?.offset ?? -1) === 0,
+  null, { timeout: 5000 }).catch(() => {});
+await welcome.getByRole('button', { name: /jump/ }).first().click().catch(() => {});
+await offsetPast('gt', 0);
+const jumped = await pageOffset();
+check('a card\'s jump scrolls the page in the editor, and the view follows',
+  jumped > 0 && jumped === gapJump && await page.evaluate(() => document.querySelector('.native-panel.paged').scrollTop > 0),
+  `offset=${jumped} (gap ${gapJump})`);
+check('no cell caret is drawn over the page', await page.evaluate(() =>
+  [...document.querySelectorAll('.caret,.tree-caret')].every(c => getComputedStyle(c).visibility === 'hidden')));
+await page.screenshot({ path: `${SHOTS}/43-native-welcome.png` });
+// A strip: a toolbar a buffer group mounts in a pane one cell tall (the git
+// log's buttons). Laid out on that height, every control is whole in it.
+await page.request.post(URL + '/action', { data: { action: 'show_git_log' } });
+const strip = page.locator('.native-panel.np-pane.strip').first();
+await strip.waitFor({ timeout: 8000 }).catch(() => {});
+check('a one-row toolbar pane is a native strip', (await strip.count()) === 1);
+check('its buttons sit whole inside it', await page.evaluate(() => {
+  const s = document.querySelector('.native-panel.np-pane.strip');
+  if (!s) return false;
+  const r = s.getBoundingClientRect();
+  const bs = [...s.querySelectorAll('.w-button')];
+  return bs.length > 0 && bs.every(b => { const q = b.getBoundingClientRect(); return q.top >= r.top - 0.5 && q.bottom <= r.bottom + 0.5; })
+    && s.scrollHeight <= s.clientHeight + 1;
+}));
+await page.screenshot({ path: `${SHOTS}/44-native-strip.png` });
+check('no JS page errors (native panels)', nerrs.length === 0, nerrs.join(' | '));
 
 console.log('\n[touch pan/scroll on mobile (hasTouch context)]');
 // The bridge is single-client: close the desktop page (frees /ws) before

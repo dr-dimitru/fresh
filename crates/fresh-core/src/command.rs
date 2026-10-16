@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Source of a command (builtin or from a plugin)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, crate::TS)]
 #[ts(export)]
 pub enum CommandSource {
     /// Built-in editor command
@@ -12,7 +12,7 @@ pub enum CommandSource {
 
 /// A command registered by a plugin via the service bridge.
 /// This is a simplified version that the editor converts to its internal Command type.
-#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, crate::TS)]
 #[ts(export)]
 pub struct Command {
     /// Command name (e.g., "Open File")
@@ -38,17 +38,26 @@ pub struct Command {
 }
 
 /// A single suggestion item for autocomplete
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, crate::TS)]
 #[serde(deny_unknown_fields)]
 #[ts(export, rename = "PromptSuggestion")]
 pub struct Suggestion {
+    /// What this row is, unique within the list: the plugin's own name for
+    /// the item (a path, a match's `file:line:col`, a record id).
+    ///
+    /// **Required.** The list keys its rows by it, so an insertion or a
+    /// re-rank moves the other rows instead of rewriting them, and the
+    /// selection stays on the row it was on. Not the label: two rows may
+    /// read the same and still be different things. `setPromptSuggestions`
+    /// throws when two suggestions share an id.
+    pub id: String,
     /// The text to display
     pub text: String,
-    /// Optional description
+    /// Optional description, shown in the row alongside `text`
     #[serde(default)]
     #[ts(optional)]
     pub description: Option<String>,
-    /// The value to use when selected (defaults to text if None)
+    /// The value to use when selected (defaults to `text` when omitted)
     #[serde(default)]
     #[ts(optional)]
     pub value: Option<String>,
@@ -63,7 +72,7 @@ pub struct Suggestion {
     #[serde(default)]
     #[ts(optional)]
     pub description_spans: Option<Vec<crate::api::StyledText>>,
-    /// Optional keyboard shortcut
+    /// Optional keyboard shortcut, shown in the row as a hint
     #[serde(default)]
     #[ts(optional)]
     pub keybinding: Option<String>,
@@ -74,9 +83,9 @@ pub struct Suggestion {
 }
 
 #[cfg(feature = "plugins")]
-impl<'js> rquickjs::FromJs<'js> for Suggestion {
-    fn from_js(_ctx: &rquickjs::Ctx<'js>, value: rquickjs::Value<'js>) -> rquickjs::Result<Self> {
-        rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
+impl<'js> fresh_js::FromJs<'js> for Suggestion {
+    fn from_js(_ctx: &fresh_js::Ctx<'js>, value: fresh_js::Value<'js>) -> fresh_js::Result<Self> {
+        fresh_js::serde::from_value(value).map_err(|e| fresh_js::Error::FromJs {
             from: "object",
             to: "Suggestion",
             message: Some(e.to_string()),
@@ -85,8 +94,9 @@ impl<'js> rquickjs::FromJs<'js> for Suggestion {
 }
 
 impl Suggestion {
-    pub fn new(text: String) -> Self {
+    pub fn new(id: String, text: String) -> Self {
         Self {
+            id,
             text,
             description: None,
             value: None,
@@ -95,6 +105,12 @@ impl Suggestion {
             keybinding: None,
             source: None,
         }
+    }
+
+    /// The first id `suggestions` repeats, if any: a list whose ids are not
+    /// unique cannot key its rows, and is refused where it arrives.
+    pub fn duplicate_id(suggestions: &[Suggestion]) -> Option<&str> {
+        crate::api::first_duplicate_id(suggestions.iter().map(|s| s.id.as_str()))
     }
 
     /// Check if this suggestion is disabled
@@ -110,7 +126,7 @@ mod tests {
     /// `is_disabled` mirrors the `disabled` option and treats `None` as enabled.
     #[test]
     fn is_disabled_reflects_disabled_field() {
-        let mut s = Suggestion::new("foo".into());
+        let mut s = Suggestion::new("foo".into(), "foo".into());
         assert!(!s.is_disabled(), "None defaults to enabled");
 
         s.disabled = Some(false);
@@ -126,15 +142,18 @@ mod tests {
     #[cfg(feature = "plugins")]
     #[test]
     fn suggestion_from_js_decodes_distinguishing_fields() {
-        use rquickjs::{Context, FromJs, Runtime, Value};
+        use fresh_js::{Context, FromJs, Runtime, Value};
         let rt = Runtime::new().unwrap();
         let ctx = Context::full(&rt).unwrap();
         ctx.with(|ctx| {
             let v: Value = ctx
-                .eval::<Value, _>(b"({text: 'hello', description: 'world'})".as_slice())
+                .eval::<Value, _>(
+                    b"({id: 'greeting', text: 'hello', description: 'world'})".as_slice(),
+                )
                 .unwrap();
             let got = Suggestion::from_js(&ctx, v).unwrap();
             assert_eq!(got.text, "hello");
+            assert_eq!(got.id, "greeting");
             assert_eq!(got.description.as_deref(), Some("world"));
         });
     }

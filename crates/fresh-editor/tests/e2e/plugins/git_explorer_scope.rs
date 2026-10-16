@@ -170,12 +170,12 @@ fn write_git_wrapper(bin_dir: &Path, log: &Path, root_alias: &Path, root: &Path)
 fn git_explorer_checks_only_visible_or_expanded_nested_repositories() {
     let fixture = MultiRepoFixture::new();
     fixture.init_workspace_repo();
-    fixture.init_nested_repo("packages/visible", &["src/edited.ts"], Some("src/edited.ts"));
     fixture.init_nested_repo(
-        "packages/hidden/repo",
-        &["src/new.ts"],
-        Some("src/new.ts"),
+        "packages/visible",
+        &["src/edited.ts"],
+        Some("src/edited.ts"),
     );
+    fixture.init_nested_repo("packages/hidden/repo", &["src/new.ts"], Some("src/new.ts"));
     let data_dir = fixture._temp.path().join("test-data/fresh");
     let _data_dir_pin = pin_data_dir(data_dir);
     let _path_pin = fixture.install_git_wrapper();
@@ -193,10 +193,7 @@ fn git_explorer_checks_only_visible_or_expanded_nested_repositories() {
     harness.editor_mut().file_explorer_navigate_down();
     harness.editor_mut().file_explorer_toggle_expand();
     let visible_repo = fixture.repo_root("packages/visible");
-    fixture.wait_for_status_cwds(
-        &mut harness,
-        &[root.clone(), visible_repo.clone()],
-    );
+    fixture.wait_for_status_cwds(&mut harness, &[root.clone(), visible_repo.clone()]);
     assert!(!fixture
         .status_cwds()
         .contains(&fixture.repo_root("packages/hidden/repo")));
@@ -208,15 +205,12 @@ fn git_explorer_checks_only_visible_or_expanded_nested_repositories() {
     harness.editor_mut().file_explorer_toggle_expand();
     harness
         .wait_until(|h| {
-            h.screen_to_string().lines().any(|line| {
-                line.contains("edited.ts") && line.contains('M')
-            })
+            h.screen_to_string()
+                .lines()
+                .any(|line| line.contains("edited.ts") && line.contains('M'))
         })
         .unwrap();
-    fixture.wait_for_status_cwds(
-        &mut harness,
-        &[root.clone(), visible_repo.clone()],
-    );
+    fixture.wait_for_status_cwds(&mut harness, &[root.clone(), visible_repo.clone()]);
 
     let screen = harness.screen_to_string();
     let root_name = fixture.root.file_name().unwrap().to_string_lossy();
@@ -233,6 +227,9 @@ fn git_explorer_checks_only_visible_or_expanded_nested_repositories() {
         .find(|line| line.starts_with('│') && line.contains("edited.ts"))
         .expect("modified nested file should be visible");
     assert!(root_line.contains('M'), "root badge missing: {root_line}");
-    assert!(visible_line.contains('M'), "parent badge missing: {visible_line}");
+    assert!(
+        visible_line.contains('M'),
+        "parent badge missing: {visible_line}"
+    );
     assert!(file_line.contains('M'), "file badge missing: {file_line}");
 }

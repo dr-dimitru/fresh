@@ -26,9 +26,7 @@ use crate::server::capture_backend::{
 use crate::server::command_access;
 use crate::server::input_parser::ClientInputParser;
 use crate::server::ipc::{ServerConnection, ServerListener, SocketPaths, StreamWrapper};
-use crate::server::protocol::{
-    ClientControl, ServerControl, ServerHello, TermSize, VersionMismatch, PROTOCOL_VERSION,
-};
+use crate::server::protocol::{ClientControl, ServerControl, ServerHello, TermSize};
 use crate::view::color_support::ColorCapability;
 
 /// Configuration for the editor server
@@ -101,8 +99,12 @@ pub struct EditorServer {
     terminal: Option<Terminal<CaptureBackend>>,
     last_client_activity: Instant,
     shutdown: Arc<AtomicBool>,
-    /// Effective terminal size (from the primary/first client)
+    /// Effective terminal size (from the client that sizes the session)
     term_size: TermSize,
+    /// Id of the terminal that sizes the session: the one last used — typed
+    /// in, clicked in, focused or resized. `None` (or an id that has since
+    /// disconnected) falls back to the oldest attached terminal.
+    size_owner: Option<u64>,
     /// Index of the client that most recently provided input (for per-client detach)
     last_input_client: Option<usize>,
     /// Next wait ID for --wait tracking
@@ -203,6 +205,11 @@ struct ConnectedClient {
     needs_full_render: bool,
     /// If set, this client is waiting for a --wait completion signal
     wait_id: Option<u64>,
+    /// Control-socket bytes not yet ending in a newline.
+    control_buf: Vec<u8>,
+    /// The client forwards a Linux console mouse from GPM
+    /// (`ClientControl::GpmPointer`), so the editor draws the pointer.
+    gpm_pointer: bool,
     /// Per-workspace capability token presented in this client's `Hello`
     /// (from `$FRESH_CMD_TOKEN`). Authorizes `RunScript` against the token's
     /// grant; `None` for clients that carry no token.
@@ -218,13 +225,8 @@ impl EditorServer {
             SocketPaths::for_working_dir(&config.working_dir)?
         };
 
+        // Also writes the PID file, which clients check for a running daemon
         let listener = ServerListener::bind(socket_paths)?;
-
-        // Write PID file so clients can detect stale daemons
-        let pid = std::process::id();
-        if let Err(e) = listener.paths().write_pid(pid) {
-            tracing::warn!("Failed to write PID file: {}", e);
-        }
 
         // Workspace Trust is born in `main.rs` (already rooted at the working
         // dir, store attached, persisted level loaded) and threaded in via the
@@ -257,6 +259,7 @@ impl EditorServer {
             last_client_activity: Instant::now(),
             shutdown: Arc::new(AtomicBool::new(false)),
             term_size: TermSize::new(80, 24), // Default until first client connects
+            size_owner: None,
             last_input_client: None,
             next_wait_id: 1,
             waiting_clients: std::collections::HashMap::new(),
@@ -317,6 +320,13 @@ impl EditorServer {
         let mut last_render = Instant::now();
         const FRAME_DURATION: Duration = Duration::from_millis(16); // 60fps
 
+        // Poll every 5ms for a second after any activity, so replies to a
+        // keystroke land promptly; once idle, once a frame.
+        const ACTIVE_POLL: Duration = Duration::from_millis(5);
+        const ACTIVE_WINDOW: Duration = Duration::from_secs(1);
+        let mut last_activity = Instant::now();
+        let mut periodic_deadline: Option<Instant> = None;
+
         // Bind the web bridge (`--web`) before the loop: unlike a terminal,
         // a browser can't be waited for, so the editor is built eagerly here
         // rather than on the first IPC client.
@@ -367,7 +377,7 @@ impl EditorServer {
             }
 
             // Accept new connections
-            tracing::debug!("[server] main loop: calling accept()");
+            tracing::trace!("[server] main loop: calling accept()");
             match self.listener.accept() {
                 Ok(Some(conn)) => {
                     // Get current cursor style from editor if it exists, otherwise from config
@@ -414,7 +424,7 @@ impl EditorServer {
             }
 
             // Process client messages and get input events
-            tracing::debug!("[server] main loop: calling process_clients");
+            tracing::trace!("[server] main loop: calling process_clients");
             let (input_events, resize_occurred, input_source) = self.process_clients()?;
             if let Some(idx) = input_source {
                 self.last_input_client = Some(idx);
@@ -521,22 +531,21 @@ impl EditorServer {
             // Process input events
             if !input_events.is_empty() {
                 self.last_client_activity = Instant::now();
-                for event in input_events {
+                for event in crate::server::input_parser::coalesce_motion(input_events) {
                     if self.handle_event(event)? {
                         needs_render = true;
                     }
                 }
             }
 
-            // Process async messages from editor
-            if let Some(ref mut editor) = self.editor {
-                if editor.process_async_messages_budgeted() {
-                    needs_render = true;
-                }
-                if editor.process_pending_file_opens() {
-                    needs_render = true;
-                }
+            // Shared per-iteration housekeeping (async messages, timers,
+            // plugin timers, auto-save, recovery save) — see
+            // `run_editor_tick`.
+            if self.run_editor_tick() {
+                needs_render = true;
+            }
 
+            if let Some(ref mut editor) = self.editor {
                 // Answer script callers whose script has now settled: what
                 // the script returned becomes the reply's `output` (what
                 // `fresh --cmd script run` prints).
@@ -588,10 +597,6 @@ impl EditorServer {
                     }
                 }
 
-                if editor.check_mouse_hover_timer() {
-                    needs_render = true;
-                }
-
                 // Active animations force a render every FRAME_DURATION so
                 // the slide settles on its own. Without this the loop only
                 // ticks when an external event (input, resize, async
@@ -605,6 +610,7 @@ impl EditorServer {
                 if editor.active_window().animations.is_active()
                     || editor.active_window_mut().animations.take_settle_frame()
                     || editor.has_pending_wheel_scroll()
+                    || editor.has_drag_autoscroll()
                 {
                     needs_render = true;
                 }
@@ -620,10 +626,8 @@ impl EditorServer {
                 // word under the cursor waited for the next keystroke and
                 // then jumped, which reads as a flicker while typing. The LSP
                 // spinner and the async-paste fallback had the same hole.
-                if editor
-                    .next_periodic_redraw_deadline()
-                    .is_some_and(|deadline| Instant::now() >= deadline)
-                {
+                periodic_deadline = editor.next_periodic_redraw_deadline();
+                if periodic_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     needs_render = true;
                 }
             }
@@ -645,6 +649,10 @@ impl EditorServer {
                 }
             }
 
+            if needs_render {
+                last_activity = Instant::now();
+            }
+
             // Render and broadcast if needed
             if needs_render && last_render.elapsed() >= FRAME_DURATION {
                 self.render_and_broadcast()?;
@@ -652,37 +660,30 @@ impl EditorServer {
                 needs_render = false;
             }
 
-            // Brief sleep to avoid busy-waiting
-            std::thread::sleep(Duration::from_millis(5));
+            let mut wait = if last_activity.elapsed() < ACTIVE_WINDOW {
+                ACTIVE_POLL
+            } else {
+                FRAME_DURATION
+            };
+            if let Some(deadline) = periodic_deadline {
+                // A deadline already due waits for the frame it owes, not 0.
+                let until_frame = FRAME_DURATION.saturating_sub(last_render.elapsed());
+                wait = wait.min(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .max(until_frame),
+                );
+            }
+            std::thread::sleep(wait.max(Duration::from_millis(1)));
         }
 
-        // Perform the same shutdown sequence as the normal (non-daemon) exit path
-        // in run_event_loop_common: auto-save, end recovery session, save workspace.
+        // The same shutdown sequence as the normal (non-daemon) exit path in
+        // run_event_loop_common — see `Editor::persist_on_exit`.
         if let Some(ref mut editor) = self.editor {
-            // Auto-save file-backed buffers to disk before exiting
-            if editor.config().editor.auto_save_enabled {
-                match editor.save_all_on_exit() {
-                    Ok(count) if count > 0 => {
-                        tracing::info!("Auto-saved {} buffer(s) on exit", count);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!("Failed to auto-save on exit: {}", e);
-                    }
-                }
+            // Each failure is logged inside; none blocks shutdown.
+            if let Err(e) = editor.persist_on_exit(true) {
+                tracing::debug!("Shutdown persistence incomplete: {e}");
             }
-
-            // End recovery session first (flushes dirty buffers + assigns recovery IDs),
-            // then save workspace (captures those IDs for next workspace restore).
-            if let Err(e) = editor.end_recovery_session() {
-                tracing::warn!("Failed to end recovery session: {}", e);
-            }
-            if let Err(e) = editor.save_all_windows_workspaces() {
-                tracing::warn!("Failed to save workspaces: {}", e);
-            } else {
-                tracing::debug!("Workspaces saved successfully");
-            }
-            editor.save_dock_chrome();
         }
 
         // Clean shutdown
@@ -692,18 +693,18 @@ impl EditorServer {
     }
 
     /// The size the shared editor renders at: the element-wise MIN of every
-    /// viewport watching it — the primary attached terminal and, when this
-    /// daemon hosts the web bridge, the smallest connected browser. One editor
-    /// draws one grid, so the grid has to fit them all; a larger window
-    /// letterboxes rather than being shown a grid it can't display. Terminals
-    /// keep the daemon's long-standing "first client sizes the session" rule.
+    /// viewport watching it — the terminal that sizes the session (see
+    /// [`Self::sizing_client`]) and, when this daemon hosts the web bridge,
+    /// the smallest connected browser. One editor draws one grid, so the grid
+    /// has to fit them all; a larger window letterboxes rather than being
+    /// shown a grid it can't display.
     ///
     /// Returns whether the size actually moved (the caller then pushes it into
     /// the capture backend and the editor via `update_terminal_size`).
     fn recompute_term_size(&mut self) -> bool {
         // `mut` is exercised only by the `web` branch below.
         #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-        let mut fit: Option<TermSize> = self.clients.first().map(|c| c.term_size);
+        let mut fit: Option<TermSize> = self.sizing_client().map(|c| c.term_size);
         #[cfg(feature = "web")]
         if let Some((wc, wr)) = self.web.as_ref().and_then(|b| b.wanted_size()) {
             fit = Some(match fit {
@@ -718,6 +719,22 @@ impl EditorServer {
             }
             _ => false,
         }
+    }
+
+    /// The terminal the session is sized for: the one last used (see
+    /// `size_owner`), else the oldest attached.
+    ///
+    /// Terminals do not share a size, and one grid is drawn for all of them,
+    /// so one of them has to win. It used to be the first to attach, for as
+    /// long as it stayed attached — so with Fresh left open on a Linux VT, a
+    /// desktop terminal attached to the same session was drawn at the VT's
+    /// size and resizing its window did nothing (#3517). The terminal in use
+    /// is the one whose size matters; the others get its grid until they are
+    /// used in turn, the way tmux's `window-size latest` behaves.
+    fn sizing_client(&self) -> Option<&ConnectedClient> {
+        self.size_owner
+            .and_then(|id| self.clients.iter().find(|c| c.id == id))
+            .or_else(|| self.clients.first())
     }
 
     /// True while a browser is connected to the hosted web bridge.
@@ -837,13 +854,24 @@ impl EditorServer {
                     ),
                 )),
             ),
-            false,
+            // Plugins load on the plugin thread and arrive through the async
+            // bridge, as they do for an in-process launch, so the first frame
+            // is not held back by them. Loading them inline kept a bare
+            // `fresh` on a blank screen for the whole plugin load — over a
+            // second on a fast machine and several on a slow one (#3517).
+            // The lifecycle hooks `initialize_editor` fires queue behind the
+            // loads on the same FIFO thread, so they still run after them.
+            true,
             self.config.orchestrator_mode,
+            // A daemon is a session, never a file launch: files reach it as
+            // `OpenFiles` into whatever workspace it has.
+            false,
         )
         .map_err(|e| io::Error::other(format!("Failed to create editor: {}", e)))?;
 
-        // Auto-load init.ts via the same pipeline as the non-server entry point.
-        editor.load_init_script(self.config.init_enabled);
+        // Auto-load init.ts via the same pipeline as the non-server entry
+        // point, queued behind the plugin loads.
+        editor.load_init_script_async(self.config.init_enabled);
 
         // Enable session mode - use hardware cursor only, no REVERSED software cursor
         editor.set_session_mode(true);
@@ -986,47 +1014,9 @@ impl EditorServer {
         client_id: u64,
         cursor_style: crate::config::CursorStyle,
     ) -> io::Result<ConnectedClient> {
-        // Read client hello
-        // On Windows, don't toggle blocking mode - named pipes don't support mode switching
-        // after connection. The read_control() method handles this internally.
-        #[cfg(not(windows))]
-        conn.control.set_nonblocking(false)?;
-        let hello_json = conn
-            .read_control()?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "No hello received"))?;
-
-        let client_msg: ClientControl = serde_json::from_str(&hello_json)
-            .map_err(|e| io::Error::other(format!("Invalid hello: {}", e)))?;
-
-        let hello = match client_msg {
-            ClientControl::Hello(h) => h,
-            _ => {
-                return Err(io::Error::other("Expected Hello message"));
-            }
-        };
-
-        // Check protocol version
-        if hello.protocol_version != PROTOCOL_VERSION {
-            let mismatch = VersionMismatch {
-                server_version: env!("CARGO_PKG_VERSION").to_string(),
-                client_version: hello.client_version.clone(),
-                action: if hello.protocol_version > PROTOCOL_VERSION {
-                    "upgrade_server".to_string()
-                } else {
-                    "restart_server".to_string()
-                },
-                message: format!(
-                    "Protocol version mismatch: server={}, client={}",
-                    PROTOCOL_VERSION, hello.protocol_version
-                ),
-            };
-
-            let response = serde_json::to_string(&ServerControl::VersionMismatch(mismatch))
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            conn.write_control(&response)?;
-
-            return Err(io::Error::other("Version mismatch"));
-        }
+        // `accept` read the Hello, and answered one of another protocol
+        // version itself
+        let hello = conn.hello.clone();
 
         // Send server hello
         let session_id = self.config.session_name.clone().unwrap_or_else(|| {
@@ -1071,6 +1061,8 @@ impl EditorServer {
             input_parser: ClientInputParser::new(),
             needs_full_render: true,
             wait_id: None,
+            gpm_pointer: false,
+            control_buf: Vec::new(),
             cmd_token: hello.cmd_token,
         })
     }
@@ -1083,12 +1075,15 @@ impl EditorServer {
         let mut input_events = Vec::new();
         let mut resize_occurred = false;
         let mut control_messages: Vec<(usize, ClientControl)> = Vec::new();
+        // The last terminal this pass that was used, and so takes over sizing
+        // the session (see `sizing_client`).
+        let mut claimed_by: Option<u64> = None;
 
         for (idx, client) in self.clients.iter_mut().enumerate() {
             // Read from data socket
             let mut buf = [0u8; 4096];
             let mut data_eof = false;
-            tracing::debug!("[server] reading from client {} data socket", client.id);
+            tracing::trace!("[server] reading from client {} data socket", client.id);
             match client.conn.read_data(&mut buf) {
                 Ok(0) => {
                     tracing::debug!("[server] Client {} data stream closed (EOF)", client.id);
@@ -1114,6 +1109,9 @@ impl EditorServer {
                     if !events.is_empty() {
                         input_source_client = Some(idx);
                     }
+                    if events.iter().any(claims_session_size) {
+                        claimed_by = Some(client.id);
+                    }
                     input_events.extend(events);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -1137,6 +1135,7 @@ impl EditorServer {
             let flushed = client.input_parser.flush_idle(Instant::now());
             if !flushed.is_empty() {
                 input_source_client = Some(idx);
+                claimed_by = Some(client.id);
                 input_events.extend(flushed);
             }
 
@@ -1147,53 +1146,39 @@ impl EditorServer {
             #[allow(clippy::let_underscore_must_use)]
             let _ = client.conn.control.set_nonblocking(true);
 
-            // On Windows, use try_read pattern instead of blocking read_line
-            #[cfg(windows)]
-            {
-                let mut buf = [0u8; 1024];
-                match client.conn.control.try_read(&mut buf) {
+            // Drain whatever the control socket holds into this client's
+            // buffer, then take every complete newline-delimited message.
+            // Reading one line through a fresh `BufReader` per pass (as this
+            // did on unix) dropped every message buffered past the first: a
+            // client that sends `OpenFiles` and then `Resize` straight after
+            // lost the `Resize`. A partial trailing message stays buffered
+            // for the next pass.
+            let mut chunk = [0u8; 4096];
+            loop {
+                match client.conn.control.try_read(&mut chunk) {
                     Ok(0) => {
                         tracing::debug!("Client {} control stream closed (EOF)", client.id);
                         disconnected.push(idx);
+                        break;
                     }
-                    Ok(n) => {
-                        // Try to parse as control message
-                        if let Ok(s) = std::str::from_utf8(&buf[..n]) {
-                            for line in s.lines() {
-                                if !line.trim().is_empty() {
-                                    if let Ok(msg) = serde_json::from_str::<ClientControl>(line) {
-                                        control_messages.push((idx, msg));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Ok(n) => client.control_buf.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) => {
                         tracing::warn!("Client {} control read error: {}", client.id, e);
+                        break;
                     }
                 }
             }
-
-            #[cfg(not(windows))]
-            {
-                let mut reader = std::io::BufReader::new(&client.conn.control);
-                let mut line = String::new();
-                match std::io::BufRead::read_line(&mut reader, &mut line) {
-                    Ok(0) => {
-                        tracing::debug!("Client {} control stream closed (EOF)", client.id);
-                        disconnected.push(idx);
-                    }
-                    Ok(_) if !line.trim().is_empty() => {
-                        if let Ok(msg) = serde_json::from_str::<ClientControl>(&line) {
-                            control_messages.push((idx, msg));
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        tracing::warn!("Client {} control read error: {}", client.id, e);
-                    }
+            while let Some(pos) = client.control_buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = client.control_buf.drain(..=pos).collect();
+                let Ok(line) = std::str::from_utf8(&line) else {
+                    continue;
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(msg) = serde_json::from_str::<ClientControl>(line) {
+                    control_messages.push((idx, msg));
                 }
             }
         }
@@ -1230,12 +1215,21 @@ impl EditorServer {
                 ClientControl::Resize { cols, rows } => {
                     if let Some(client) = self.clients.get_mut(idx) {
                         client.term_size = TermSize::new(cols, rows);
-                        // The first client sizes the session; the main loop
+                        // A terminal being resized is a terminal in use, so it
+                        // takes over sizing the session; the main loop
                         // recomputes the shared grid from it (mins'd against
-                        // any browsers on the hosted web bridge).
-                        if idx == 0 {
-                            resize_occurred = true;
-                        }
+                        // any browsers on the hosted web bridge). A client
+                        // also sends one as it starts relaying, which is how a
+                        // newly attached terminal gets the session fitted to
+                        // it while a one-shot `fresh FILE` client does not.
+                        claimed_by = Some(client.id);
+                        resize_occurred = true;
+                    }
+                }
+                ClientControl::GpmPointer => {
+                    if let Some(client) = self.clients.get_mut(idx) {
+                        client.gpm_pointer = true;
+                        resize_occurred = true; // repaint with the pointer
                     }
                 }
                 ClientControl::Ping => {
@@ -1288,9 +1282,28 @@ impl EditorServer {
 
                         // Track the waiting client
                         if let Some(wait_id) = wait_id {
+                            // A viewer is an attached terminal (a client that
+                            // is not itself waiting on a file) or a browser.
+                            let viewed = self.web_busy()
+                                || self
+                                    .clients
+                                    .iter()
+                                    .enumerate()
+                                    .any(|(i, c)| i != idx && c.wait_id.is_none());
                             if let Some(client) = self.clients.get_mut(idx) {
                                 self.waiting_clients.insert(wait_id, client.id);
                                 client.wait_id = Some(wait_id);
+                                if !viewed {
+                                    tracing::info!(
+                                        "OpenFiles --wait on a daemon with no viewer; telling the client"
+                                    );
+                                    let msg = serde_json::to_string(&ServerControl::NoViewer)
+                                        .unwrap_or_default();
+                                    // Best-effort: a client that is already gone
+                                    // has nothing left to tell.
+                                    #[allow(clippy::let_underscore_must_use)]
+                                    let _ = client.conn.write_control(&msg);
+                                }
                             }
                         }
 
@@ -1360,13 +1373,20 @@ impl EditorServer {
             }
         }
 
+        if let Some(id) = claimed_by {
+            if self.size_owner != Some(id) {
+                self.size_owner = Some(id);
+                resize_occurred = true;
+            }
+        }
+
         // Deduplicate and sort for safe reverse removal
         disconnected.sort_unstable();
         disconnected.dedup();
 
-        // Remove disconnected clients. Losing one changes the shared fit: the
-        // primary terminal sizes the session, so when it goes away the next
-        // client inherits that role and the grid has to be recomputed for it —
+        // Remove disconnected clients. Losing one changes the shared fit: if
+        // it was the terminal sizing the session, the oldest remaining one
+        // inherits that role and the grid has to be recomputed for it —
         // otherwise a survivor keeps being rendered at the dead client's size
         // and shows a clipped screen until it happens to send a resize. Flag it
         // like any other resize so the main loop refits and repaints; when the
@@ -1461,11 +1481,81 @@ impl EditorServer {
         }
     }
 
+    /// One iteration of shared per-tick housekeeping, from the one place that
+    /// has it: [`crate::app::editor_tick`] — the same function the TUI
+    /// (`main.rs`), the GUI and the web loop call. Returns true if a render is
+    /// owed.
+    ///
+    /// The daemon loop used to run a hand-copied subset of `editor_tick`
+    /// (async messages, pending file opens, the mouse hover timer), so every
+    /// check the subset missed simply never ran in a daemon session: plugin
+    /// `setTimeout` / `setInterval` never fired, and — worse —
+    /// `auto_recovery_save_dirty_buffers` never ran, so a daemon wrote
+    /// `session.lock` at startup and then not one recovery chunk, losing every
+    /// unsaved buffer on a crash (issue #3440). Calling the shared function
+    /// means a check added for the direct loop cannot go missing here again.
+    ///
+    /// The only part that can't be shared is the full-redraw request: the
+    /// daemon's own `Terminal` draws into a capture buffer, with no tty of its
+    /// own to clear, so rather than clearing one it marks every attached client
+    /// with the same `needs_full_render` a freshly connected client gets, and
+    /// `render_and_broadcast` resets style state and clears on their behalf.
+    fn run_editor_tick(&mut self) -> bool {
+        let mut needs_render = false;
+        let mut full_redraw_requested = false;
+
+        if let Some(ref mut editor) = self.editor {
+            match crate::app::editor_tick(editor, || {
+                full_redraw_requested = true;
+                Ok(())
+            }) {
+                Ok(owes_frame) => needs_render = owes_frame,
+                // Can't currently happen — the only `?` inside `editor_tick`
+                // is the callback above, which never fails — but a tick hiccup
+                // must not tear down a daemon with clients attached, so log it
+                // and carry on rather than propagating, the way the web loop
+                // does.
+                Err(e) => tracing::warn!("editor_tick error: {e}"),
+            }
+        }
+
+        if full_redraw_requested {
+            for client in &mut self.clients {
+                client.needs_full_render = true;
+            }
+            needs_render = true;
+        }
+
+        needs_render
+    }
+
     /// Render the editor and broadcast output to all clients
     fn render_and_broadcast(&mut self) -> io::Result<()> {
+        // The pointer is drawn for a GPM console while it is the terminal in
+        // use — as the in-process editor does on a console. Set every frame,
+        // since it is a property of the active window and windows switch.
+        let gpm_pointer = self.sizing_client().is_some_and(|c| c.gpm_pointer);
+        // And in the colors that terminal can show, detected from the
+        // environment its client sent, as an in-process editor detects its
+        // own. Assuming truecolor everywhere turned a Linux console's
+        // backgrounds black — the console keeps only each channel's top bit —
+        // so selections, and anything else told apart by background, vanished.
+        let colors = self.sizing_client().map(|c| {
+            crate::view::color_support::ColorCapability::detect_from(|name| {
+                c.env.get(name).cloned().flatten()
+            })
+        });
+        let linux_console = self
+            .sizing_client()
+            .is_some_and(|c| c.term() == Some("linux"));
         let Some(ref mut editor) = self.editor else {
             return Ok(());
         };
+        editor.set_gpm_active(gpm_pointer);
+        editor.set_linux_console(linux_console);
+        if let Some(colors) = colors {
+            editor.set_color_capability(colors);
+        }
 
         let Some(ref mut terminal) = self.terminal else {
             return Ok(());
@@ -1492,6 +1582,26 @@ impl EditorServer {
         terminal
             .draw(|frame| editor.render(frame))
             .map_err(|e| io::Error::other(e.to_string()))?;
+
+        // A client owed a full render (just attached, or resumed) missed the
+        // change that set the current title.
+        let changed_title = editor.take_pending_window_title();
+        let title_for = |needs_full: bool| -> Option<&str> {
+            changed_title
+                .as_deref()
+                .or_else(|| needs_full.then(|| editor.current_window_title()).flatten())
+        };
+        for client in &mut self.clients {
+            if let Some(title) = title_for(client.needs_full_render) {
+                let msg = serde_json::to_string(&ServerControl::SetTitle {
+                    title: title.to_string(),
+                })
+                .unwrap_or_default();
+                // Best-effort: client may already be disconnected
+                #[allow(clippy::let_underscore_must_use)]
+                let _ = client.conn.write_control(&msg);
+            }
+        }
 
         // Get the captured output
         let output = terminal.backend_mut().take_buffer();
@@ -1547,9 +1657,22 @@ impl EditorServer {
     }
 }
 
+/// Whether an input event means its terminal is the one in use, and so takes
+/// over sizing the session (see `EditorServer::sizing_client`).
+///
+/// Everything but bare pointer motion and losing focus: a pointer passing
+/// over a window you are not using reports motion too, and two windows side
+/// by side would otherwise trade the session's size back and forth under it.
+fn claims_session_size(event: &Event) -> bool {
+    match event {
+        Event::FocusLost => false,
+        Event::Mouse(m) => !matches!(m.kind, crossterm::event::MouseEventKind::Moved),
+        _ => true,
+    }
+}
+
 impl ConnectedClient {
     /// Get the client's TERM environment variable
-    #[allow(dead_code)]
     pub fn term(&self) -> Option<&str> {
         self.env.get("TERM").and_then(|v| v.as_deref())
     }
@@ -1599,13 +1722,18 @@ mod wave_dismiss_tests {
 
     /// Build a server with an initialized editor, ready to receive input.
     fn server_with_editor(prefix: &str) -> EditorServer {
+        server_with_editor_config(prefix, Config::default())
+    }
+
+    /// Same, with a caller-supplied editor config.
+    pub(super) fn server_with_editor_config(prefix: &str, editor_config: Config) -> EditorServer {
         let temp_dir = std::env::temp_dir().join(unique_session_name(prefix));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let config = EditorServerConfig {
             working_dir: temp_dir.clone(),
             session_name: Some(unique_session_name(prefix)),
             idle_timeout: Some(Duration::from_secs(30)),
-            editor_config: Config::default(),
+            editor_config,
             dir_context: DirectoryContext::for_testing(&temp_dir),
             plugins_enabled: false,
             init_enabled: false,
@@ -1658,12 +1786,15 @@ mod wave_dismiss_tests {
             full_width: true,
             completions: Vec::new(),
             completions_visible_rows: 0,
+            min_rows: 0,
+            max_rows: 0,
             block_caret: false,
             sel_start: -1,
             sel_end: -1,
             label_width: 0,
             read_only: false,
             markdown: false,
+            combo: false,
             key: Some("field".to_string()),
         };
         editor.widget_registry.mount(
@@ -1784,6 +1915,109 @@ mod wave_dismiss_tests {
                 .expect("editor present")
                 .wave_animation_active(),
             "the wave must be dismissable by mouse activity in daemon mode (issue #2530)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod editor_tick_tests {
+    //! Regression tests for issue #3440: a daemon (server) session must run the
+    //! same shared per-iteration housekeeping a directly-launched one does.
+    //! The bug was that the daemon loop ran a hand-copied subset of
+    //! `app::editor_tick` — async messages, pending file opens, the mouse hover
+    //! timer — so every other check in it never ran in a daemon session. Plugin
+    //! `setTimeout` / `setInterval` never fired, and
+    //! `auto_recovery_save_dirty_buffers` never ran at all: the daemon wrote
+    //! `session.lock` at startup and then not one recovery chunk, so a `kill
+    //! -9` lost every unsaved buffer.
+    //!
+    //! These tests call `run_editor_tick` directly, so they cover what it does,
+    //! not that the loop calls it — that wiring is what
+    //! `daemon_loop_runs_editor_tick_so_a_dirty_buffer_gets_a_recovery_chunk`
+    //! in `server/tests.rs` pins, by driving `run()` itself over real IPC.
+
+    use super::wave_dismiss_tests::server_with_editor_config;
+    use crate::config::Config;
+    use crate::server::test_support::recovery_chunk_files;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use fresh_input_parser::Event;
+
+    /// Typing into an unsaved buffer in daemon mode must leave a recovery chunk
+    /// on disk, exactly as it does in a directly-launched session. Before the
+    /// fix the daemon never called `auto_recovery_save_dirty_buffers`, so the
+    /// buffer existed only in the daemon's memory and a crash took it with it
+    /// (issue #3440).
+    #[test]
+    fn recovery_save_runs_for_a_dirty_buffer_in_daemon_mode() {
+        // The interval is a rate limit on a check that runs every tick; zero
+        // means the first tick after the edit is allowed to write, so the test
+        // doesn't have to wait out the 2s default.
+        let mut editor_config = Config::default();
+        editor_config.editor.auto_recovery_save_interval_secs = 0;
+
+        let mut server = server_with_editor_config("recovery-tick", editor_config);
+        let recovery_dir = server.config.dir_context.recovery_dir();
+
+        // Type into the unnamed startup buffer — the `[No Name]*` case from the
+        // report — through the daemon's real input path.
+        for ch in "abc".chars() {
+            server
+                .handle_event(Event::key(KeyEvent::new(
+                    KeyCode::Char(ch),
+                    KeyModifiers::empty(),
+                )))
+                .expect("handle_event");
+        }
+        assert!(
+            server
+                .editor()
+                .expect("editor present")
+                .active_state()
+                .buffer
+                .is_modified(),
+            "precondition: typing must leave the buffer dirty"
+        );
+        assert!(
+            recovery_chunk_files(&recovery_dir).is_empty(),
+            "precondition: nothing is saved before the first tick"
+        );
+
+        // One iteration of the daemon loop's shared housekeeping.
+        server.run_editor_tick();
+
+        assert!(
+            !recovery_chunk_files(&recovery_dir).is_empty(),
+            "the daemon loop must run the shared editor_tick, so an unsaved \
+             buffer gets a recovery chunk (issue #3440); recovery dir {:?} \
+             holds no *.chunk.* file",
+            recovery_dir
+        );
+    }
+
+    /// A full-redraw request has to be picked up and turned into client state,
+    /// since the daemon has no tty of its own to clear. Before the fix nothing
+    /// in the daemon ever called `take_full_redraw_request`, so a plugin- or
+    /// theme-driven request was a silent no-op there.
+    ///
+    /// Consuming the flag is what this asserts; the `needs_full_render` fan-out
+    /// it feeds would need connected clients, which no test here has. With none
+    /// attached the request is correctly dropped once consumed.
+    #[test]
+    fn full_redraw_request_from_the_tick_is_absorbed_in_daemon_mode() {
+        let mut server = server_with_editor_config("redraw-tick", Config::default());
+        server
+            .editor_mut()
+            .expect("editor present")
+            .request_full_redraw();
+
+        server.run_editor_tick();
+
+        assert!(
+            !server
+                .editor_mut()
+                .expect("editor present")
+                .take_full_redraw_request(),
+            "the tick must have consumed the full-redraw request"
         );
     }
 }

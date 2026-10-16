@@ -1,17 +1,20 @@
 use crate::api::OverlayColorSpec;
+use crate::TS;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use ts_rs::TS;
 
-/// Decoration metadata for a file explorer entry.
+/// Decoration metadata for a file explorer entry, provided by a plugin
+/// through `setFileExplorerDecorations`.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct FileExplorerDecoration {
-    /// File path to decorate
+    /// File path to decorate: absolute, or relative to the file explorer's
+    /// root. Paths outside the root are ignored.
     #[ts(type = "string")]
     pub path: PathBuf,
-    /// Symbol to display (e.g., "●", "M", "A")
+    /// Symbol to display (e.g., "●", "M", "A"). Only its first character is
+    /// shown, so use a single character.
     pub symbol: String,
     /// Color as RGB array or theme key string (e.g., "ui.file_status_added_fg")
     pub color: OverlayColorSpec,
@@ -65,7 +68,7 @@ pub struct FileExplorerTrailingSlot {
 
 /// Additive slot override for a file explorer entry.
 ///
-/// Any field left as `None` falls back to the editor's compatibility providers,
+/// Any field left `null` falls back to the editor's compatibility providers,
 /// so plugins can override just the piece they care about.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -98,9 +101,9 @@ pub struct FileExplorerSlotEntry {
 }
 
 #[cfg(feature = "plugins")]
-impl<'js> rquickjs::FromJs<'js> for FileExplorerDecoration {
-    fn from_js(_ctx: &rquickjs::Ctx<'js>, value: rquickjs::Value<'js>) -> rquickjs::Result<Self> {
-        rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
+impl<'js> fresh_js::FromJs<'js> for FileExplorerDecoration {
+    fn from_js(_ctx: &fresh_js::Ctx<'js>, value: fresh_js::Value<'js>) -> fresh_js::Result<Self> {
+        fresh_js::serde::from_value(value).map_err(|e| fresh_js::Error::FromJs {
             from: "object",
             to: "FileExplorerDecoration",
             message: Some(e.to_string()),
@@ -109,9 +112,9 @@ impl<'js> rquickjs::FromJs<'js> for FileExplorerDecoration {
 }
 
 #[cfg(feature = "plugins")]
-impl<'js> rquickjs::FromJs<'js> for FileExplorerSlotEntry {
-    fn from_js(_ctx: &rquickjs::Ctx<'js>, value: rquickjs::Value<'js>) -> rquickjs::Result<Self> {
-        rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
+impl<'js> fresh_js::FromJs<'js> for FileExplorerSlotEntry {
+    fn from_js(_ctx: &fresh_js::Ctx<'js>, value: fresh_js::Value<'js>) -> fresh_js::Result<Self> {
+        fresh_js::serde::from_value(value).map_err(|e| fresh_js::Error::FromJs {
             from: "object",
             to: "FileExplorerSlotEntry",
             message: Some(e.to_string()),
@@ -122,7 +125,7 @@ impl<'js> rquickjs::FromJs<'js> for FileExplorerSlotEntry {
 #[cfg(all(test, feature = "plugins"))]
 mod tests {
     use super::*;
-    use rquickjs::{Context, FromJs, Runtime, Value};
+    use fresh_js::{Context, FromJs, Runtime, Value};
 
     /// `FileExplorerDecoration::from_js` reads every decoration field, not
     /// just returning a defaulted stub. Uses non-zero priority and a theme

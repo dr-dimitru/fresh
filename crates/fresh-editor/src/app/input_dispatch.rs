@@ -254,12 +254,12 @@ impl Editor {
             }
             DeferredAction::FileBrowserPageUp => {
                 if let Some(state) = &mut self.active_window_mut().file_open_state {
-                    state.page_up(10);
+                    state.page_up();
                 }
             }
             DeferredAction::FileBrowserPageDown => {
                 if let Some(state) = &mut self.active_window_mut().file_open_state {
-                    state.page_down(10);
+                    state.page_down();
                 }
             }
             DeferredAction::FileBrowserConfirm => {
@@ -294,8 +294,14 @@ impl Editor {
                 self.handle_interactive_replace_key(c)?;
             }
             DeferredAction::CancelInteractiveReplace => {
-                self.cancel_prompt();
-                self.active_window_mut().interactive_replace_state = None;
+                // End the session exactly as `c`/`q` do, which also clears
+                // the search highlights and the current-match mark.
+                let replacements_made = self
+                    .active_window()
+                    .interactive_replace_state
+                    .as_ref()
+                    .map_or(0, |s| s.replacements_made);
+                self.finish_interactive_replace(replacements_made);
             }
 
             // Terminal mode actions
@@ -433,6 +439,7 @@ impl Editor {
     /// the plugin's panel `PROMPT_TOOLBAR_PANEL_ID`, so the events reach it
     /// tagged `panel_id: 0`, and the checked state the events carry is what
     /// the plugin re-emits its spec with.
+    #[cfg(feature = "plugins")]
     pub(crate) fn toggle_overlay_toolbar_widget(&mut self, key: &str) {
         if key.is_empty() {
             return;
@@ -522,6 +529,7 @@ impl Editor {
     /// panel's update does (`resolve_described_panel`). The toolbar never
     /// had a text projection: it is described in the card's header band, so
     /// nothing is rendered into a buffer here.
+    #[cfg(any(feature = "plugins", test))]
     pub(crate) fn mount_prompt_toolbar(
         &mut self,
         key: &crate::widgets::PanelKey,
@@ -601,7 +609,8 @@ impl Editor {
         let spec = self.widget_registry.get(&key)?.spec.clone();
         let (hovered, hovered_item) = self.widget_registry.hover_keys(&key);
         Some(crate::view::shell::panel::Interior {
-            spec: Rc::new(spec),
+            // A handle on the registry's storage, not a copy of it.
+            spec,
             states: Rc::new(
                 self.widget_registry
                     .instance_states(&key)
@@ -614,6 +623,7 @@ impl Editor {
                     .map(|p| p.h_pan.clone())
                     .unwrap_or_default(),
             ),
+            projections: self.projections_for(&key),
             focus_key: self
                 .widget_registry
                 .focus_key(&key)

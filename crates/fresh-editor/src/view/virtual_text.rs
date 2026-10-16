@@ -153,6 +153,16 @@ pub struct VirtualText {
     /// Offsets are byte offsets within `text`. Used e.g. by live-diff
     /// to bold + underline removed words on deletion virtual lines.
     pub text_overlays: Vec<fresh_core::api::VirtualLineTextOverlay>,
+    /// Draw only in a pane showing the buffer in compose view.
+    ///
+    /// Decorations live on the buffer, but compose view is a property of a
+    /// pane, so a plugin composing one pane (markdown_compose's table
+    /// borders, code-block rails) would otherwise draw that frame around
+    /// the raw source in a sibling pane. Every render pass filters on this
+    /// one flag, so the passes cannot disagree about which rows exist: a
+    /// line suppressed in the token stream but not in the wrap index makes
+    /// the index describe rows the renderer never draws.
+    pub compose_only: bool,
 }
 
 impl VirtualText {
@@ -164,14 +174,19 @@ impl VirtualText {
     /// always survive.
     pub fn resolved_style(&self, theme: &crate::view::theme::Theme) -> Style {
         let mut style = self.style;
+        // A key brings its text attributes along with its color.
         if let Some(ref key) = self.fg_theme_key {
             if let Some(color) = theme.resolve_theme_key(key) {
-                style = style.fg(color);
+                style = style
+                    .fg(color)
+                    .add_modifier(theme.resolve_modifier_key(key));
             }
         }
         if let Some(ref key) = self.bg_theme_key {
             if let Some(color) = theme.resolve_theme_key(key) {
-                style = style.bg(color);
+                style = style
+                    .bg(color)
+                    .add_modifier(theme.resolve_modifier_key(key));
             }
         }
         style
@@ -274,6 +289,7 @@ impl VirtualTextManager {
                 gutter_glyph: None,
                 gutter_color: None,
                 text_overlays: Vec::new(),
+                compose_only: false,
             },
         );
         self.bump_version();
@@ -336,6 +352,7 @@ impl VirtualTextManager {
                 gutter_glyph: None,
                 gutter_color: None,
                 text_overlays: Vec::new(),
+                compose_only: false,
             },
         );
         self.bump_version();
@@ -379,6 +396,7 @@ impl VirtualTextManager {
                 gutter_glyph: None,
                 gutter_color: None,
                 text_overlays: Vec::new(),
+                compose_only: false,
             },
         );
         self.bump_version();
@@ -401,6 +419,7 @@ impl VirtualTextManager {
         priority: i32,
         string_id: String,
         pad_to_column: Option<u32>,
+        compose_only: bool,
     ) -> VirtualTextId {
         debug_assert!(
             vtext_position.is_inline(),
@@ -429,6 +448,7 @@ impl VirtualTextManager {
                 gutter_glyph: None,
                 gutter_color: None,
                 text_overlays: Vec::new(),
+                compose_only,
             },
         );
 
@@ -471,6 +491,7 @@ impl VirtualTextManager {
             None,
             None,
             Vec::new(),
+            false,
         )
     }
 
@@ -496,6 +517,7 @@ impl VirtualTextManager {
         gutter_glyph: Option<String>,
         gutter_color: Option<Color>,
         text_overlays: Vec<fresh_core::api::VirtualLineTextOverlay>,
+        compose_only: bool,
     ) -> VirtualTextId {
         debug_assert!(
             placement.is_line(),
@@ -524,6 +546,7 @@ impl VirtualTextManager {
                 gutter_glyph,
                 gutter_color,
                 text_overlays,
+                compose_only,
             },
         );
         self.bump_version();
@@ -915,37 +938,6 @@ impl VirtualTextManager {
         results.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.priority.cmp(&b.1.priority)));
 
         results
-    }
-
-    /// Build a lookup map for virtual LINES, keyed by the line's anchor byte position
-    ///
-    /// For each source line, the renderer can quickly check if there are
-    /// LineAbove or LineBelow virtual texts anchored to positions within that line.
-    pub fn build_lines_lookup(
-        &self,
-        marker_list: &MarkerList,
-        start: usize,
-        end: usize,
-    ) -> HashMap<usize, Vec<&VirtualText>> {
-        let mut lookup: HashMap<usize, Vec<&VirtualText>> = HashMap::new();
-
-        for vtext in self.texts.values() {
-            if !vtext.position.is_line() {
-                continue;
-            }
-            if let Some(pos) = marker_list.get_position(vtext.marker_id) {
-                if pos >= start && pos < end {
-                    lookup.entry(pos).or_default().push(vtext);
-                }
-            }
-        }
-
-        // Sort each position's texts by priority
-        for texts in lookup.values_mut() {
-            texts.sort_by_key(|vt| vt.priority);
-        }
-
-        lookup
     }
 }
 

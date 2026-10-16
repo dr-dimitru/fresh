@@ -71,6 +71,10 @@ pub enum HookArgs {
     /// A buffer was closed
     BufferClosed { buffer_id: BufferId, window_id: u64 },
 
+    /// A buffer group was closed, by its plugin, by the user closing its
+    /// tab, or because a buffer it showed was closed
+    BufferGroupClosed { group_id: u64, window_id: u64 },
+
     /// Before text is inserted
     BeforeInsert {
         buffer_id: BufferId,
@@ -123,6 +127,12 @@ pub enum HookArgs {
         /// Number of lines removed by this deletion
         lines_removed: usize,
     },
+
+    /// A buffer's content changed: after any applied edit, including the
+    /// bulk edits (multi-cursor typing, a whole-buffer replace, and the undo
+    /// or redo of either) that fire no `AfterInsert` / `AfterDelete`. Carries
+    /// no positions; it tells a plugin to re-read the buffer, not what moved.
+    BufferModified { buffer_id: BufferId, window_id: u64 },
 
     /// Cursor moved to a new position
     CursorMoved {
@@ -213,6 +223,16 @@ pub enum HookArgs {
     /// re-configures itself from this handler would otherwise wake
     /// itself (and every other plugin) right back up.
     ConfigChanged {},
+
+    /// The editor-wide input mode changed (`setInputMode`): a modal-editing
+    /// personality such as vi was turned on or off, or moved between its
+    /// sub-modes. For a plugin whose window-scoped mode should step aside
+    /// while one is on (markdown-source), since a window's editor mode
+    /// outranks the input mode.
+    InputModeChanged {
+        /// The new input mode, or `None` when it was cleared.
+        mode: Option<String>,
+    },
 
     /// Rendering is starting for a buffer (called once per buffer before render_line hooks)
     RenderStart { buffer_id: BufferId },
@@ -362,6 +382,22 @@ pub enum HookArgs {
         server_command: String,
         /// The request parameters as a JSON string
         params: Option<String>,
+    },
+
+    /// LSP server notification (server -> client) with a method the editor
+    /// does not handle itself, e.g. `textDocument/clangd.fileStatus` or
+    /// `$/memoryUsage`. Fired as the `lsp/custom_notification` hook.
+    LspCustomNotification {
+        /// The language of the server that sent the notification
+        language: String,
+        /// The name of the server that sent it (disambiguates multiple
+        /// servers configured for one language)
+        server_name: String,
+        /// The JSON-RPC method name
+        method: String,
+        /// The notification parameters as a JSON value (not a string);
+        /// `null` when the server sent none
+        params: Option<serde_json::Value>,
     },
 
     /// Viewport changed (scrolled or resized)
@@ -631,6 +667,12 @@ pub enum HookArgs {
         /// Event-specific JSON payload.
         #[serde(default)]
         payload: serde_json::Value,
+        /// The key of the widget that holds the panel's focus *now*, after
+        /// whatever the event did (`""` when nothing is focused). The
+        /// host's fact — a plugin reads it here instead of mirroring focus
+        /// from `focus` events and guessing at the moves it was not told of.
+        #[serde(default)]
+        focus_key: String,
     },
 }
 
@@ -899,6 +941,33 @@ mod tests {
         .unwrap();
         assert_eq!(json["uri"], "file:///x.rs");
         assert_eq!(json["count"], 7);
+    }
+
+    /// Custom LSP notification params reach plugins as a JSON object (so
+    /// `payload.params.status` works), not as a pre-serialized string like
+    /// `LspServerRequest` uses; absent params become `null`.
+    #[test]
+    fn hook_args_to_json_lsp_custom_notification_params_are_an_object() {
+        let json = hook_args_to_json(&HookArgs::LspCustomNotification {
+            language: "cpp".into(),
+            server_name: "clangd".into(),
+            method: "textDocument/clangd.fileStatus".into(),
+            params: Some(serde_json::json!({"uri": "file:///a.cpp", "status": "ready"})),
+        })
+        .unwrap();
+        assert_eq!(json["language"], "cpp");
+        assert_eq!(json["server_name"], "clangd");
+        assert_eq!(json["method"], "textDocument/clangd.fileStatus");
+        assert_eq!(json["params"]["status"], "ready");
+
+        let json = hook_args_to_json(&HookArgs::LspCustomNotification {
+            language: "cpp".into(),
+            server_name: "clangd".into(),
+            method: "$/memoryUsage".into(),
+            params: None,
+        })
+        .unwrap();
+        assert!(json["params"].is_null());
     }
 
     #[test]

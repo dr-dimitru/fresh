@@ -1729,6 +1729,16 @@ async function loadBundle(packageDir: string, manifest: PackageManifest): Promis
     }
   }
 
+  // Reload themes if bundle contains any (uses same format as theme-packs)
+  if (manifest.fresh?.themes && manifest.fresh.themes.length > 0) {
+    editor.debug(`[pkg] Bundle contains ${manifest.fresh.themes.length} theme(s), reloading themes`);
+    editor.reloadThemes();
+  }
+
+  // Apply grammar changes before loading plugins, so a bundle plugin can
+  // switch already-open buffers to the bundle's languages when it loads.
+  await editor.reloadGrammars();
+
   // Load all plugins from the bundle
   if (manifest.fresh?.plugins) {
     for (const plugin of manifest.fresh.plugins) {
@@ -1751,14 +1761,6 @@ async function loadBundle(packageDir: string, manifest: PackageManifest): Promis
     }
   }
 
-  // Reload themes if bundle contains any (uses same format as theme-packs)
-  if (manifest.fresh?.themes && manifest.fresh.themes.length > 0) {
-    editor.debug(`[pkg] Bundle contains ${manifest.fresh.themes.length} theme(s), reloading themes`);
-    editor.reloadThemes();
-  }
-
-  // Apply grammar changes
-  await editor.reloadGrammars();
   editor.debug(`[pkg] Bundle loaded: ${bundleName}`);
 }
 
@@ -2164,12 +2166,15 @@ const pkgTheme: Record<string, ThemeColor> = {
   statusUpdate: { fg: { rgb: [220, 180, 80] } },
 };
 
-// Define pkg-manager mode with arrow key navigation
+// Define pkg-manager mode with arrow key navigation. ↑/↓ step over the
+// packages, skipping section headers and spacers — stepping the list would
+// land on them — so they are declared dialog-wide shortcuts: they run ahead
+// of the focused list instead of after it.
 editor.defineMode(
   "pkg-manager",
   [
-    ["Up", "pkg_nav_up"],
-    ["Down", "pkg_nav_down"],
+    ["Up", "pkg_nav_up", "shortcut"],
+    ["Down", "pkg_nav_down", "shortcut"],
     ["Return", "pkg_activate"],
     ["Tab", "pkg_next_button"],
     ["S-Tab", "pkg_prev_button"],
@@ -2519,9 +2524,8 @@ function buildPkgHeaderEntries(): TextPropertyEntry[] {
  * navigation skips them implicitly via the index math. */
 interface PkgListRow {
   entry: TextPropertyEntry;
-  /** Stable widget-key for the List item. Empty string for non-
-   * selectable header rows (the List still tracks them in
-   * itemKeys but they don't carry useful identity). */
+  /** The row's List item key: what the row is, unique in the list.
+   * Header and filler rows have fixed keys of their own. */
   key: string;
   /** Index within `getFilteredItems()` if this row is a real
    * package, else -1. The widget's `selectedIndex` is reported
@@ -2558,7 +2562,9 @@ function buildPkgListRows(): PkgListRow[] {
           text: `  ${name.padEnd(nameW)} ${ver.padEnd(7)} ${status}`,
           properties: { type: "package-row", installed: true },
         },
-        key: `pkg.${item.name}`,
+        // Installed packages come from four directories, so a plugin and
+        // a theme can share a name; the type tells them apart.
+        key: `pkg.${item.packageType}.${item.name}`,
         itemIndex: idx,
       });
       idx++;
@@ -2601,7 +2607,9 @@ function buildPkgListRows(): PkgListRow[] {
           text: `  ${name.padEnd(availNameW)} [${typeTag}]`,
           properties: { type: "package-row", installed: false },
         },
-        key: `pkg.${item.name}`,
+        // Registries of different kinds can each offer a name. (Installed
+        // names are not offered again, so no row here repeats one above.)
+        key: `pkg.${item.packageType}.${item.name}`,
         itemIndex: idx,
       });
       idx++;
@@ -3305,6 +3313,7 @@ editor.on("resize", () => {
 const registryFinder = new Finder<[string, RegistryEntry]>(editor, {
   id: "pkg-registry",
   format: ([name, entry]) => ({
+    id: name,
     label: name,
     description: entry.description,
     metadata: { name, entry }
@@ -3454,6 +3463,7 @@ function pkg_update() : void {
   const finder = new Finder<InstalledPackage>(editor, {
     id: "pkg-update",
     format: (pkg) => ({
+      id: `${pkg.type}:${pkg.name}`,
       label: pkg.name,
       description: `${pkg.type} | ${pkg.version}${pkg.localSource ? " (local)" : ""}`,
       metadata: pkg
@@ -3489,6 +3499,7 @@ function pkg_remove() : void {
   const finder = new Finder<InstalledPackage>(editor, {
     id: "pkg-remove",
     format: (pkg) => ({
+      id: `${pkg.type}:${pkg.name}`,
       label: pkg.name,
       description: `${pkg.type} | ${pkg.version}`,
       metadata: pkg
@@ -3570,6 +3581,7 @@ async function pkg_outdated() : Promise<void> {
   const finder = new Finder<{ pkg: InstalledPackage; behind: number }>(editor, {
     id: "pkg-outdated",
     format: (item) => ({
+      id: `${item.pkg.type}:${item.pkg.name}`,
       label: item.pkg.name,
       description: `${item.behind} commits behind`,
       metadata: item

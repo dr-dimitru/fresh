@@ -94,7 +94,9 @@ Or, pick your preferred method:
 | OpenSUSE | [.rpm](#opensuse-rpm) |
 | FreeBSD | [ports / pkg](https://www.freshports.org/editors/fresh) |
 | Gentoo | [GURU](#gentoo-guru) |
+| Solus | [eopkg](#solus-eopkg) |
 | Linux (sandboxed / portable) | [AppImage](#appimage), [Flatpak](#flatpak) |
+| Desktop app (Windows, macOS, Linux) | [Fresh Desktop](#fresh-desktop) |
 | All platforms | [Pre-built binaries](#pre-built-binaries) |
 | npm | [npm / npx](#npm) |
 | Rust users (Fast) | [cargo-binstall](#using-cargo-binstall) |
@@ -220,6 +222,15 @@ Enable the repository as read in [Project:GURU/Information for End Users](https:
 emerge --ask app-editors/fresh
 ```
 
+### Solus (eopkg)
+
+Fresh is the official repository. Run eopkg to install:
+
+
+```bash
+sudo eopkg it fresh
+```
+
 ### AppImage
 
 > On most systems the [universal build](#universal-build-linux) is the better
@@ -255,6 +266,35 @@ flatpak run io.github.sinelaw.fresh
 ```
 
 See [flatpak/README.md](flatpak/README.md) for building from source.
+
+### Fresh Desktop
+
+A standalone desktop application: Fresh in its own window, with the editor
+bundled inside, so there is nothing else to install and no browser or terminal
+to open. Download it from the [releases page](https://github.com/sinelaw/fresh/releases):
+
+| Platform | File |
+|----------|------|
+| Windows (x64) | `fresh-desktop-VERSION-windows-x64-setup.exe` |
+| macOS (Intel and Apple Silicon) | `fresh-desktop-VERSION-macos-universal.dmg` |
+| Linux (x86_64) | `fresh-desktop-VERSION-linux-x86_64.AppImage` |
+
+It opens your home directory, or the folder or files you open it with, and
+remembers each project's session like the terminal edition does. The builds
+are not signed with a developer certificate yet. On macOS, the first launch is
+refused; allow it under **System Settings → Privacy & Security → Open Anyway**
+(or run `xattr -dr com.apple.quarantine "/Applications/Fresh Desktop.app"`).
+On Windows, choose **More info → Run anyway** in the SmartScreen prompt.
+Update by installing a newer release.
+To build it from source instead (needs Rust and Node.js), run this from a
+checkout. It builds this platform's package (an AppImage on Linux, a `.dmg` on
+macOS, an installer on Windows) into `desktop/dist/`:
+
+```bash
+node desktop/scripts/package.js
+```
+
+See [desktop/README.md](desktop/README.md) for details.
 
 ### Pre-built binaries
 

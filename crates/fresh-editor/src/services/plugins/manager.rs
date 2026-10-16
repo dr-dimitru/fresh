@@ -183,22 +183,6 @@ impl PluginManager {
         }
     }
 
-    /// Load plugins from a directory.
-    pub fn load_plugins_from_dir(&self, dir: &Path) -> Vec<String> {
-        #[cfg(feature = "plugins")]
-        {
-            if let Some(ref manager) = self.inner {
-                return manager.load_plugins_from_dir(dir);
-            }
-            Vec::new()
-        }
-        #[cfg(not(feature = "plugins"))]
-        {
-            let _ = dir;
-            Vec::new()
-        }
-    }
-
     /// Load plugins from a directory with config support.
     /// Returns (errors, discovered_plugins) where discovered_plugins is a map of
     /// plugin name -> PluginConfig with paths populated.
@@ -330,6 +314,7 @@ impl PluginManager {
         // front of the returned batch — matching the order the real
         // plugin thread would have produced if the inject call were a
         // genuine plugin response.
+        #[cfg_attr(not(feature = "plugins"), allow(unused_mut))]
         let mut commands = std::mem::take(&mut self.pending_injected_commands);
         #[cfg(feature = "plugins")]
         {
@@ -338,32 +323,6 @@ impl PluginManager {
             }
         }
         commands
-    }
-
-    /// Process commands, blocking until `HookCompleted` for the given hook arrives.
-    /// See [`PluginThreadHandle::process_commands_until_hook_completed`] for details.
-    ///
-    // TODO: This method is currently unused (dead code). Either wire it into the
-    // render path to synchronously wait for plugin responses (e.g. conceals from
-    // lines_changed), or remove it along with PluginThreadHandle's implementation
-    // and the HookCompleted sentinel if the non-blocking drain approach is sufficient.
-    pub fn process_commands_until_hook_completed(
-        &mut self,
-        hook_name: &str,
-        timeout: std::time::Duration,
-    ) -> Vec<super::api::PluginCommand> {
-        #[cfg(feature = "plugins")]
-        {
-            if let Some(ref mut manager) = self.inner {
-                return manager.process_commands_until_hook_completed(hook_name, timeout);
-            }
-            Vec::new()
-        }
-        #[cfg(not(feature = "plugins"))]
-        {
-            let _ = (hook_name, timeout);
-            Vec::new()
-        }
     }
 
     /// Get the state snapshot handle for updating editor state.
@@ -419,6 +378,13 @@ impl PluginManager {
         self.inner
             .as_ref()
             .map(|m| m.mode_text_input_async(mode, text))
+    }
+
+    /// See `PluginRequest::SyncRuntime`. Non-blocking: the caller must keep
+    /// servicing the plugin command channel while it waits.
+    #[cfg(feature = "plugins")]
+    pub fn sync_runtime(&self) -> Option<fresh_plugin_runtime::thread::oneshot::Receiver<()>> {
+        self.inner.as_ref().and_then(|m| m.sync_runtime())
     }
 
     /// List all loaded plugins.

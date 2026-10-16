@@ -60,6 +60,10 @@ Rows past the end of the buffer keep the theme's editor background, so the empty
 
 Enable `auto_save_enabled` in settings to automatically save modified buffers to disk at a configurable interval (default 30 seconds). This is separate from the crash-recovery auto-save, which runs independently every 2 seconds to a recovery directory.
 
+## Interrupted Saves
+
+A file that can't be replaced by a new one without losing something (it belongs to another user, has other hard links, or carries attributes that can't be copied) is overwritten in place. Before truncating it, Fresh keeps a complete copy of the new content in its recovery directory. If the write fails part-way, or Fresh dies during it, the file may be left damaged; the next session then opens an **Interrupted Save** dialog for it: **Restore** writes the kept copy into the file (and reloads any open buffer of it that has no unsaved changes), **Show Diff** closes the dialog and opens the file on disk beside the kept copy (keeping the copy, so the diff can be read at leisure), **Discard** deletes the copy, and **Later** keeps it and shows where it is. A copy that is still waiting is asked about again at the next start, or any time with **Review Interrupted Saves** from the command palette, including one kept by a save earlier in the same session. While such a copy is kept, or after a save of it failed part-way in this session, a large file (opened without loading it whole) can't be saved again, not even under another name, since its unchanged parts would be read back from the damaged file.
+
 ## Code Folding
 
 Fold and unfold code blocks via gutter indicators or "Toggle Fold" from the command palette. Up/Down navigation skips folded regions. Each split view maintains its own fold state. Folding works in two modes:
@@ -90,6 +94,8 @@ Diagnostic messages can be displayed at the end of each line, right-aligned, wit
 ## Line Wrap
 
 When line wrap is enabled (`line_wrap` in settings), wrapped continuation lines preserve the indentation of their parent line (hanging indent).
+
+Lines wrap at the window edge, or at `wrap_column` when it is set and the window is wider. `wrap_column` counts text columns, not the line-number gutter: `"wrap_column": 80` fits 80 characters on a row with or without line numbers. It can be set per language, e.g. to wrap Markdown at 80 while code wraps at the window edge.
 
 **Per-buffer overrides** — **Toggle Line Wrap (Current Buffer)** and **Toggle Line Numbers (Current Buffer)** flip these for the active buffer only, leaving the global default and other buffers untouched. The override persists across restarts; the editor-wide **Toggle Line Wrap** / **Toggle Line Numbers** commands still change the default for everything else and save it to your config. See [Per-Buffer Overrides](../configuration/index.md#per-buffer-overrides) for the naming convention every settings toggle follows.
 
@@ -257,6 +263,16 @@ Smart editing for Markdown files (provided by the built-in `markdown_source` plu
 
 "Markdown: Toggle Compose" from the command palette enables a distraction-free mode that conceals markup (`**`, `*`, `[]()`), applies soft line breaks at a configurable width, and renders tables. Use "Markdown: Set Compose Width" to adjust the width. Open the same file in a vertical split to see source and composed views side by side.
 
+Three commands switch the pane in focus between views of a Markdown file:
+
+| Command | View |
+|---------|------|
+| Markdown: Source Mode | The raw Markdown |
+| Markdown: Rendered Mode | The composed document |
+| Markdown: Source/Compose Dual Mode | The source and the composed document side by side, in a tab of their own; the two scroll together |
+
+"Markdown: Cycle View Mode" steps through Source, Rendered and dual mode, and "Markdown: Toggle Source/Compose Dual Mode" switches dual mode on and off. The dual-mode tab sits next to the file's own tab, and you can edit the file in its source side. Leaving dual mode, or closing its tab, closes only that tab: the file stays open as it was, and other panes you have open on it are left alone.
+
 Compose mode reads the document the way markdown defines it, so a paragraph, list item or quote written across several source lines is re-flowed into one block at the page width — a hard-wrapped file reads as prose rather than as its source layout. The things markdown treats as their own block still are: a blank line, a heading, a thematic break, a table row, a fenced code block, a new list marker, and a hard break (two trailing spaces or a trailing backslash).
 
 ### Contents Panel
@@ -269,7 +285,7 @@ The `markdown_toc` plugin adds a **Contents** section to the sidebar, under the 
 
 The panel works the same way in source and compose mode: compose conceals the markers and re-flows the text but does not move it, so the rows, the highlight and the jump target are identical in both.
 
-Settings live under *Plugin Settings → markdown_toc* (`plugins.markdown_toc.settings` in `config.json`):
+Settings live under *Plugins → markdown_toc* (`plugins.markdown_toc.settings` in `config.json`):
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
