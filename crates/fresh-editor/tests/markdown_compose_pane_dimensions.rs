@@ -507,3 +507,174 @@ fn two_compose_panes_replay_seen_scroll_without_new_batches() {
         "replaying seen content must not re-offer either pane"
     );
 }
+
+const FOLD_DOCUMENT: &str = "# Folding\n\nOpening paragraph with **emphasis** for the cursor.\n\n- Parent item with **bold** words\n  - Child alpha\n  - Child beta\n  - Child gamma\n- Sibling item\n\n```rust\nlet folded = \"frame\";\n```\n\nClosing paragraph with **strong** markup.\n\nFinal sentinel.\n";
+
+/// Column of the vertical split's separator, read from the tab-bar row, which
+/// holds no buffer text that could contain a frame rail.
+fn separator_col(screen: &str) -> usize {
+    screen
+        .lines()
+        .nth(1)
+        .unwrap()
+        .chars()
+        .position(|c| c == '│')
+        .unwrap()
+}
+
+/// Text of one side of a vertical split, row by row, so a pane's rows can be
+/// compared without the sibling's text leaking into the assertion.
+fn pane_rows(screen: &str, left: bool) -> Vec<String> {
+    let sep = separator_col(screen);
+    screen
+        .lines()
+        .map(|row| {
+            if left {
+                row.chars().take(sep).collect()
+            } else {
+                row.chars().skip(sep + 1).collect()
+            }
+        })
+        .collect()
+}
+
+fn row_of(rows: &[String], needle: &str) -> Option<usize> {
+    rows.iter().position(|row| row.contains(needle))
+}
+
+#[test]
+fn folded_compose_pane_keeps_its_own_layout_cursor_and_scroll() {
+    let md = format!(
+        "{FOLD_DOCUMENT}\n{}",
+        (1..=30)
+            .map(|n| format!("Tail paragraph {n:02} with **markup**.\n\n"))
+            .collect::<String>()
+    );
+    let (mut h, _tmp) = compose_harness(&md, Config::default(), 140, 30);
+    command(&mut h, "Toggle Compose");
+    settle_frame(&mut h);
+    command(&mut h, "Split Vertical");
+    command(&mut h, "Toggle Compose");
+    settle_frame(&mut h);
+
+    // Fold the nested list in the left pane only, from its parent item.
+    let rows = pane_rows(&h.screen_to_string(), true);
+    let parent = row_of(&rows, "Parent item").unwrap();
+    h.mouse_click(10, parent as u16).unwrap();
+    command(&mut h, "Toggle Fold");
+    h.wait_until_stable(|h| {
+        !pane_rows(&h.screen_to_string(), true)
+            .iter()
+            .any(|r| r.contains("Child beta"))
+    })
+    .unwrap();
+    h.wait_for_async_quiescence(4).unwrap();
+    let screen = h.screen_to_string();
+    let (left, right) = (pane_rows(&screen, true), pane_rows(&screen, false));
+    for child in ["Child alpha", "Child beta", "Child gamma"] {
+        assert!(
+            row_of(&left, child).is_none(),
+            "left pane folds {child}:\n{screen}"
+        );
+        assert!(
+            row_of(&right, child).is_some(),
+            "right pane keeps {child}:\n{screen}"
+        );
+    }
+    assert!(
+        left[parent].contains("- Parent item"),
+        "the left cursor reveals its own list marker:\n{screen}"
+    );
+    assert!(
+        right[parent].contains("• Parent item"),
+        "the right pane keeps the composed marker it had:\n{screen}"
+    );
+    assert!(
+        row_of(&right, "# Folding").is_some() && row_of(&left, "# Folding").is_none(),
+        "each pane reveals markup only on its own cursor line:\n{screen}"
+    );
+    let left_frame = row_of(&left, "┌").unwrap();
+    let right_frame = row_of(&right, "┌").unwrap();
+    assert_eq!(
+        right_frame - left_frame,
+        6,
+        "the fold moves only the left pane's frame up by the three hidden items:\n{screen}"
+    );
+    for rows in [&left, &right] {
+        let top = row_of(rows, "┌").unwrap();
+        assert!(
+            rows[top].contains('┐') && rows[top + 2].contains('┘'),
+            "frames stay closed:\n{screen}"
+        );
+    }
+
+    // Down from the folded parent skips the hidden children in this pane.
+    h.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    h.wait_for_async_quiescence(4).unwrap();
+    let cursor = h.render_observing_cursor().unwrap().expect("left caret");
+    let left = pane_rows(&h.screen_to_string(), true);
+    assert!(
+        left[cursor.1 as usize].contains("- Sibling item"),
+        "the caret lands on the sibling after the fold:\n{}",
+        h.screen_to_string()
+    );
+
+    // Scroll the unfolded right pane; the folded left pane must not move.
+    let right_x = 80;
+    for _ in 0..4 {
+        h.mouse_scroll_down(right_x, 10).unwrap();
+    }
+    h.wait_until_stable(|h| {
+        !pane_rows(&h.screen_to_string(), false)
+            .iter()
+            .any(|r| r.contains("Opening paragraph"))
+    })
+    .unwrap();
+    h.wait_for_async_quiescence(4).unwrap();
+    let screen = h.screen_to_string();
+    let (left, right) = (pane_rows(&screen, true), pane_rows(&screen, false));
+    assert!(
+        row_of(&left, "Opening paragraph").is_some(),
+        "left pane keeps its scroll:\n{screen}"
+    );
+    assert!(
+        row_of(&left, "Child beta").is_none(),
+        "left fold survives sibling scroll:\n{screen}"
+    );
+
+    // Click into the scrolled right pane and type where the click landed.
+    let pane_left = separator_col(&screen) + 1;
+    let target = row_of(&right, "Tail paragraph 03").expect("scrolled pane shows the tail");
+    let byte = right[target].find("paragraph").unwrap();
+    let col = right[target][..byte].chars().count();
+    h.mouse_click((pane_left + col) as u16, target as u16)
+        .unwrap();
+    h.wait_for_async_quiescence(4).unwrap();
+    h.type_text("X").unwrap();
+    h.wait_until_stable(|h| h.screen_to_string().contains("Tail Xparagraph 03"))
+        .unwrap();
+    h.wait_for_async_quiescence(4).unwrap();
+    let cursor = h.render_observing_cursor().unwrap().expect("right caret");
+    let screen = h.screen_to_string();
+    let right = pane_rows(&screen, false);
+    let row = &right[cursor.1 as usize];
+    assert!(
+        row.contains("Tail Xparagraph 03"),
+        "caret stays on the edited row:\n{screen}"
+    );
+    let typed = row[..row.find("paragraph 03").unwrap()].chars().count();
+    assert_eq!(
+        cursor.0 as usize,
+        pane_left + typed,
+        "caret sits just after the typed character:\n{screen}"
+    );
+    let left = pane_rows(&screen, true);
+    assert!(
+        row_of(&left, "Child beta").is_none(),
+        "left fold survives an edit in the sibling:\n{screen}"
+    );
+    assert!(
+        row_of(&left, "Opening paragraph").is_some(),
+        "left scroll survives an edit in the sibling:\n{screen}"
+    );
+}
