@@ -678,3 +678,90 @@ fn folded_compose_pane_keeps_its_own_layout_cursor_and_scroll() {
         "left scroll survives an edit in the sibling:\n{screen}"
     );
 }
+
+/// Width of the first table frame drawn in one pane, corner to corner.
+fn first_table_width(rows: &[String]) -> Option<usize> {
+    let top = rows.iter().find(|row| row.contains('┬'))?;
+    let left = top.chars().position(|c| c == '┌')?;
+    let right = top.chars().position(|c| c == '┐')?;
+    Some(right - left)
+}
+
+#[test]
+fn table_width_growth_in_one_pane_reaches_the_sibling() {
+    // Tall enough that the first bounded batch misses the wide row, so the
+    // shared width memo grows while only one pane is scrolled to it.
+    let mut md = String::from("# Table\n\n| Key | Value |\n| --- | --- |\n");
+    for n in 1..=400 {
+        if n == 300 {
+            md.push_str("| a-much-longer-key-cell | v |\n");
+        } else {
+            md.push_str(&format!("| r{n:04} | v |\n"));
+        }
+    }
+    md.push_str("\nFinal sentinel.\n");
+    let (mut h, _tmp) = compose_harness(&md, Config::default(), 140, 16);
+    command(&mut h, "Toggle Compose");
+    settle_frame(&mut h);
+    command(&mut h, "Split Vertical");
+    command(&mut h, "Toggle Compose");
+    settle_frame(&mut h);
+    let narrow = first_table_width(&pane_rows(&h.screen_to_string(), true)).unwrap();
+
+    // Scroll the left pane continuously down to the wide row, then back up.
+    let left_shows = |h: &EditorTestHarness, text: &str| {
+        row_of(&pane_rows(&h.screen_to_string(), true), text).is_some()
+    };
+    h.mouse_click(20, 8).unwrap();
+    while !left_shows(&h, "a-much-longer-key-cell") {
+        h.send_key(KeyCode::PageDown, KeyModifiers::NONE).unwrap();
+        h.wait_for_async_quiescence(4).unwrap();
+    }
+    h.send_key(KeyCode::Home, KeyModifiers::CONTROL).unwrap();
+    h.wait_until_stable(|h| left_shows(h, "# Table")).unwrap();
+    h.wait_for_async_quiescence(4).unwrap();
+    let screen = h.screen_to_string();
+    let left = first_table_width(&pane_rows(&screen, true)).unwrap();
+    let right = first_table_width(&pane_rows(&screen, false)).unwrap();
+    assert!(left > narrow, "the wide row widens the table:\n{screen}");
+    assert_eq!(
+        right, left,
+        "the sibling showing the same table adopts the widened columns:\n{screen}"
+    );
+}
+
+#[test]
+fn reopened_fence_restyles_every_compose_pane() {
+    let md = "# Fence\n\n```rust\nlet a = 1;\n```\n\nParagraph below the fence.\n\nFinal sentinel.\n";
+    let (mut h, _tmp) = compose_harness(md, Config::default(), 140, 24);
+    command(&mut h, "Toggle Compose");
+    settle_frame(&mut h);
+    command(&mut h, "Split Vertical");
+    command(&mut h, "Toggle Compose");
+    settle_frame(&mut h);
+    let paragraph_prefix = |rows: &[String]| {
+        let row = &rows[row_of(rows, "Paragraph below").unwrap()];
+        row[..row.find("Paragraph below").unwrap()].to_string()
+    };
+    let screen = h.screen_to_string();
+    let before = paragraph_prefix(&pane_rows(&screen, true));
+    assert_eq!(before, paragraph_prefix(&pane_rows(&screen, false)));
+
+    // Typing a word after the closing fence (no backtick) stops it closing,
+    // so the paragraph below becomes code in every pane showing the file.
+    h.mouse_click(20, 6).unwrap();
+    h.send_key(KeyCode::Home, KeyModifiers::CONTROL).unwrap();
+    h.send_key_repeat(KeyCode::Down, KeyModifiers::NONE, 4)
+        .unwrap();
+    h.send_key(KeyCode::End, KeyModifiers::NONE).unwrap();
+    h.type_text(" x").unwrap();
+    h.wait_until_stable(|h| paragraph_prefix(&pane_rows(&h.screen_to_string(), true)) != before)
+        .unwrap();
+    h.wait_for_async_quiescence(4).unwrap();
+    let screen = h.screen_to_string();
+    assert_eq!(
+        paragraph_prefix(&pane_rows(&screen, false)),
+        paragraph_prefix(&pane_rows(&screen, true)),
+        "the sibling pane must restyle the paragraph too:\n{screen}"
+    );
+}

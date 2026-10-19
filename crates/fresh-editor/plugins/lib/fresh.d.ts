@@ -5672,7 +5672,10 @@ interface EditorAPI {
 	* layout generation. Use these dimensions instead of the active viewport.
 	* Decoration adds and removals for that buffer made synchronously by the
 	* handler are automatically isolated to this plugin and pane. `refreshLines`
-	* in that handler refreshes only that pane. Replies for obsolete layouts
+	* in that handler offers the buffer's lines again to every pane in this
+	* window that subscribes through `pane_lines_changed`, so state the plugin
+	* shares across panes reaches siblings too; it does not re-fire
+	* `lines_changed`. Replies for obsolete layouts
 	* are discarded; buffer coordinates retain normal edit remapping. Do not
 	* `await` before emitting these decorations: asynchronous continuations are
 	* not bound to the batch. Other calls retain their buffer-wide behavior;

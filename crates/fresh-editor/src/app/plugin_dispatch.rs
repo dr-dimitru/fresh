@@ -655,8 +655,15 @@ impl Editor {
                     return Ok(());
                 }
                 if matches!(*command, PluginCommand::RefreshLines { .. }) {
-                    if let Some(offer) = self.active_window_mut().pane_line_offers.get_mut(&pane) {
-                        offer.seen.clear();
+                    // Re-offer every pane of this buffer, not just the one that
+                    // asked: what made the handler refresh (a grown table memo,
+                    // a fence edit) is plugin state shared by all of them, and a
+                    // sibling that is not scrolled gets no batch of its own.
+                    // Legacy `lines_changed` subscribers are left alone.
+                    for ((_, buffer), offer) in &mut self.active_window_mut().pane_line_offers {
+                        if *buffer == context.buffer_id {
+                            offer.seen.clear();
+                        }
                     }
                     self.request_plugin_render();
                     return Ok(());
