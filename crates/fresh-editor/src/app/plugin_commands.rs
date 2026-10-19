@@ -2118,6 +2118,15 @@ impl Editor {
             .split_view_states_mut()
             .get_mut(&target)
         {
+            // A named pane must hold the buffer. Otherwise the opinion would be
+            // planted in view state the buffer picks up when it is opened
+            // there later, overriding the user's global setting.
+            if split_id.is_some()
+                && view.shown_buffer() != Some(buffer_id)
+                && !view.has_buffer(buffer_id)
+            {
+                return;
+            }
             let vs = view.ensure_buffer_state(buffer_id);
             vs.line_numbers_plugin_override = enabled;
             vs.show_line_numbers = vs.line_numbers_visible(default_line_numbers);
