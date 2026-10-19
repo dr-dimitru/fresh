@@ -78,6 +78,39 @@ Plugins that already read the setting at point of use (as in the
 `getPluginConfig()` example above) need no subscription — they pick up
 the change on the next read.
 
+## Markdown Compose line numbers
+
+Compose exposes `plugins.markdown_compose.settings.lineNumbers` in Settings:
+
+- `"hide"` (default) preserves Compose's hidden line-number gutter.
+- `"inherit"` follows the global `editor.line_numbers` preference.
+
+For example:
+
+```json
+{
+  "plugins": {
+    "markdown_compose": {
+      "enabled": true,
+      "settings": { "lineNumbers": "inherit" }
+    }
+  }
+}
+```
+
+An explicit **Toggle Line Numbers (Current Buffer)** choice still wins over
+both the Compose default and the global setting. The override belongs to the
+buffer's view in that pane, so Source and Compose panes of one file can differ.
+Leaving Compose withdraws its default without changing that choice. Settings
+changes and config reloads update visible Compose panes, including an unfocused
+Source/Compose preview, without moving focus.
+
+Compose uses the renderer's resolved text and gutter dimensions from the
+[`pane_lines_changed` hook](../api/events.md#on), not the active pane's viewport.
+Centered pages reclaim gutter space from the desk when it fits; in narrow panes
+the gutter reduces the text measure. Code frames, tables, and prose use the
+same measure. This does not change the default page width or prose-reflow policy.
+
 ## Available methods
 
 | Method                          | TS return type     | Settings UI widget |

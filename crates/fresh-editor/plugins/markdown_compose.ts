@@ -11,6 +11,27 @@ import { wrapToWidth } from "./lib/text.ts";
 
 const editor = getEditor();
 
+editor.defineConfigEnum("lineNumbers", {
+  values: ["hide", "inherit"] as const,
+  default: "hide",
+  description: "Compose line numbers: 'hide' keeps the preview gutter hidden; 'inherit' follows editor.line_numbers. Explicit per-buffer user overrides always win.",
+});
+
+function composeLineNumbersDefault(): false | null {
+  const settings = editor.getPluginConfig<{ lineNumbers?: "hide" | "inherit" }>();
+  return settings?.lineNumbers === "inherit" ? null : false;
+}
+
+editor.on("config_changed", () => {
+  // Apply the opinion to the actual composing leaves, including an unfocused
+  // dual-view preview. Never move focus or write the user's explicit pin.
+  for (const pane of editor.listSplits()) {
+    if (pane.viewMode === "compose") {
+      editor.setLineNumbersDefault(pane.bufferId, composeLineNumbersDefault(), pane.splitId);
+    }
+  }
+});
+
 // Everything this plugin draws is the composed rendering of one pane, but
 // decorations live on the buffer: a pane showing the same buffer as source
 // must not draw them. `composeOnly` is the editor's switch for that — every
@@ -47,13 +68,11 @@ interface MarkdownConfig {
   // exist without overriding a user who deliberately asked for full width.
   composeWidth: number | null | undefined;
   maxWidth: number;
-  hideLineNumbers: boolean;
 }
 
 const config: MarkdownConfig = {
   composeWidth: undefined,
   maxWidth: 100,
-  hideLineNumbers: true,
 };
 
 // Fallback measure when the editor config can't be read at all. Matches the
@@ -817,12 +836,9 @@ function tableCells(content: string): string[] {
 // edge onto a row of its own. A table laid out at the full measure only got
 // away with it while the pane was wider than the measure; in a pane narrower
 // than the configured compose width (a vertical split, the file explorer
-// open), `effectiveComposeWidth` clamps to the pane and every border line
-// folded.
-function allocatedFor(maxW: number[]): number[] {
-  const viewport = editor.getViewport();
-  const composeW = effectiveComposeWidth(viewport ? viewport.width : 80);
-  const available = composeW - 2 - (maxW.length + 1);
+// open), the batch supplies the renderer's resolved text measure.
+function allocatedFor(maxW: number[], measure: number): number[] {
+  const available = measure - 2 - (maxW.length + 1);
   return distributeColumnWidths(maxW, available);
 }
 
@@ -1256,7 +1272,7 @@ function enableMarkdownCompose(bufferId: number, splitId: number | null = null):
   // composing, so it passes an opinion rather than a setting: the editor keeps
   // it apart from the user's own "Toggle Line Numbers (Current Buffer)" pin,
   // which still wins here and is what comes back on the way out (issue #2931).
-  editor.setLineNumbersDefault(bufferId, false);
+  editor.setLineNumbersDefault(bufferId, composeLineNumbersDefault(), splitId ?? undefined);
 
   // Same for the gutter's fold arrows: they are a code-editor affordance, and
   // a document preview with no line numbers has no use for them — they only
@@ -1759,23 +1775,6 @@ function displayWidth(text: string): number {
 }
 
 const MIN_COL_W = 3;
-
-/**
- * Return the effective compose width for layout: the configured compose
- * width clamped to the available viewport width.
- *
- * When `config.composeWidth` is explicitly set (e.g. 80) but the editor
- * content area is smaller (e.g. after the File Explorer sidebar opens),
- * using the configured value verbatim overflows the viewport. The Rust
- * render layer already clamps the compose area the same way in
- * `calculate_compose_layout`; plugin-side computations (table column
- * allocation, soft-wrap width) need to match.
- */
-function effectiveComposeWidth(viewportWidth: number): number {
-  const cw = activeComposeWidth();
-  if (cw == null) return viewportWidth;
-  return Math.min(cw, viewportWidth);
-}
 
 /**
  * W3C-inspired column width distribution.
@@ -2546,8 +2545,6 @@ function processLineConceals(
 }
 
 
-// Track viewport width per buffer for resize detection
-let lastViewportWidth = 0;
 
 // =============================================================================
 // Reflow: a run of source lines renders as one flowed block
@@ -3208,7 +3205,7 @@ function groupTableRows(lines: LineInfoLike[]): LineInfoLike[][] {
  * then forces one `refreshLines` so already-visible rows (which were laid out at
  * the old, narrower width before the wider row scrolled in) re-render at the new
  * width. The follow-up pass finds the memo unchanged, so it does not loop. */
-function computeRowWidths(bufferId: number, lines: LineInfoLike[]): boolean {
+function computeRowWidths(bufferId: number, lines: LineInfoLike[], measure: number): boolean {
   currentRowWidths = new Map();
   let grew = false;
   for (const group of groupTableRows(lines)) {
@@ -3262,7 +3259,7 @@ function computeRowWidths(bufferId: number, lines: LineInfoLike[]): boolean {
     const end = existing ? Math.max(existing.end, gEnd) : gEnd;
     editor.createMarker(bufferId, id, start, end, { maxW: acc });
 
-    const widths = allocatedFor(acc);
+    const widths = allocatedFor(acc, measure);
     for (const line of group) currentRowWidths.set(line.byte_start, widths);
   }
   return grew;
@@ -3300,17 +3297,12 @@ function computeRowWidths(bufferId: number, lines: LineInfoLike[]): boolean {
 
 
 // Register hooks
-editor.on("lines_changed", (data) => {
-  // Gate on the batch's OWN compose flag, not on `getBufferInfo`. The two
-  // answer the same question, but only this one is guaranteed to be about the
-  // buffer these lines came from: `getBufferInfo` reads the editor's state
-  // snapshot, which is refreshed on the editor thread's schedule and can still
-  // say "source" for a buffer whose compose commands the same frame already
-  // applied. The lines in a batch are marked seen when the batch is sent, so a
-  // batch dropped on a stale read is not offered again — turning compose on
-  // left the document literal until an edit or a scroll happened to produce
-  // another batch (#2968). The payload cannot lag what it was built from.
-  if (!data.is_composing_in_any_split) return;
+editor.on("pane_lines_changed", (data) => {
+  // Mode and dimensions belong to this batch's reconciled pane, not the active
+  // buffer snapshot. The host scopes all synchronous decoration mutations to
+  // this pane, so differently sized Compose views cannot replace each other.
+  if (data.view_mode !== "compose" || data.layout.textWidth === 0) return;
+  const measure = data.layout.textWidth;
   // Cursor reveal/conceal decisions are NOT made here: every emitted
   // decoration carries an activation scope and the renderer evaluates it
   // per frame against each split's own cursors. This handler runs only
@@ -3320,7 +3312,7 @@ editor.on("lines_changed", (data) => {
   // Column widths for every table row in this batch (uniform per table, via the
   // grow-only memo). If a wider row scrolled into view and grew a table's
   // columns, force a refresh so already-visible rows re-render at the new width.
-  const tableWidthsGrew = computeRowWidths(data.buffer_id, data.lines);
+  const tableWidthsGrew = computeRowWidths(data.buffer_id, data.lines, measure);
 
   // Line-number → line, for local first/last-row classification of borders.
   const byLineNum = new Map<number, LineInfoLike>();
@@ -3330,12 +3322,6 @@ editor.on("lines_changed", (data) => {
   // (no following line in the batch, ever) still closes its frame. Without this
   // `isLast` can never be true at end-of-buffer and the bottom border is missing.
   const bufEnd = editor.getBufferLength(data.buffer_id);
-
-  // The page measure, read once for the batch rather than per line — the
-  // conceal pass needs it for the thematic-break rule and the list indent, and
-  // it can't change within a single render.
-  const batchViewport = editor.getViewport();
-  const measure = effectiveComposeWidth(batchViewport ? batchViewport.width : 80);
 
   // The batch's flow blocks, computed before the per-line pass because the
   // conceal pass needs to know which lines are continuations: their leading
@@ -3574,16 +3560,8 @@ editor.on("after_delete", (data) => {
 editor.on("buffer_closed", (data) => {
   // View state is cleaned up automatically when the buffer is removed from keyed_states
 });
-editor.on("viewport_changed", (data) => {
-  if (!isComposingInAnySplit(data.buffer_id)) return;
-  if (data.width === lastViewportWidth) return;
-  lastViewportWidth = data.width;
-
-  // Refresh all visible lines: the per-line pass recomputes column widths for
-  // the new viewport width (allocatedFor reads the live viewport) and re-emits
-  // each row's border frame to match.
-  editor.refreshLines(data.buffer_id);
-});
+// Pane geometry changes invalidate the host's pane batch automatically. A
+// scroll/focus event alone must not refresh already-decorated document ranges.
 editor.on("prompt_confirmed", (args) => {
   if (args.prompt_type !== "markdown-compose-width") return;
 
