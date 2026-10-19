@@ -246,6 +246,7 @@ fn json_to_js_value<'js>(
 
 /// Call a JS handler function directly with structured data, bypassing JSON
 /// string serialization and JS-side `JSON.parse()` + source re-parsing.
+/// Runs only the handler's synchronous body; the caller drains the job queue.
 fn call_handler(ctx: &fresh_js::Ctx<'_>, handler_name: &str, event_data: &serde_json::Value) {
     let js_data = match json_to_js_value(ctx, event_data) {
         Ok(v) => v,
@@ -264,8 +265,6 @@ fn call_handler(ctx: &fresh_js::Ctx<'_>, handler_name: &str, event_data: &serde_
         Ok(result) => attach_promise_catch(ctx, &globals, handler_name, result),
         Err(e) => log_js_error(ctx, e, &format!("handler {}", handler_name)),
     }
-
-    run_pending_jobs_checked(ctx, &format!("emit handler {}", handler_name));
 }
 
 /// If `result` is a thenable (Promise), attach `.catch()` to surface async rejections.
@@ -11057,6 +11056,15 @@ impl QuickJsBackend {
                 };
                 context.with(|ctx| {
                     call_handler(&ctx, &handler.handler_name, event_data);
+                    // The queue is shared by every plugin's context, so it can
+                    // hold jobs queued before this emit, by any plugin. They
+                    // are not part of the batch: drain them unscoped.
+                    let pane = self.current_hook_pane.replace(None);
+                    run_pending_jobs_checked(
+                        &ctx,
+                        &format!("emit handler {}", handler.handler_name),
+                    );
+                    self.current_hook_pane.replace(pane);
                 });
             }
         }
@@ -12277,6 +12285,68 @@ mod tests {
             }
             _ => panic!("Expected SetStatus from event handler, got {:?}", cmd),
         }
+    }
+
+    #[tokio::test]
+    async fn pane_scope_does_not_reach_another_plugins_queued_job() {
+        // A job another plugin queued before this emit is not part of the
+        // batch, so its decorations must stay buffer-wide; only the handler's
+        // own synchronous calls are scoped to the pane.
+        let (mut backend, rx) = create_test_backend();
+        backend
+            .execute_js(
+                r#"
+                const editor = getEditor();
+                Promise.resolve().then(() => editor.clearNamespace(1, "beta-ns"));
+            "#,
+                "beta.js",
+            )
+            .unwrap();
+        backend
+            .execute_js(
+                r#"
+                const editor = getEditor();
+                globalThis.onPane = function(data) {
+                    editor.clearNamespace(data.buffer_id, "alpha-ns");
+                };
+                editor.on("pane_lines_changed", "onPane");
+            "#,
+                "alpha.js",
+            )
+            .unwrap();
+        let mut beta_before = false;
+        while let Ok(cmd) = rx.try_recv() {
+            beta_before |= matches!(&cmd, PluginCommand::ClearNamespace { .. });
+        }
+        assert!(
+            !beta_before,
+            "beta's job must still be queued for this test to mean anything"
+        );
+
+        let event_data = serde_json::json!({
+            "window_id": 1, "split_id": 4, "buffer_id": 1, "layout_generation": 9,
+        });
+        backend
+            .emit_to("pane_lines_changed", &event_data, None)
+            .await
+            .unwrap();
+        let mut scoped = Vec::new();
+        let mut plain = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                PluginCommand::PaneDecoration { context, command } => {
+                    if let PluginCommand::ClearNamespace { namespace, .. } = *command {
+                        scoped.push((context.plugin_name, namespace.as_str().to_string()));
+                    }
+                }
+                PluginCommand::ClearNamespace { namespace, .. } => {
+                    plain.push(namespace.as_str().to_string())
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(scoped, vec![("alpha".to_string(), "alpha-ns".to_string())]);
+        assert_eq!(plain, vec!["beta-ns".to_string()]);
     }
 
     #[tokio::test]
