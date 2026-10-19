@@ -765,3 +765,25 @@ fn reopened_fence_restyles_every_compose_pane() {
         "the sibling pane must restyle the paragraph too:\n{screen}"
     );
 }
+
+#[test]
+fn resized_compose_keeps_its_decorations_until_the_new_layout_arrives() {
+    let (mut h, _tmp) = compose_harness(DOCUMENT, Config::default(), 100, 30);
+    command(&mut h, "Toggle Compose");
+    settle_frame(&mut h);
+    // Move the caret off the decorated lines so nothing is revealed by it.
+    h.send_key(KeyCode::End, KeyModifiers::CONTROL).unwrap();
+    h.wait_for_async_quiescence(4).unwrap();
+    for width in [60, 52, 70] {
+        // `resize` paints one frame before any plugin reply can be read, so
+        // this is the first frame at the new geometry.
+        h.resize(width, 30).unwrap();
+        let screen = h.screen_to_string();
+        assert!(
+            !screen.contains("```") && !screen.contains("**emphasis**"),
+            "the first frame after a resize must not fall back to raw Markdown:\n{screen}"
+        );
+        assert!(screen.contains('┌'), "the code frame stays drawn:\n{screen}");
+        settle_frame(&mut h);
+    }
+}

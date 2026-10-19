@@ -688,11 +688,20 @@ impl Editor {
                             let layout = crate::view::ui::split_rendering::pane_layout(state, view);
                             let mode = if matches!(view.view_mode, crate::state::ViewMode::PageView) { "compose" } else { "source" };
                             let key = (split_id, buffer_id);
-                            let changed = pane_offers_for_win.get(&key)
+                            let previous = pane_offers_for_win.get(&key);
+                            let changed = previous
                                 .is_none_or(|offer| offer.layout != layout || offer.view_mode != mode);
+                            let mode_changed = previous.is_none_or(|offer| offer.view_mode != mode);
                             if changed {
                                 *generation_counter += 1;
-                                state.clear_pane_decorations(Some(split_id.into()), None);
+                                // A new geometry keeps the old projection on
+                                // screen until the reply rebuilds each re-offered
+                                // line; clearing here painted raw Markdown for a
+                                // frame on every resize step. A mode change may
+                                // get no reply at all, so it clears.
+                                if mode_changed {
+                                    state.clear_pane_decorations(Some(split_id.into()), None);
+                                }
                                 pane_offers_for_win.insert(key, crate::view::pane_decorations::PaneLineOffer {
                                     layout, view_mode: mode.into(), generation: *generation_counter,
                                     seen: Default::default(),

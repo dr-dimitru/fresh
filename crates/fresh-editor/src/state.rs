@@ -873,7 +873,8 @@ impl EditorState {
     }
 
     /// Tear down projection markers as well as their owning records. Used on
-    /// geometry changes, pane/tab disappearance, and plugin unload.
+    /// view-mode changes, pane/tab disappearance, and plugin unload. A
+    /// geometry change keeps them until the plugin's reply replaces them.
     pub(crate) fn clear_pane_decorations(
         &mut self,
         pane: Option<fresh_core::SplitId>,
