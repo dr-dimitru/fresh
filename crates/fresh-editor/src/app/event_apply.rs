@@ -59,45 +59,52 @@ impl Editor {
         removed: usize,
         inserted: usize,
     ) {
-        let Some(seen) = self
-            .active_window_mut()
+        let window = self.active_window_mut();
+        let sets = window
             .seen_byte_ranges
             .get_mut(&buffer_id)
-        else {
-            return;
-        };
+            .into_iter()
+            .chain(
+                window
+                    .pane_line_offers
+                    .iter_mut()
+                    .filter(|((_, buffer), _)| *buffer == buffer_id)
+                    .map(|(_, offer)| &mut offer.seen),
+            );
         let edit_end = position + removed;
-        *seen = seen
-            .iter()
-            .filter_map(|&(start, end)| {
-                if end <= position {
-                    Some((start, end))
-                } else if start >= edit_end && start > position {
-                    // **Entirely after the edit**, so only its coordinates
-                    // moved. `start > position` is the half an insertion needs:
-                    // it removes nothing, so `edit_end == position`, and
-                    // `start >= edit_end` alone also caught the line the text
-                    // was inserted at the *start* of — whose content plainly
-                    // changed. That line kept a seen entry, shifted along, and
-                    // the set was left holding a range no line has.
-                    //
-                    // Which bites when the edit is taken back. An undo or a
-                    // backspace runs the shift in reverse, the stale entry
-                    // lands exactly on the restored line's range, and the line
-                    // reads as already offered — so `lines_changed` never
-                    // fires for it and a per-line decoration plugin never
-                    // rebuilds it. In compose a heading kept its text and lost
-                    // its bold until an unrelated edit offered the line again.
-                    //
-                    // A deletion is unaffected: `removed > 0` makes `edit_end`
-                    // strictly greater than `position`, so the added test can
-                    // only be true where the first one already was.
-                    Some(((start + inserted) - removed, (end + inserted) - removed))
-                } else {
-                    None // overlaps the edit, so its content changed
-                }
-            })
-            .collect();
+        for seen in sets {
+            *seen = seen
+                .iter()
+                .filter_map(|&(start, end)| {
+                    if end <= position {
+                        Some((start, end))
+                    } else if start >= edit_end && start > position {
+                        // **Entirely after the edit**, so only its coordinates
+                        // moved. `start > position` is the half an insertion needs:
+                        // it removes nothing, so `edit_end == position`, and
+                        // `start >= edit_end` alone also caught the line the text
+                        // was inserted at the *start* of — whose content plainly
+                        // changed. That line kept a seen entry, shifted along, and
+                        // the set was left holding a range no line has.
+                        //
+                        // Which bites when the edit is taken back. An undo or a
+                        // backspace runs the shift in reverse, the stale entry
+                        // lands exactly on the restored line's range, and the line
+                        // reads as already offered — so `lines_changed` never
+                        // fires for it and a per-line decoration plugin never
+                        // rebuilds it. In compose a heading kept its text and lost
+                        // its bold until an unrelated edit offered the line again.
+                        //
+                        // A deletion is unaffected: `removed > 0` makes `edit_end`
+                        // strictly greater than `position`, so the added test can
+                        // only be true where the first one already was.
+                        Some(((start + inserted) - removed, (end + inserted) - removed))
+                    } else {
+                        None // overlaps the edit, so its content changed
+                    }
+                })
+                .collect();
+        }
     }
 
     /// Apply an event to the active buffer with all cross-cutting concerns.

@@ -462,6 +462,9 @@ impl Editor {
         self.detach_buffer_from_all_windows(id);
         self.active_window_mut().event_logs.remove(&id);
         self.active_window_mut().seen_byte_ranges.remove(&id);
+        self.active_window_mut()
+            .pane_line_offers
+            .retain(|(_, buffer), _| *buffer != id);
         self.active_window_mut().buffer_metadata.remove(&id);
         self.active_window_mut().status_bar_values.remove(&id);
         if let Some((request_id, _, _)) = self

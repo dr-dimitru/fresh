@@ -160,6 +160,7 @@ pub(crate) fn decoration_context(
     bracket_highlight: BracketHighlightSettings,
     view_lines: &[ViewLine],
     fold_indicators_visible: bool,
+    pane: Option<fresh_core::SplitId>,
 ) -> DecorationContext {
     use crate::view::folding::indent_folding;
 
@@ -255,11 +256,12 @@ pub(crate) fn decoration_context(
     let is_compose = matches!(view_mode, ViewMode::PageView);
     let mut semantic_token_spans = Vec::new();
     let mut viewport_overlays = Vec::new();
-    for (overlay, range) in
-        state
-            .overlays
-            .query_viewport(viewport_start, viewport_end, &state.marker_list)
-    {
+    for (overlay, range) in state.overlays.query_viewport_for_pane(
+        viewport_start,
+        viewport_end,
+        &state.marker_list,
+        pane,
+    ) {
         if crate::services::lsp::semantic_tokens::is_semantic_token_overlay(overlay) {
             if let crate::view::overlay::OverlayFace::Foreground { color } = &overlay.face {
                 semantic_token_spans.push(crate::primitives::highlighter::HighlightSpan {

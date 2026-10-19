@@ -524,6 +524,7 @@ fn text_pane_content(
                 state,
                 fresh.buffer_tab_state_mut(),
                 ReconcileInputs {
+                    pane_id: split_id.into(),
                     content_rect,
                     pin_to_top: is_non_scrollable,
                     show_horizontal_scrollbar,
@@ -686,6 +687,7 @@ pub(crate) fn reconcile_panes(pass: &ContentPass, f: &FrameFacts<'_>, s: &mut St
             state,
             vs.buffer_tab_state_mut(),
             ReconcileInputs {
+                pane_id: split_id.into(),
                 content_rect,
                 // A pane whose content is pinned to its size does not scroll
                 // to follow the cursor.

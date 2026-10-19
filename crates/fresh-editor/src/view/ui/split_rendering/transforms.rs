@@ -239,7 +239,8 @@ const JOIN_ESTIMATE_PASSES: usize = 2;
 /// Returns `visible_count` unchanged for a non-composing split or an
 /// unconcealed buffer: every other conceal in the editor stays inside one
 /// line, so nothing else can pay for this query.
-pub(crate) fn join_adjusted_visible_count(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn join_adjusted_visible_count_for_pane(
     buffer: &crate::model::buffer::Buffer,
     conceals: &crate::view::conceal::ConcealManager,
     marker_list: &crate::model::marker::MarkerList,
@@ -247,6 +248,7 @@ pub(crate) fn join_adjusted_visible_count(
     top_byte: usize,
     visible_count: usize,
     is_compose: bool,
+    pane: Option<fresh_core::SplitId>,
 ) -> usize {
     if !is_compose || conceals.is_empty() || visible_count == 0 {
         return visible_count;
@@ -261,7 +263,14 @@ pub(crate) fn join_adjusted_visible_count(
             return total;
         }
         let swallowed: usize = conceals
-            .query_viewport(top_byte, end_byte, marker_list, cursor_positions)
+            .query_viewport_for_pane(
+                top_byte,
+                end_byte,
+                marker_list,
+                true,
+                cursor_positions,
+                pane,
+            )
             .iter()
             .map(|(range, _)| {
                 let from = buffer.get_line_number(range.start.max(top_byte));
@@ -499,6 +508,7 @@ pub(super) fn inject_virtual_lines(
     theme: &Theme,
     wrap_width: Option<usize>,
     is_compose: bool,
+    pane: Option<fresh_core::SplitId>,
 ) -> Vec<ViewLine> {
     // Get viewport byte range from source lines.
     // Use the last line that has source bytes (not a trailing empty line
@@ -514,10 +524,12 @@ pub(super) fn inject_virtual_lines(
         .map(|b| b + 1)
         .unwrap_or(viewport_start);
 
-    let mut virtual_lines =
-        state
-            .virtual_texts
-            .query_lines_in_range(&state.marker_list, viewport_start, viewport_end);
+    let mut virtual_lines = state.virtual_texts.query_lines_for_pane(
+        &state.marker_list,
+        viewport_start,
+        viewport_end,
+        pane,
+    );
 
     // Lines a plugin added as `composeOnly` (markdown_compose's table borders
     // and list spacing) belong only to a Compose-mode split. Virtual lines live
@@ -734,16 +746,17 @@ pub struct InlineHint {
 /// actual mode (`scrollbar_math::scroll_geometry`), so gating on it there takes
 /// compose's own decorations out of the row count of a *composing* buffer and
 /// the scrollbar stops short of the end of the document.
-pub fn resolve_inline_hints(
+pub fn resolve_inline_hints_for_pane(
     state: &EditorState,
     theme: Option<&Theme>,
     start: usize,
     end: usize,
     include_compose_only: bool,
+    pane: Option<fresh_core::SplitId>,
 ) -> Vec<InlineHint> {
     state
         .virtual_texts
-        .query_inline_in_range(&state.marker_list, start, end)
+        .query_inline_for_pane(&state.marker_list, start, end, pane)
         .into_iter()
         .filter(|(_, vtext)| include_compose_only || !vtext.compose_only)
         .map(|(anchor, vtext)| InlineHint {

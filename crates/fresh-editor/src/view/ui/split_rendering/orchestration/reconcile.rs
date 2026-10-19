@@ -44,6 +44,7 @@ use ratatui::layout::Rect;
 /// What a pane's reconcile needs beyond the view state.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReconcileInputs {
+    pub pane_id: fresh_core::SplitId,
     /// The rectangle the pane's text is formatted into — the pane's content
     /// rect, after its tab strip and scrollbars.
     pub content_rect: Rect,
@@ -65,6 +66,7 @@ pub(crate) fn reconcile_pane(
     inputs: ReconcileInputs,
 ) {
     let _span = tracing::trace_span!("reconcile_pane").entered();
+    view.viewport.pane_id = Some(inputs.pane_id);
     let BufferViewState {
         viewport,
         cursors,
@@ -195,7 +197,7 @@ pub(crate) fn place_pane(
         view_mode,
         crate::view::wrap_index::fold_signature(&fold_ranges),
     );
-    let inputs = state.pipeline_inputs();
+    let inputs = state.pipeline_inputs_for(viewport.pane_id);
     let cursor_byte = cursors.primary().position;
     let buffer_len = state.buffer.len();
     // Large-file mode has no line data at all — the gutter is byte-based and
@@ -229,11 +231,23 @@ pub(crate) fn place_pane(
             .unwrap_or_else(|| state.buffer.len());
         let divergent = state
             .conceals
-            .earliest_cursor_divergence(cl_start, cl_end, &state.marker_list, &cursor_positions)
+            .divergence_for_pane(
+                cl_start,
+                cl_end,
+                &state.marker_list,
+                &cursor_positions,
+                viewport.pane_id,
+            )
             .is_some()
             || state
                 .soft_breaks
-                .earliest_cursor_divergence(cl_start, cl_end, &state.marker_list, &cursor_positions)
+                .divergence_for_pane(
+                    cl_start,
+                    cl_end,
+                    &state.marker_list,
+                    &cursor_positions,
+                    viewport.pane_id,
+                )
                 .is_some();
         let expansion = if divergent {
             let canonical = state
@@ -248,7 +262,8 @@ pub(crate) fn place_pane(
                 .map(|i| i.row_of_byte(&state.buffer, cl_start));
             match (canonical, first_row) {
                 (Some(canonical_rows), Some(first_row)) => {
-                    let aware = state.index_decorations(
+                    let aware = state.index_decorations_for(
+                        viewport.pane_id,
                         geometry.view_mode,
                         state.fold_ranges(folds),
                         &cursor_positions,
@@ -369,6 +384,32 @@ pub(crate) fn pane_text_width(
         state.margins.has_line_indicators(),
     );
     usize::from(width).saturating_sub(gutter.width)
+}
+
+/// The same resolved page and gutter used by drawing, exposed as a small
+/// value for pane-local plugin offers. No shared last-pane margin reads.
+pub(crate) fn pane_layout(
+    state: &EditorState,
+    view: &BufferViewState,
+) -> fresh_core::api::PaneLayout {
+    let gutter = resolve_gutter_layout(
+        &state.margins,
+        view.show_line_numbers,
+        &view.view_mode,
+        Rect::new(0, 0, view.viewport.width, view.viewport.height),
+        view.compose_width,
+        gutter_estimated_lines(state),
+        state.diff_gutter.as_ref().map(|g| g.width()),
+        state.margins.has_line_indicators(),
+    );
+    fresh_core::api::PaneLayout {
+        text_width: gutter
+            .compose
+            .render_area
+            .width
+            .saturating_sub(gutter.width as u16),
+        gutter_width: gutter.width as u16,
+    }
 }
 
 /// The line count the gutter is sized for: the buffer's line count, or its

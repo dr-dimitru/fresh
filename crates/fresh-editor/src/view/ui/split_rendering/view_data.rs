@@ -10,8 +10,8 @@ use super::folding::{apply_folding, fold_adjusted_visible_count, fold_skip_set};
 use super::style::fold_placeholder_style;
 use super::transforms::{
     apply_conceal_ranges, apply_grid_wrapping_transform, apply_soft_breaks,
-    apply_wrapping_transform_from, inject_virtual_lines, join_adjusted_visible_count,
-    resolve_inline_hints, splice_inline_virtual_text,
+    apply_wrapping_transform_from, inject_virtual_lines, join_adjusted_visible_count_for_pane,
+    resolve_inline_hints_for_pane, splice_inline_virtual_text,
 };
 use super::MAX_SAFE_LINE_WIDTH;
 use crate::state::{EditorState, ViewMode};
@@ -201,7 +201,7 @@ pub(super) fn build_view_data(
     // fill fewer than N rows and the viewport's bottom comes up short — the
     // same shortfall a collapsed fold produces, and answered the same way, by
     // asking the token build for the lines the joins ate.
-    let adjusted_visible_count = join_adjusted_visible_count(
+    let adjusted_visible_count = join_adjusted_visible_count_for_pane(
         &state.buffer,
         &state.conceals,
         &state.marker_list,
@@ -209,6 +209,7 @@ pub(super) fn build_view_data(
         viewport.top_byte(),
         adjusted_visible_count,
         matches!(view_mode, ViewMode::PageView),
+        viewport.pane_id,
     );
 
     let is_binary = state.buffer.is_binary();
@@ -344,12 +345,13 @@ pub(super) fn build_view_data(
             .next_back()
             .unwrap_or(viewport.top_byte())
             + 1;
-        let soft_breaks = state.soft_breaks.query_viewport_rendered(
+        let soft_breaks = state.soft_breaks.query_rendered_for_pane(
             viewport.top_byte(),
             viewport_end,
             &state.marker_list,
             cursor_positions,
             Some(theme),
+            viewport.pane_id,
         );
         if !soft_breaks.is_empty() {
             tokens = apply_soft_breaks(tokens, &soft_breaks);
@@ -372,12 +374,13 @@ pub(super) fn build_view_data(
             .next_back()
             .unwrap_or(viewport.top_byte())
             + 1;
-        let conceal_ranges = state.conceals.query_viewport_in(
+        let conceal_ranges = state.conceals.query_viewport_for_pane(
             viewport.top_byte(),
             viewport_end,
             &state.marker_list,
             is_compose,
             cursor_positions,
+            viewport.pane_id,
         );
         if !conceal_ranges.is_empty() {
             tokens = apply_conceal_ranges(tokens, &conceal_ranges);
@@ -413,12 +416,13 @@ pub(super) fn build_view_data(
             .unwrap_or(viewport.top_byte());
         tokens = splice_inline_virtual_text(
             tokens,
-            &resolve_inline_hints(
+            &resolve_inline_hints_for_pane(
                 state,
                 Some(theme),
                 viewport.top_byte(),
                 viewport_end,
                 is_compose,
+                viewport.pane_id,
             ),
         );
     }
@@ -497,6 +501,7 @@ pub(super) fn build_view_data(
         theme,
         virtual_line_wrap_width,
         is_compose,
+        viewport.pane_id,
     );
     let placeholder_style = fold_placeholder_style(theme);
     let lines = apply_folding(

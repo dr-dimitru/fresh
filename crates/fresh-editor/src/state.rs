@@ -291,6 +291,8 @@ pub struct EditorState {
 
     /// Soft break points for marker-based line wrapping during rendering
     pub soft_breaks: SoftBreakManager,
+    pane_decoration_scopes:
+        std::collections::HashSet<crate::view::pane_decorations::DecorationScope>,
 
     /// Popups for floating windows (completion, documentation, etc.)
     pub popups: PopupManager,
@@ -513,6 +515,7 @@ impl EditorState {
             virtual_texts: VirtualTextManager::new(),
             conceals: ConcealManager::new(),
             soft_breaks: SoftBreakManager::new(),
+            pane_decoration_scopes: Default::default(),
             popups: PopupManager::new(),
             margins: MarginManager::new(),
             mode: "insert".to_string(),
@@ -741,8 +744,8 @@ impl EditorState {
             .wrap_indices
             .get(&geometry)
             .is_some_and(|index| index.is_built_for(&geometry, inputs));
-        let decorations =
-            (!current).then(|| self.index_decorations(geometry.view_mode, folds, &[]));
+        let decorations = (!current)
+            .then(|| self.index_decorations_for(geometry.pane_id, geometry.view_mode, folds, &[]));
         let line_ending = self.buffer.line_ending();
         // Touch even a current entry: scrollbar markers read the most recently
         // used geometry, and different splits can show the same buffer.
@@ -770,28 +773,43 @@ impl EditorState {
         folds: Vec<std::ops::Range<usize>>,
         cursors: &[usize],
     ) -> crate::view::wrap_index::IndexDecorations {
+        self.index_decorations_for(None, view_mode, folds, cursors)
+    }
+
+    pub fn index_decorations_for(
+        &self,
+        pane: Option<fresh_core::SplitId>,
+        view_mode: crate::view::line_wrap_cache::CacheViewMode,
+        folds: Vec<std::ops::Range<usize>>,
+        cursors: &[usize],
+    ) -> crate::view::wrap_index::IndexDecorations {
         use crate::view::line_wrap_cache::CacheViewMode;
         #[cfg(test)]
         tests::INDEX_DECORATION_SNAPSHOTS.with(|count| count.set(count.get() + 1));
         let end = self.buffer.len().saturating_add(1);
         let no_cursors = cursors;
+        let is_compose = matches!(view_mode, CacheViewMode::Compose);
 
-        let soft_breaks = if self.soft_breaks.is_empty() {
+        let soft_breaks = if self.soft_breaks.is_empty() || (pane.is_some() && !is_compose) {
             Vec::new()
         } else {
             // `theme: None` — the index measures and never draws, so a
             // continuation prefix contributes its width here but no colour.
-            self.soft_breaks
-                .query_viewport_rendered(0, end, &self.marker_list, no_cursors, None)
+            self.soft_breaks.query_rendered_for_pane(
+                0,
+                end,
+                &self.marker_list,
+                no_cursors,
+                None,
+                pane,
+            )
         };
-
-        let is_compose = matches!(view_mode, CacheViewMode::Compose);
 
         let conceals = if self.conceals.is_empty() {
             Vec::new()
         } else {
             self.conceals
-                .query_viewport_in(0, end, &self.marker_list, is_compose, no_cursors)
+                .query_viewport_for_pane(0, end, &self.marker_list, is_compose, no_cursors, pane)
                 .into_iter()
                 .map(|(r, t)| (r, t.map(str::to_owned)))
                 .collect()
@@ -800,26 +818,29 @@ impl EditorState {
         let inline_hints = if self.virtual_texts.is_empty() {
             Vec::new()
         } else {
-            crate::view::ui::split_rendering::transforms::resolve_inline_hints(
-                self, None, 0, end, true,
+            crate::view::ui::split_rendering::transforms::resolve_inline_hints_for_pane(
+                self,
+                None,
+                0,
+                end,
+                pane.is_none() || is_compose,
+                pane,
             )
         };
 
-        // Every virtual line the buffer has, compose's frame included — and the
-        // same for the rails above. The renderer drops the compose-only ones
-        // when the split it is drawing is in source mode, but this index is not
-        // per split: scroll math asks for it under a fixed
-        // `CacheViewMode::Source` label that says nothing about any split's
-        // mode (`scrollbar_math::scroll_geometry`). Dropping them on that label
-        // took the table borders and list spacers out of the row count of a
-        // *composing* buffer, and the wheel and the scrollbar stopped short of
-        // the end of the document.
+        // A real pane's canonical index uses its actual view mode and scope,
+        // exactly like painting. The legacy unscoped entry point retains its
+        // historical measuring convention (include Compose frames), for callers
+        // that do not have a pane or a meaningful mode.
         let virtual_lines = if self.virtual_texts.is_empty() {
             Vec::new()
         } else {
             let mut v: Vec<usize> = self
                 .virtual_texts
-                .query_lines_in_range(&self.marker_list, 0, end)
+                .query_lines_for_pane(&self.marker_list, 0, end, pane)
+                .into_iter()
+                .filter(|(_, v)| pane.is_none() || is_compose || !v.compose_only)
+                .collect::<Vec<_>>()
                 .into_iter()
                 .map(|(pos, _)| pos)
                 .collect();
@@ -836,14 +857,97 @@ impl EditorState {
         }
     }
 
+    /// Install a write scope only around one synchronous command dispatch.
+    pub(crate) fn set_decoration_scope(
+        &mut self,
+        scope: crate::view::pane_decorations::DecorationScope,
+    ) -> crate::view::pane_decorations::DecorationScope {
+        use crate::view::pane_decorations::DecorationScope;
+        if matches!(scope, DecorationScope::Pane { .. }) {
+            self.pane_decoration_scopes.insert(scope.clone());
+        }
+        self.overlays.set_scope(scope.clone());
+        self.virtual_texts.set_scope(scope.clone());
+        self.soft_breaks.set_scope(scope.clone());
+        self.conceals.set_scope(scope)
+    }
+
+    /// Tear down projection markers as well as their owning records. Used on
+    /// geometry changes, pane/tab disappearance, and plugin unload.
+    pub(crate) fn clear_pane_decorations(
+        &mut self,
+        pane: Option<fresh_core::SplitId>,
+        plugin: Option<&str>,
+    ) {
+        use crate::view::pane_decorations::DecorationScope;
+        let scopes: Vec<_> = self
+            .pane_decoration_scopes
+            .iter()
+            .filter(|scope| match scope {
+                DecorationScope::Pane {
+                    split_id,
+                    plugin_name,
+                } => pane.is_none_or(|p| p == *split_id) && plugin.is_none_or(|p| p == plugin_name),
+                DecorationScope::Buffer => false,
+            })
+            .cloned()
+            .collect();
+        for scope in scopes {
+            let old = self.set_decoration_scope(scope.clone());
+            self.conceals.clear(&mut self.marker_list);
+            self.soft_breaks.clear(&mut self.marker_list);
+            self.virtual_texts.clear(&mut self.marker_list);
+            self.overlays.clear(&mut self.marker_list);
+            self.set_decoration_scope(old);
+            self.pane_decoration_scopes.remove(&scope);
+        }
+    }
+
+    /// Prune invisible/dead projection owners before reconciliation. Versions
+    /// can be released only together with their pane's cached indices, or a
+    /// reopened pane could accidentally match an old version's row snapshot.
+    /// Zero-area panes lose projection markers but retain native cache identity
+    /// and versions until their logical pane disappears, avoiding idle rebuilds.
+    pub(crate) fn retain_decoration_panes(
+        &mut self,
+        live: &std::collections::HashSet<fresh_core::SplitId>,
+        drawable: &std::collections::HashSet<fresh_core::SplitId>,
+    ) {
+        use crate::view::pane_decorations::DecorationScope;
+        let dead: std::collections::HashSet<_> = self
+            .pane_decoration_scopes
+            .iter()
+            .filter_map(|scope| match scope {
+                DecorationScope::Pane { split_id, .. } if !drawable.contains(split_id) => {
+                    Some(*split_id)
+                }
+                _ => None,
+            })
+            .collect();
+        for pane in dead {
+            self.clear_pane_decorations(Some(pane), None);
+        }
+        self.wrap_indices.retain_panes(live);
+        self.conceals.retain_scope_versions(live);
+        self.soft_breaks.retain_scope_versions(live);
+        self.virtual_texts.retain_scope_versions(live);
+    }
+
     /// The versions of everything that feeds line layout, as one value — the
     /// currency `WrapIndex` and its callers trade in.
     pub fn pipeline_inputs(&self) -> crate::view::line_wrap_cache::PipelineInputs {
+        self.pipeline_inputs_for(None)
+    }
+
+    pub fn pipeline_inputs_for(
+        &self,
+        pane: Option<fresh_core::SplitId>,
+    ) -> crate::view::line_wrap_cache::PipelineInputs {
         crate::view::line_wrap_cache::PipelineInputs {
             buffer: self.buffer.version(),
-            soft_breaks: self.soft_breaks.version(),
-            conceals: self.conceals.version(),
-            virtual_text: self.virtual_texts.version(),
+            soft_breaks: self.soft_breaks.version_for(pane),
+            conceals: self.conceals.version_for(pane),
+            virtual_text: self.virtual_texts.version_for(pane),
         }
     }
 
@@ -1870,6 +1974,35 @@ impl EditorState {
             .query_viewport(0, self.buffer.len() + 1, &self.marker_list, &[])
     }
 
+    /// Decorations for byte-walking scroll fallbacks, selected by the same
+    /// pane and view mode as painting and the row index.
+    pub(crate) fn scroll_decorations(
+        &self,
+        view: &crate::view::split::BufferViewState,
+    ) -> (Vec<(usize, u16)>, Vec<usize>) {
+        let pane = view.viewport.pane_id;
+        let composing = matches!(view.view_mode, ViewMode::PageView);
+        let breaks = if composing {
+            self.soft_breaks.query_viewport_for_pane(
+                0,
+                self.buffer.len() + 1,
+                &self.marker_list,
+                &[],
+                pane,
+            )
+        } else {
+            Vec::new()
+        };
+        let lines = self
+            .virtual_texts
+            .query_lines_for_pane(&self.marker_list, 0, self.buffer.len() + 1, pane)
+            .into_iter()
+            .filter(|(_, v)| composing || !v.compose_only)
+            .map(|(pos, _)| pos)
+            .collect();
+        (breaks, lines)
+    }
+
     // ========== DocumentModel Helper Methods ==========
     // These methods provide convenient access to DocumentModel functionality
     // while maintaining backward compatibility with existing code.
@@ -2154,6 +2287,318 @@ mod tests {
 
     thread_local! {
         pub(super) static INDEX_DECORATION_SNAPSHOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn pane_projection_teardown_removes_only_its_owners_markers() {
+        use crate::view::pane_decorations::DecorationScope;
+        use crate::view::virtual_text::VirtualTextPosition;
+        use fresh_core::SplitId;
+        let mut state = EditorState::new(40, 20, usize::MAX, test_fs());
+        state.buffer.insert(0, "text");
+        let legacy = state.virtual_texts.add_with_id(
+            &mut state.marker_list,
+            3,
+            "buffer".into(),
+            ratatui::style::Style::default(),
+            VirtualTextPosition::BeforeChar,
+            0,
+            "same".into(),
+        );
+        let legacy_marker = state.virtual_texts.marker_id_of(legacy).unwrap();
+        let mut markers = Vec::new();
+        for owner in ["first", "second"] {
+            state.set_decoration_scope(DecorationScope::Pane {
+                split_id: SplitId(1),
+                plugin_name: owner.into(),
+            });
+            let id = state.virtual_texts.add_with_id(
+                &mut state.marker_list,
+                1,
+                owner.into(),
+                ratatui::style::Style::default(),
+                VirtualTextPosition::BeforeChar,
+                0,
+                "same".into(),
+            );
+            markers.push(state.virtual_texts.marker_id_of(id).unwrap());
+            state.conceals.add(
+                &mut state.marker_list,
+                crate::view::overlay::OverlayNamespace::from_string("same".into()),
+                2..3,
+                None,
+            );
+            state.soft_breaks.add(
+                &mut state.marker_list,
+                crate::view::overlay::OverlayNamespace::from_string("same".into()),
+                2,
+                0,
+            );
+        }
+        state.set_decoration_scope(DecorationScope::Buffer);
+        // Plugin unload has no pane-hook context; pane close has no plugin owner.
+        state.clear_pane_decorations(None, Some("first"));
+        assert_eq!(state.marker_list.get_position(markers[0]), None);
+        assert_eq!(state.marker_list.get_position(markers[1]), Some(1));
+        assert_eq!(state.conceals.len(), 1);
+        assert_eq!(state.soft_breaks.len(), 1);
+        state.clear_pane_decorations(Some(SplitId(1)), None);
+        assert_eq!(state.marker_list.get_position(markers[1]), None);
+        assert_eq!(state.marker_list.get_position(legacy_marker), Some(3));
+        assert_eq!(
+            state.marker_list.query_range(0, 4).len(),
+            1,
+            "teardown must delete projection anchors but retain the buffer-wide marker"
+        );
+        assert!(state.pane_decoration_scopes.is_empty());
+    }
+
+    #[test]
+    fn zero_area_projection_teardown_preserves_settled_native_index() {
+        use crate::view::pane_decorations::DecorationScope;
+        use fresh_core::SplitId;
+        let mut state = EditorState::new(40, 20, usize::MAX, test_fs());
+        state
+            .buffer
+            .insert(0, &"**words** that wrap across rows\n".repeat(150));
+        state.set_decoration_scope(DecorationScope::Pane {
+            split_id: SplitId(1),
+            plugin_name: "test".into(),
+        });
+        state.conceals.add(
+            &mut state.marker_list,
+            crate::view::overlay::OverlayNamespace::from_string("same".into()),
+            0..2,
+            None,
+        );
+        state.set_decoration_scope(DecorationScope::Buffer);
+        let live = std::collections::HashSet::from([SplitId(1)]);
+        let drawable = std::collections::HashSet::new();
+        let mut view = crate::view::viewport::Viewport::new(40, 0);
+        view.pane_id = Some(SplitId(1));
+        let geometry = crate::view::ui::split_rendering::wrap_index_geometry_for(
+            &view,
+            &state,
+            true,
+            &ViewMode::PageView,
+            0,
+        );
+        state.retain_decoration_panes(&live, &drawable);
+        assert!(state
+            .marker_list
+            .query_range(0, state.buffer.len())
+            .is_empty());
+        state.ensure_wrap_index(
+            geometry,
+            state.pipeline_inputs_for(view.pane_id),
+            Vec::new(),
+        );
+        let snapshots = INDEX_DECORATION_SNAPSHOTS.with(|n| n.get());
+        for _ in 0..12 {
+            state.retain_decoration_panes(&live, &drawable);
+            state.ensure_wrap_index(
+                geometry,
+                state.pipeline_inputs_for(view.pane_id),
+                Vec::new(),
+            );
+        }
+        assert_eq!(
+            INDEX_DECORATION_SNAPSHOTS.with(|n| n.get()),
+            snapshots,
+            "an empty pane must not force a whole-buffer snapshot on every frame"
+        );
+    }
+
+    #[test]
+    fn source_index_excludes_compose_soft_breaks() {
+        use crate::view::line_wrap_cache::CacheViewMode;
+        use crate::view::pane_decorations::DecorationScope;
+        use fresh_core::SplitId;
+        let mut state = EditorState::new(40, 20, usize::MAX, test_fs());
+        state.buffer.insert(0, "one two three");
+        state.set_decoration_scope(DecorationScope::Pane {
+            split_id: SplitId(1),
+            plugin_name: "test".into(),
+        });
+        state.soft_breaks.add(
+            &mut state.marker_list,
+            crate::view::overlay::OverlayNamespace::from_string("test".into()),
+            4,
+            0,
+        );
+        assert!(state
+            .index_decorations_for(Some(SplitId(1)), CacheViewMode::Source, Vec::new(), &[])
+            .soft_breaks
+            .is_empty());
+        assert_eq!(
+            state
+                .index_decorations_for(Some(SplitId(1)), CacheViewMode::Compose, Vec::new(), &[])
+                .soft_breaks
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn pane_snapshots_keep_folds_and_cursor_activation_independent() {
+        use crate::view::line_wrap_cache::CacheViewMode;
+        use crate::view::pane_decorations::DecorationScope;
+        use fresh_core::api::MarkerActivation;
+        use fresh_core::SplitId;
+        let mut state = EditorState::new(40, 20, usize::MAX, test_fs());
+        state.buffer.insert(0, "**one**\nsecond\nthird\n");
+        for id in [1, 2] {
+            state.set_decoration_scope(DecorationScope::Pane {
+                split_id: SplitId(id),
+                plugin_name: "test".into(),
+            });
+            state.conceals.add_with_activation(
+                &mut state.marker_list,
+                crate::view::overlay::OverlayNamespace::from_string("same".into()),
+                0..2,
+                None,
+                Some(MarkerActivation {
+                    if_cursor_in: false,
+                    scope_start: 0,
+                    scope_end: 7,
+                }),
+                true,
+            );
+        }
+        state.set_decoration_scope(DecorationScope::Buffer);
+        let a = state.index_decorations_for(
+            Some(SplitId(1)),
+            CacheViewMode::Compose,
+            std::iter::once(8..15).collect(),
+            &[3],
+        );
+        let b = state.index_decorations_for(
+            Some(SplitId(2)),
+            CacheViewMode::Compose,
+            Vec::new(),
+            &[16],
+        );
+        assert!(
+            a.conceals.is_empty(),
+            "only pane A's editing cursor reveals syntax"
+        );
+        assert_eq!(
+            b.conceals.len(),
+            1,
+            "pane B retains its own concealed syntax"
+        );
+        assert_eq!(a.folds, vec![8..15]);
+        assert!(b.folds.is_empty(), "pane A's folding must not reach pane B");
+        let canonical = state.index_decorations_for(
+            Some(SplitId(1)),
+            CacheViewMode::Compose,
+            std::iter::once(8..15).collect(),
+            &[],
+        );
+        assert_eq!(
+            canonical.conceals.len(),
+            1,
+            "canonical row geometry must not inherit a cursor-aware snapshot"
+        );
+        assert_eq!(canonical.folds, vec![8..15]);
+    }
+
+    #[test]
+    fn active_panes_do_not_evict_each_others_wrap_indices() {
+        use crate::view::ui::split_rendering::scrollbar::scrollbar_line_counts;
+        let mut state = EditorState::new(40, 20, usize::MAX, test_fs());
+        state
+            .buffer
+            .insert(0, &"words that wrap across narrow panes\n".repeat(150));
+        let len = state.buffer.len();
+        let mut geometries = Vec::new();
+        for id in 1..=5 {
+            let mut view = crate::view::viewport::Viewport::new(40, 20);
+            view.pane_id = Some(fresh_core::SplitId(id));
+            view.line_wrap_enabled = true;
+            scrollbar_line_counts(
+                &mut state,
+                &view,
+                &ViewMode::PageView,
+                u64::MAX,
+                len,
+                Vec::new(),
+            );
+            geometries.push(crate::view::ui::split_rendering::wrap_index_geometry_for(
+                &view,
+                &state,
+                true,
+                &ViewMode::PageView,
+                0,
+            ));
+        }
+        assert!(
+            geometries
+                .iter()
+                .all(|g| state.wrap_indices.get(g).is_some()),
+            "a live pane's index must survive another pane's preparation"
+        );
+        let snapshots = INDEX_DECORATION_SNAPSHOTS.with(|n| n.get());
+        for geometry in geometries {
+            state.ensure_wrap_index(
+                geometry,
+                state.pipeline_inputs_for(geometry.pane_id),
+                Vec::new(),
+            );
+        }
+        assert_eq!(
+            INDEX_DECORATION_SNAPSHOTS.with(|n| n.get()),
+            snapshots,
+            "steady frames must not rebuild the document for evicted panes"
+        );
+    }
+
+    #[test]
+    fn equal_width_panes_keep_distinct_projection_snapshots() {
+        use crate::view::pane_decorations::DecorationScope;
+        use crate::view::ui::split_rendering::scrollbar::scrollbar_line_counts;
+        use fresh_core::SplitId;
+        let mut state = EditorState::new(40, 20, usize::MAX, test_fs());
+        state.buffer.insert(
+            0,
+            &"words that wrap across multiple rows in a narrow pane\n".repeat(150),
+        );
+        let len = state.buffer.len();
+        let mut a = crate::view::viewport::Viewport::new(40, 20);
+        a.pane_id = Some(SplitId(1));
+        a.line_wrap_enabled = true;
+        let mut b = a.clone();
+        b.pane_id = Some(SplitId(2));
+        let scope = DecorationScope::Pane {
+            split_id: SplitId(2),
+            plugin_name: "test".into(),
+        };
+        state.conceals.set_scope(scope);
+        state.conceals.add(
+            &mut state.marker_list,
+            crate::view::overlay::OverlayNamespace::from_string("test".into()),
+            0..1,
+            Some("more words ".repeat(30)),
+        );
+        let counts = |s: &mut EditorState, v: &crate::view::viewport::Viewport| {
+            scrollbar_line_counts(s, v, &ViewMode::PageView, u64::MAX, len, Vec::new()).0
+        };
+        let before = counts(&mut state, &a);
+        assert!(counts(&mut state, &b) > before);
+        assert_eq!(counts(&mut state, &a), before);
+        let snapshots = INDEX_DECORATION_SNAPSHOTS.with(|n| n.get());
+        state.conceals.add(
+            &mut state.marker_list,
+            crate::view::overlay::OverlayNamespace::from_string("test".into()),
+            2..3,
+            None,
+        );
+        assert_eq!(counts(&mut state, &a), before);
+        assert_eq!(
+            INDEX_DECORATION_SNAPSHOTS.with(|n| n.get()),
+            snapshots,
+            "a sibling mutation must not resnapshot this pane's entire decoration set"
+        );
     }
 
     #[test]

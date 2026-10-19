@@ -288,7 +288,7 @@ impl Editor {
     /// skipped has to be guaranteed a retry. (The pre-layout drain at the top
     /// of `render` does take the lock; it runs before any drawing, which is the
     /// point of doing it there.)
-    fn request_plugin_render(&mut self) {
+    pub(super) fn request_plugin_render(&mut self) {
         #[cfg(feature = "plugins")]
         {
             self.plugin_render_requested = true;
@@ -502,6 +502,36 @@ impl Editor {
             lsp_waiting,
             hide_cursor,
         };
+        let buffer_panes = self.active_window().visible_buffer_panes();
+        let live_decoration_panes = buffer_panes
+            .iter()
+            .map(|(pane, _, _)| (*pane).into())
+            .collect();
+        let drawable_panes: std::collections::HashSet<fresh_core::SplitId> = buffer_panes
+            .iter()
+            .filter(|(pane, _, _)| {
+                self.active_window()
+                    .pane_rects
+                    .content(*pane)
+                    .is_some_and(|rect| !rect.is_empty())
+            })
+            .map(|(pane, _, _)| (*pane).into())
+            .collect();
+        let retired_projection = {
+            let offers = &mut self.active_window_mut().pane_line_offers;
+            let before = offers.len();
+            offers
+                .retain(|(pane, _), _| drawable_panes.contains(&fresh_core::SplitId::from(*pane)));
+            offers.len() != before
+        };
+        for (_, state) in &mut self.active_window_mut().buffers {
+            state.retain_decoration_panes(&live_decoration_panes, &drawable_panes);
+            if retired_projection {
+                // Drop the old projection once, not on every zero-row frame:
+                // reconciliation may cache a decoration-free zero-area index.
+                state.wrap_indices.retain_panes(&drawable_panes);
+            }
+        }
         let mut prepared_grid = {
             let _s = tracing::info_span!("reconcile_panes").entered();
             crate::app::shell_host::reconcile_body(
@@ -536,60 +566,89 @@ impl Editor {
             // the buffer behind the group, so those are what is offered: a
             // panel scrolled by its own viewport is otherwise never offered
             // the lines it shows.
-            let visible_buffers = {
-                let window = self.active_window();
-                let groups = window.pane_groups();
-                let mut leaves = Vec::new();
-                for (leaf, buffer) in window.split_manager().visible_leaves() {
-                    match groups.get(&leaf) {
-                        Some(group) => leaves.extend(group.visible_leaves()),
-                        None => leaves.push((leaf, buffer)),
-                    }
-                }
-                pane_rects.visible(&leaves)
-            };
+            let visible_buffers = self.active_window().visible_buffer_panes();
 
+            let (has_legacy_lines, has_pane_lines) = self
+                .plugin_manager
+                .try_read()
+                .map(|pm| {
+                    (
+                        pm.has_subscribers("lines_changed"),
+                        pm.has_subscribers("pane_lines_changed"),
+                    )
+                })
+                .unwrap_or((false, false));
+            let visible: std::collections::HashSet<_> = visible_buffers
+                .iter()
+                .map(|(pane, buffer, _)| (*pane, *buffer))
+                .collect();
+            let stale: Vec<_> = self
+                .active_window()
+                .pane_line_offers
+                .keys()
+                .filter(|key| !visible.contains(key))
+                .copied()
+                .collect();
+            for (pane, buffer) in stale {
+                self.active_window_mut()
+                    .pane_line_offers
+                    .remove(&(pane, buffer));
+                if let Some(state) = self.active_window_mut().buffer_state_mut(buffer) {
+                    state.clear_pane_decorations(Some(pane.into()), None);
+                }
+            }
             let mut total_new_lines = 0usize;
             for (split_id, buffer_id, split_area) in visible_buffers {
-                // Get viewport from SplitViewState (the authoritative source)
-                let viewport_top_byte = self
-                    .active_window()
-                    .split_view_states()
-                    .get(&split_id)
-                    .map(|vs| vs.buffer_tab_state().viewport.top_byte())
-                    .unwrap_or(0);
+                // Reuse the bounded offer walk for the independent legacy and
+                // pane contracts. A plugin opts into one; no per-pane document scan.
+                for pane_offer in [false, true] {
+                    if pane_offer
+                        && (!has_pane_lines
+                            || !drawable_panes.contains(&fresh_core::SplitId::from(split_id)))
+                    {
+                        continue;
+                    }
+                    // Get viewport from SplitViewState (the authoritative source)
+                    let viewport_top_byte = self
+                        .active_window()
+                        .split_view_states()
+                        .get(&split_id)
+                        .map(|vs| vs.buffer_tab_state().viewport.top_byte())
+                        .unwrap_or(0);
 
-                // Whether this buffer is being composed in any split, read from
-                // the live view states rather than from the plugin snapshot.
-                // Travels with the batch (see `HookArgs::LinesChanged`) because
-                // the lines below are marked seen as soon as they are handed
-                // over: a consumer that had to re-derive this from
-                // `getBufferInfo()` would be reading a mirror that is refreshed
-                // on the editor thread's own schedule, and would silently drop
-                // its only decoration pass whenever it read too early (#2968).
-                let composing_in_any_split =
-                    self.active_window().split_view_states().values().any(|vs| {
-                        vs.buffer_state(buffer_id)
-                            .map(|bs| matches!(bs.view_mode, crate::state::ViewMode::PageView))
-                            .unwrap_or(false)
-                    });
+                    // Whether this buffer is being composed in any split, read from
+                    // the live view states rather than from the plugin snapshot.
+                    // Travels with the batch (see `HookArgs::LinesChanged`) because
+                    // the lines below are marked seen as soon as they are handed
+                    // over: a consumer that had to re-derive this from
+                    // `getBufferInfo()` would be reading a mirror that is refreshed
+                    // on the editor thread's own schedule, and would silently drop
+                    // its only decoration pass whenever it read too early (#2968).
+                    let composing_in_any_split =
+                        self.active_window().split_view_states().values().any(|vs| {
+                            vs.buffer_state(buffer_id)
+                                .map(|bs| matches!(bs.view_mode, crate::state::ViewMode::PageView))
+                                .unwrap_or(false)
+                        });
 
-                let __active_id = self.active_window;
-                let __win = self
-                    .windows
-                    .get_mut(&__active_id)
-                    .expect("active window must exist");
-                // Take a disjoint mut borrow on `seen_byte_ranges` (a sibling
-                // field on Window, not part of WindowBuffers) so the closure
-                // below can update it alongside the buffer + view-state
-                // mutations.
-                let seen_ranges_for_win = &mut __win.seen_byte_ranges;
-                let plugin_manager = &self.plugin_manager;
-                let estimated_line_length = self.config.editor.estimated_line_length;
-                let mut hooks_deferred = false;
-                let added = __win
+                    let __active_id = self.active_window;
+                    let __win = self
+                        .windows
+                        .get_mut(&__active_id)
+                        .expect("active window must exist");
+                    // Take a disjoint mut borrow on `seen_byte_ranges` (a sibling
+                    // field on Window, not part of WindowBuffers) so the closure
+                    // below can update it alongside the buffer + view-state
+                    // mutations.
+                    let seen_ranges_for_win = &mut __win.seen_byte_ranges;
+                    let pane_offers_for_win = &mut __win.pane_line_offers;
+                    let generation_counter = &mut __win.next_pane_layout_generation;
+                    let plugin_manager = &self.plugin_manager;
+                    let estimated_line_length = self.config.editor.estimated_line_length;
+                    let mut hooks_deferred = false;
+                    let added = __win
                     .buffers
-                    .with_buffer_and_view_states(buffer_id, |state, _vs_map| {
+                    .with_buffer_and_view_states(buffer_id, |state, vs_map| {
                         // Both hooks go through `try_read`: the draw computes
                         // the payload and hands it off, but never waits on the
                         // plugin lock. On contention nothing is marked seen, so
@@ -602,10 +661,13 @@ impl Editor {
                         // `render_start` has a tiny payload (just the
                         // buffer id) — fire unconditionally so third-party
                         // plugins listening for it still work.
-                        pm_guard.run_hook(
-                            "render_start",
-                            crate::services::plugins::hooks::HookArgs::RenderStart { buffer_id },
-                        );
+                        if !pane_offer {
+                            pm_guard.run_hook(
+                                "render_start",
+                                crate::services::plugins::hooks::HookArgs::RenderStart { buffer_id },
+                            );
+                            if !has_legacy_lines { return 0; }
+                        }
 
                         let visible_count = split_area.height as usize;
                         // What the pane can show, in bytes at four per column:
@@ -620,7 +682,29 @@ impl Editor {
                             .min(PLUGIN_LINE_OFFER_BYTES);
 
                         let top_byte = viewport_top_byte;
-                        let seen_byte_ranges = seen_ranges_for_win.entry(buffer_id).or_default();
+                        let batch_layout = if pane_offer {
+                            let Some(view) = vs_map.get(&split_id).map(|vs| vs.buffer_tab_state()) else { return 0; };
+                            if view.viewport.height == 0 || view.viewport.width == 0 { return 0; }
+                            let layout = crate::view::ui::split_rendering::pane_layout(state, view);
+                            let mode = if matches!(view.view_mode, crate::state::ViewMode::PageView) { "compose" } else { "source" };
+                            let key = (split_id, buffer_id);
+                            let changed = pane_offers_for_win.get(&key)
+                                .is_none_or(|offer| offer.layout != layout || offer.view_mode != mode);
+                            if changed {
+                                *generation_counter += 1;
+                                state.clear_pane_decorations(Some(split_id.into()), None);
+                                pane_offers_for_win.insert(key, crate::view::pane_decorations::PaneLineOffer {
+                                    layout, view_mode: mode.into(), generation: *generation_counter,
+                                    seen: Default::default(),
+                                });
+                            }
+                            Some((layout, mode.to_string(), pane_offers_for_win[&key].generation))
+                        } else { None };
+                        let composing_in_any_split = batch_layout.as_ref()
+                            .map(|(_, mode, _)| mode == "compose").unwrap_or(composing_in_any_split);
+                        let seen_byte_ranges = if pane_offer {
+                            &mut pane_offers_for_win.get_mut(&(split_id, buffer_id)).expect("offer inserted").seen
+                        } else { seen_ranges_for_win.entry(buffer_id).or_default() };
 
                         // Where the walk starts. Normally the viewport's top
                         // line; for a composing buffer, backed up to the start
@@ -657,7 +741,7 @@ impl Editor {
                         // joins it measures are the ones already on screen, so
                         // a document opens at one line per row and settles over
                         // the next frames as its blocks join.
-                        let rows = crate::view::ui::split_rendering::transforms::join_adjusted_visible_count(
+                        let rows = crate::view::ui::split_rendering::transforms::join_adjusted_visible_count_for_pane(
                             &state.buffer,
                             &state.conceals,
                             &state.marker_list,
@@ -665,6 +749,7 @@ impl Editor {
                             top_byte,
                             visible_count,
                             composing_in_any_split,
+                            pane_offer.then_some(split_id.into()),
                         );
                         // A split with no rows draws nothing, so it has nothing
                         // to offer — and the walk below has no stopping rule.
@@ -851,15 +936,18 @@ impl Editor {
                                     }
                                 }
                             }
-                            pm_guard.run_hook(
-                                "lines_changed",
-                                crate::services::plugins::hooks::HookArgs::LinesChanged {
-                                    buffer_id,
-                                    lines: new_lines,
-                                    epoch: state.buffer.version(),
+                            if let Some((layout, view_mode, layout_generation)) = batch_layout {
+                                crate::view::pane_decorations::count_offer(new_lines.len(), new_lines.iter().map(|line| line.content.len()).sum());
+                                pm_guard.run_hook("pane_lines_changed", crate::services::plugins::hooks::HookArgs::PaneLinesChanged {
+                                    window_id: __active_id.0, split_id: split_id.into(), buffer_id,
+                                    epoch: state.buffer.version(), layout_generation, view_mode, layout, lines: new_lines,
+                                });
+                            } else {
+                                pm_guard.run_hook("lines_changed", crate::services::plugins::hooks::HookArgs::LinesChanged {
+                                    buffer_id, lines: new_lines, epoch: state.buffer.version(),
                                     is_composing_in_any_split: composing_in_any_split,
-                                },
-                            );
+                                });
+                            }
                             for range in fresh_ranges {
                                 seen_byte_ranges.insert(range);
                             }
@@ -867,10 +955,11 @@ impl Editor {
                         count
                     })
                     .unwrap_or(0);
-                if hooks_deferred {
-                    self.request_plugin_render();
+                    if hooks_deferred {
+                        self.request_plugin_render();
+                    }
+                    total_new_lines += added;
                 }
-                total_new_lines += added;
             }
             let hooks_elapsed = hooks_start.elapsed();
             tracing::trace!(

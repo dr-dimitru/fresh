@@ -162,6 +162,7 @@ pub type Priority = i32;
 /// Uses markers for content-anchored positions that automatically adjust with edits
 #[derive(Debug, Clone)]
 pub struct Overlay {
+    pub scope: crate::view::pane_decorations::DecorationScope,
     /// Unique handle for this overlay (opaque, for removal by handle)
     pub handle: OverlayHandle,
 
@@ -253,6 +254,7 @@ impl Overlay {
             url: None,
             theme_key: None,
             above_selection: false,
+            scope: crate::view::pane_decorations::DecorationScope::Buffer,
             compose_only: false,
         }
     }
@@ -303,6 +305,7 @@ impl Overlay {
                     url: None,
                     theme_key: None,
                     above_selection: false,
+                    scope: crate::view::pane_decorations::DecorationScope::Buffer,
                     compose_only: false,
                 },
             )
@@ -339,6 +342,7 @@ impl Overlay {
             url: None,
             theme_key: None,
             above_selection: false,
+            scope: crate::view::pane_decorations::DecorationScope::Buffer,
             compose_only: false,
         }
     }
@@ -409,6 +413,7 @@ impl Overlay {
 /// Overlays are sorted by priority for efficient rendering
 #[derive(Debug, Clone)]
 pub struct OverlayManager {
+    scope: crate::view::pane_decorations::DecorationScope,
     /// All active overlays, indexed for O(1) lookup by handle
     overlays: Vec<Overlay>,
     /// `MarkerId -> index into overlays` for O(log N + k) `remove_in_range`.
@@ -437,6 +442,7 @@ impl OverlayManager {
     /// Create a new empty overlay manager
     pub fn new() -> Self {
         Self {
+            scope: crate::view::pane_decorations::DecorationScope::Buffer,
             overlays: Vec::new(),
             marker_to_idx: HashMap::new(),
             removal_epoch: 0,
@@ -453,7 +459,15 @@ impl OverlayManager {
     /// insertion shift plus a re-index of everything after it, on every
     /// add — which is once or twice per cursor move, against a buffer that
     /// can hold an overlay per line.
-    pub fn add(&mut self, overlay: Overlay) -> OverlayHandle {
+    pub fn set_scope(
+        &mut self,
+        scope: crate::view::pane_decorations::DecorationScope,
+    ) -> crate::view::pane_decorations::DecorationScope {
+        std::mem::replace(&mut self.scope, scope)
+    }
+
+    pub fn add(&mut self, mut overlay: Overlay) -> OverlayHandle {
+        overlay.scope = self.scope.clone();
         let handle = overlay.handle.clone();
         let idx = self.overlays.len();
         self.overlays.push(overlay);
@@ -464,7 +478,10 @@ impl OverlayManager {
     /// Append many overlays at once.
     pub fn extend<I: IntoIterator<Item = Overlay>>(&mut self, overlays: I) {
         let first_new = self.overlays.len();
-        self.overlays.extend(overlays);
+        self.overlays.extend(overlays.into_iter().map(|mut o| {
+            o.scope = self.scope.clone();
+            o
+        }));
         for idx in first_new..self.overlays.len() {
             self.index_entry(idx);
         }
@@ -541,6 +558,9 @@ impl OverlayManager {
         let Some(idx) = self.handle_to_idx.get(handle).copied() else {
             return false;
         };
+        if self.overlays[idx].scope != self.scope {
+            return false;
+        }
         match self.overlays[idx].namespace.clone() {
             Some(ns) => self.bump_namespace_epoch(&ns),
             None => self.removal_epoch = self.removal_epoch.wrapping_add(1),
@@ -559,12 +579,16 @@ impl OverlayManager {
     /// diff in the same buffer made every arrow key pay for all of it.
     pub fn clear_namespace(&mut self, namespace: &OverlayNamespace, marker_list: &mut MarkerList) {
         self.bump_namespace_epoch(namespace);
-        let Some(slots) = self.namespace_to_idx.remove(namespace) else {
+        let Some(slots) = self.namespace_to_idx.get(namespace) else {
             return;
         };
         // Descending, so each swap-remove only ever pulls down an entry from
         // beyond the ones still to be removed.
-        let mut slots: Vec<usize> = slots.into_iter().collect();
+        let mut slots: Vec<usize> = slots
+            .iter()
+            .copied()
+            .filter(|&i| self.overlays[i].scope == self.scope)
+            .collect();
         slots.sort_unstable_by(|a, b| b.cmp(a));
         for idx in slots {
             self.swap_remove_at(idx, marker_list);
@@ -598,6 +622,9 @@ impl OverlayManager {
                 .into_iter()
                 .filter(|&idx| {
                     let o = &self.overlays[idx];
+                    if o.scope != self.scope {
+                        return false;
+                    }
                     if o.namespace.as_ref() != Some(namespace) {
                         return false;
                     }
@@ -630,6 +657,9 @@ impl OverlayManager {
 
         if !new_overlays.is_empty() {
             let first_new = self.overlays.len();
+            for o in &mut new_overlays {
+                o.scope = self.scope.clone();
+            }
             self.overlays.append(&mut new_overlays);
             for idx in first_new..self.overlays.len() {
                 self.index_entry(idx);
@@ -662,6 +692,9 @@ impl OverlayManager {
             .into_iter()
             .filter(|&idx| {
                 let o = &self.overlays[idx];
+                if o.scope != self.scope {
+                    return false;
+                }
                 let start = marker_list.get_position(o.start_marker).unwrap_or(0);
                 let end = marker_list.get_position(o.end_marker).unwrap_or(0);
                 start < range.end && range.start < end
@@ -708,6 +741,9 @@ impl OverlayManager {
             .into_iter()
             .filter(|&idx| {
                 let o = &self.overlays[idx];
+                if o.scope != self.scope {
+                    return false;
+                }
                 if o.namespace.as_ref() != Some(namespace) {
                     return false;
                 }
@@ -728,20 +764,15 @@ impl OverlayManager {
     /// Clear all overlays and their markers
     pub fn clear(&mut self, marker_list: &mut MarkerList) {
         self.removal_epoch = self.removal_epoch.wrapping_add(1);
-        for overlay in &self.overlays {
-            marker_list.delete(overlay.start_marker);
-            marker_list.delete(overlay.end_marker);
-            // The span marker too. Leaving it behind orphans one interval
-            // per overlay in the tree forever, and every query here now
-            // goes through that tree — `set_virtual_buffer_content` clears
-            // and refills on each content set, so the orphans would grow
-            // the `k` in O(log N + k) without bound across reloads.
-            marker_list.delete(overlay.span_marker);
+        let indices: Vec<_> = self
+            .overlays
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| (o.scope == self.scope).then_some(i))
+            .collect();
+        for idx in indices.into_iter().rev() {
+            self.swap_remove_at(idx, marker_list);
         }
-        self.overlays.clear();
-        self.marker_to_idx.clear();
-        self.handle_to_idx.clear();
-        self.namespace_to_idx.clear();
     }
 
     /// Swap-remove the entry at `idx`, deleting its markers and re-pointing
@@ -827,6 +858,16 @@ impl OverlayManager {
         end: usize,
         marker_list: &MarkerList,
     ) -> Vec<(&Overlay, Range<usize>)> {
+        self.query_viewport_for_pane(start, end, marker_list, None)
+    }
+
+    pub fn query_viewport_for_pane(
+        &self,
+        start: usize,
+        end: usize,
+        marker_list: &MarkerList,
+        pane: Option<fresh_core::SplitId>,
+    ) -> Vec<(&Overlay, Range<usize>)> {
         // Ask the marker tree which overlays touch the window at all. Every
         // overlay indexes its whole extent as one span marker, so this is an
         // ordinary interval-overlap query and it answers for all three
@@ -856,6 +897,9 @@ impl OverlayManager {
             .into_iter()
             .filter_map(|idx| {
                 let overlay = self.overlays.get(idx)?;
+                if !overlay.scope.visible_in(pane) {
+                    return None;
+                }
                 let start_pos = marker_list.get_position(overlay.start_marker)?;
                 let end_pos = marker_list.get_position(overlay.end_marker)?;
                 let range = start_pos..end_pos;

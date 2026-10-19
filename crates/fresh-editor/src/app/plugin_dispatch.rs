@@ -614,6 +614,69 @@ impl Editor {
     /// Handle a plugin command - dispatches to specialized handlers in plugin_commands module
     pub fn handle_plugin_command(&mut self, command: PluginCommand) -> AnyhowResult<()> {
         match command {
+            PluginCommand::ClearPluginPaneDecorations { plugin_name } => {
+                for window in self.windows.values_mut() {
+                    for (_, state) in &mut window.buffers {
+                        state.clear_pane_decorations(None, Some(&plugin_name));
+                    }
+                    for offer in window.pane_line_offers.values_mut() {
+                        offer.seen.clear();
+                    }
+                }
+            }
+            PluginCommand::PaneDecoration { context, command } => {
+                if command.decoration_buffer_id() != Some(context.buffer_id) {
+                    anyhow::bail!("unsupported pane decoration command");
+                }
+                let pane = (LeafId(context.split_id), context.buffer_id);
+                if context.window_id != self.active_window.0 {
+                    if let Some(window) = self
+                        .windows
+                        .get_mut(&fresh_core::WindowId(context.window_id))
+                    {
+                        if let Some(offer) = window.pane_line_offers.get_mut(&pane) {
+                            offer.seen.clear();
+                        }
+                    }
+                    return Ok(());
+                }
+                let current = self
+                    .active_window()
+                    .pane_line_offers
+                    .get(&pane)
+                    .is_some_and(|offer| offer.generation == context.layout_generation);
+                let shown = self
+                    .active_window()
+                    .split_view_states()
+                    .get(&pane.0)
+                    .and_then(|vs| vs.shown_buffer())
+                    == Some(context.buffer_id);
+                if !current || !shown {
+                    return Ok(());
+                }
+                if matches!(*command, PluginCommand::RefreshLines { .. }) {
+                    if let Some(offer) = self.active_window_mut().pane_line_offers.get_mut(&pane) {
+                        offer.seen.clear();
+                    }
+                    self.request_plugin_render();
+                    return Ok(());
+                }
+                let Some(state) = self.active_window_mut().buffer_state_mut(context.buffer_id)
+                else {
+                    return Ok(());
+                };
+                let old = state.set_decoration_scope(
+                    crate::view::pane_decorations::DecorationScope::Pane {
+                        split_id: context.split_id,
+                        plugin_name: context.plugin_name,
+                    },
+                );
+                let result = self.handle_plugin_command(*command);
+                if let Some(state) = self.active_window_mut().buffer_state_mut(context.buffer_id) {
+                    state.set_decoration_scope(old);
+                }
+                result?;
+            }
             // ==================== Text Editing Commands ====================
             PluginCommand::InsertText {
                 buffer_id,
@@ -985,8 +1048,12 @@ impl Editor {
             PluginCommand::SetLineNumbers { buffer_id, enabled } => {
                 self.handle_set_line_numbers(buffer_id, enabled);
             }
-            PluginCommand::SetLineNumbersDefault { buffer_id, enabled } => {
-                self.handle_set_line_numbers_default(buffer_id, enabled);
+            PluginCommand::SetLineNumbersDefault {
+                buffer_id,
+                enabled,
+                split_id,
+            } => {
+                self.handle_set_line_numbers_default(buffer_id, enabled, split_id);
             }
             PluginCommand::SetFoldIndicators { buffer_id, enabled } => {
                 self.active_window_mut()
@@ -7278,7 +7345,7 @@ impl Window {
         // The panes as the last layout placed them, in the tree's order. The
         // layout funnel refreshes them before this runs on a split, a
         // resize or a chrome toggle (`relayout` refreshes the snapshot).
-        let laid_out = self.visible_panes();
+        let laid_out = self.visible_buffer_panes();
         self.buffers
             .with_all_mut(|buffers_mut, mgr, vs_map| {
                 if let Some(active_vs) = vs_map.get(&active_split_id) {
@@ -7390,6 +7457,15 @@ impl Window {
                         split_id: leaf_id.0 .0,
                         buffer_id: buf_id,
                         label: mgr.get_label(leaf_id.0).map(|l| l.to_string()),
+                        view_mode: if matches!(
+                            vs.buffer_tab_state().view_mode,
+                            crate::state::ViewMode::PageView
+                        ) {
+                            "compose"
+                        } else {
+                            "source"
+                        }
+                        .into(),
                         x: rect.x,
                         y: rect.y,
                         width: rect.width,

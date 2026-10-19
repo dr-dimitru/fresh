@@ -22,7 +22,7 @@ use fresh_core::api::{
     CreateVirtualBufferOptions, CursorInfo, DiffBaselineResult, DirEntry, FileExplorerScope,
     FormatterPackConfig, GrammarInfoSnapshot, GrepMatch, JsDiagnostic, JsPosition, JsRange,
     JsTextPropertyEntry, KeyEventPayload, LanguagePackConfig, LayoutHints, LineDiffHunk,
-    LspServerPackConfig, OverlayColorSpec, OverlayOptions, PluginAnimationEdge,
+    LspServerPackConfig, OverlayColorSpec, OverlayOptions, PaneLayout, PluginAnimationEdge,
     PluginAnimationKind, ProcessLimitsPackConfig, RemoteBackendInfo, ReplaceResult, ScreenSize,
     ScrollbarMarker, SearchTakeResult, SpawnResult, SplitSnapshot, TerminalResult,
     TextPropertiesAtCursor, TokenColor, TsHighlightSpan, ViewTokenStyle, ViewTokenWire,
@@ -61,6 +61,7 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         "RemoteBackendInfo" => Some(decl_with_docs::<RemoteBackendInfo>(&cfg)),
         "CursorInfo" => Some(decl_with_docs::<CursorInfo>(&cfg)),
         "ViewportInfo" => Some(decl_with_docs::<ViewportInfo>(&cfg)),
+        "PaneLayout" => Some(decl_with_docs::<PaneLayout>(&cfg)),
         "ScreenSize" => Some(decl_with_docs::<ScreenSize>(&cfg)),
         "KeyEventPayload" => Some(decl_with_docs::<KeyEventPayload>(&cfg)),
         "SplitSnapshot" => Some(decl_with_docs::<SplitSnapshot>(&cfg)),
@@ -367,6 +368,7 @@ const DEPENDENCY_TYPES: &[&str] = &[
     "TsCompositeHunk",                 // Used in createCompositeBuffer opts.hunks
     "TsSyntaxRegion",                  // Used by setSyntaxRegions
     "TsCreateCompositeBufferOptions",  // Options for createCompositeBuffer
+    "PaneLayout",                      // Resolved pane decoration dimensions
     "ViewportInfo",                    // Used by plugins for viewport queries
     "ScreenSize",                      // Used by editor.getScreenSize()
     "KeyEventPayload",                 // Used by editor.getNextKey()
@@ -814,6 +816,20 @@ interface HookEventMap {
     byte_start: number;
     byte_end: number;
     content: string;
+  };
+  /** A pane-local decoration batch. Synchronous decoration commands for its
+   * buffer are scoped to this plugin/pane, including removals and refreshes.
+   * Dimensions are captured after reconciliation; do not use getViewport()
+   * for this batch. Async continuations are not implicitly scoped. */
+  pane_lines_changed: {
+    window_id: number;
+    split_id: number;
+    buffer_id: number;
+    epoch: number;
+    layout_generation: number;
+    view_mode: "source" | "compose";
+    layout: PaneLayout;
+    lines: HookEventMap["lines_changed"]["lines"];
   };
   lines_changed: {
     buffer_id: number;

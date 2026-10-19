@@ -25,7 +25,7 @@ mod orchestration;
 // three for a caller that hands it a whole rectangle; the shell folds a
 // display list and calls them one `Host` at a time instead, so that a pane's
 // rectangle is the one layout gave it.
-pub(crate) use orchestration::reconcile::pane_text_width;
+pub(crate) use orchestration::reconcile::{pane_layout, pane_text_width};
 pub(crate) use orchestration::render_buffer::wrap_index_geometry_for;
 pub(crate) use orchestration::{
     content_pass, paint_leaf, prepare_content, reconcile_panes, ContentPass, FrameFacts,
@@ -477,6 +477,7 @@ mod tests {
             BracketHighlightSettings::default(),
             &[],
             true, // auxiliary render paths have no per-split fold pin
+            None,
         );
 
         let mut dummy_theme_map = Vec::new();
@@ -589,6 +590,7 @@ mod tests {
             BracketHighlightSettings::default(),
             &[],
             true, // auxiliary render paths have no per-split fold pin
+            None,
         );
 
         let glyph = crate::config::default_indentation_guide_glyph();
@@ -1998,6 +2000,7 @@ mod tests {
         let empty_folds = FoldManager::new();
 
         let geometry = WrapIndexGeometry {
+            pane_id: None,
             fold_signature: 0,
             rule: WrapRule::Word {
                 content_width: width - 1,
@@ -3260,6 +3263,7 @@ mod tests {
             BracketHighlightSettings::default(),
             &[],
             true, // auxiliary render paths have no per-split fold pin
+            None,
         );
 
         render_view_lines(LineRenderInput {

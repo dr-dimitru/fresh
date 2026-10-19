@@ -70,6 +70,7 @@ impl SoftBreakPrefix {
 /// A soft break point that injects a line break during rendering
 #[derive(Debug, Clone)]
 pub struct SoftBreakPoint {
+    pub scope: crate::view::pane_decorations::DecorationScope,
     /// Namespace for bulk operations (shared with overlay namespace system)
     pub namespace: OverlayNamespace,
 
@@ -143,6 +144,7 @@ pub struct SoftBreakManager {
     /// data (e.g. `LineWrapCache`) fold this into their key so any mutation
     /// invalidates stale entries automatically.
     version: u32,
+    scopes: crate::view::pane_decorations::ScopedVersions,
 }
 
 impl SoftBreakManager {
@@ -152,7 +154,26 @@ impl SoftBreakManager {
             breaks: Vec::new(),
             marker_to_idx: HashMap::new(),
             version: 0,
+            scopes: crate::view::pane_decorations::ScopedVersions::default(),
         }
+    }
+
+    pub fn set_scope(
+        &mut self,
+        scope: crate::view::pane_decorations::DecorationScope,
+    ) -> crate::view::pane_decorations::DecorationScope {
+        std::mem::replace(&mut self.scopes.write, scope)
+    }
+
+    pub(crate) fn retain_scope_versions(
+        &mut self,
+        live: &std::collections::HashSet<fresh_core::SplitId>,
+    ) {
+        self.scopes.retain_panes(live);
+    }
+
+    pub fn version_for(&self, pane: Option<fresh_core::SplitId>) -> u32 {
+        self.scopes.version_for(pane)
     }
 
     /// Monotonic version, bumped on every mutation.
@@ -214,6 +235,7 @@ impl SoftBreakManager {
         let idx = self.breaks.len();
         self.marker_to_idx.insert(marker_id, idx);
         self.breaks.push(SoftBreakPoint {
+            scope: self.scopes.write.clone(),
             namespace,
             marker_id,
             indent,
@@ -222,6 +244,7 @@ impl SoftBreakManager {
             prefix,
         });
         self.version = self.version.wrapping_add(1);
+        self.scopes.bump();
     }
 
     /// Remove all soft breaks in a namespace
@@ -230,7 +253,9 @@ impl SoftBreakManager {
             .breaks
             .iter()
             .enumerate()
-            .filter_map(|(i, b)| (&b.namespace == namespace).then_some(i))
+            .filter_map(|(i, b)| {
+                (b.scope == self.scopes.write && &b.namespace == namespace).then_some(i)
+            })
             .collect();
         if indices.is_empty() {
             return;
@@ -240,6 +265,7 @@ impl SoftBreakManager {
             self.swap_remove_at(idx, marker_list);
         }
         self.version = self.version.wrapping_add(1);
+        self.scopes.bump();
     }
 
     /// Remove all soft breaks that fall within a byte range and clean up their markers
@@ -264,6 +290,7 @@ impl SoftBreakManager {
                 }
             })
             .collect();
+        to_remove.retain(|&i| self.breaks[i].scope == self.scopes.write);
         to_remove.sort_unstable();
         to_remove.dedup();
         if to_remove.is_empty() {
@@ -275,21 +302,24 @@ impl SoftBreakManager {
             self.swap_remove_at(idx, marker_list);
         }
         self.version = self.version.wrapping_add(1);
+        self.scopes.bump();
     }
 
     /// Clear all soft breaks and their markers
     pub fn clear(&mut self, marker_list: &mut MarkerList) {
-        let had_any = !self.breaks.is_empty();
-        for bp in &self.breaks {
-            marker_list.delete(bp.marker_id);
-            if let Some(a) = &bp.activation {
-                a.release(marker_list);
-            }
+        let indices: Vec<usize> = self
+            .breaks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| (b.scope == self.scopes.write).then_some(i))
+            .collect();
+        let had_any = !indices.is_empty();
+        for idx in indices.into_iter().rev() {
+            self.swap_remove_at(idx, marker_list);
         }
-        self.breaks.clear();
-        self.marker_to_idx.clear();
         if had_any {
             self.version = self.version.wrapping_add(1);
+            self.scopes.bump();
         }
     }
 
@@ -321,9 +351,21 @@ impl SoftBreakManager {
         marker_list: &MarkerList,
         cursors: &[usize],
     ) -> Vec<(usize, u16)> {
+        self.query_viewport_for_pane(start, end, marker_list, cursors, None)
+    }
+
+    pub fn query_viewport_for_pane(
+        &self,
+        start: usize,
+        end: usize,
+        marker_list: &MarkerList,
+        cursors: &[usize],
+        pane: Option<fresh_core::SplitId>,
+    ) -> Vec<(usize, u16)> {
         let mut results: Vec<(usize, u16)> = self
             .breaks
             .iter()
+            .filter(|b| b.scope.visible_in(pane))
             .filter_map(|b| {
                 let pos = b.position(marker_list);
                 if let Some(a) = &b.activation {
@@ -362,9 +404,22 @@ impl SoftBreakManager {
         cursors: &[usize],
         theme: Option<&Theme>,
     ) -> Vec<SoftBreakRender> {
+        self.query_rendered_for_pane(start, end, marker_list, cursors, theme, None)
+    }
+
+    pub fn query_rendered_for_pane(
+        &self,
+        start: usize,
+        end: usize,
+        marker_list: &MarkerList,
+        cursors: &[usize],
+        theme: Option<&Theme>,
+        pane: Option<fresh_core::SplitId>,
+    ) -> Vec<SoftBreakRender> {
         let mut results: Vec<SoftBreakRender> = self
             .breaks
             .iter()
+            .filter(|b| b.scope.visible_in(pane))
             .filter_map(|b| {
                 let pos = b.position(marker_list);
                 if let Some(a) = &b.activation {
@@ -401,8 +456,20 @@ impl SoftBreakManager {
         marker_list: &MarkerList,
         cursors: &[usize],
     ) -> Option<usize> {
+        self.divergence_for_pane(start, end, marker_list, cursors, None)
+    }
+
+    pub fn divergence_for_pane(
+        &self,
+        start: usize,
+        end: usize,
+        marker_list: &MarkerList,
+        cursors: &[usize],
+        pane: Option<fresh_core::SplitId>,
+    ) -> Option<usize> {
         self.breaks
             .iter()
+            .filter(|v| v.scope.visible_in(pane))
             .filter_map(|b| {
                 let a = b.activation.as_ref()?;
                 let pos = b.position(marker_list);

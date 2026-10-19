@@ -32,6 +32,7 @@ use fresh_core::api::{ViewTokenWire, ViewTokenWireKind};
 /// Everything that changes where rows break, other than the text itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WrapIndexGeometry {
+    pub pane_id: Option<fresh_core::SplitId>,
     pub rule: WrapRule,
     pub view_mode: CacheViewMode,
     /// Hash of the collapsed fold ranges, or 0 when nothing is folded.
@@ -1710,6 +1711,7 @@ mod tests {
 
     fn geometry(width: usize) -> WrapIndexGeometry {
         WrapIndexGeometry {
+            pane_id: None,
             fold_signature: 0,
             rule: WrapRule::Word {
                 content_width: width,
@@ -2707,6 +2709,7 @@ mod tests {
         let mut buffer = Buffer::from_bytes(text.as_bytes().to_vec(), test_fs());
         let mut index = WrapIndex::default();
         let geometry = WrapIndexGeometry {
+            pane_id: None,
             fold_signature: 0,
             rule: WrapRule::Chop { chars: 1000 },
             view_mode: CacheViewMode::Source,
@@ -3006,14 +3009,14 @@ mod tests {
 /// instead be rebuilt from scratch on every frame that alternated between two
 /// splits — the thrash this shape exists to prevent.
 ///
-/// Capped: a buffer visible in more geometries than this is vanishingly rare,
-/// and the eviction only costs a rebuild.
+/// Capped per pane, with dead panes pruned before frame reconciliation. A
+/// live pane must not evict another pane between reconciliation and paint.
 #[derive(Debug, Default)]
 pub struct WrapIndexSet {
     entries: Vec<(WrapIndexGeometry, WrapIndex)>,
 }
 
-/// Views on one buffer beyond this many distinct geometries evict the oldest.
+/// Each pane retains at most this many distinct geometries.
 const MAX_GEOMETRIES: usize = 4;
 
 impl WrapIndexSet {
@@ -3037,8 +3040,21 @@ impl WrapIndexSet {
             let entry = self.entries.remove(pos);
             self.entries.push(entry);
         } else {
-            if self.entries.len() >= MAX_GEOMETRIES {
-                self.entries.remove(0);
+            // Pane projections cannot evict another live pane between its
+            // reconciliation and paint. Keep the small history per pane.
+            if self
+                .entries
+                .iter()
+                .filter(|(g, _)| g.pane_id == geometry.pane_id)
+                .count()
+                >= MAX_GEOMETRIES
+            {
+                let oldest = self
+                    .entries
+                    .iter()
+                    .position(|(g, _)| g.pane_id == geometry.pane_id)
+                    .expect("same-pane entries counted");
+                self.entries.remove(oldest);
             }
             self.entries.push((geometry, WrapIndex::default()));
         }
@@ -3086,6 +3102,13 @@ impl WrapIndexSet {
         for (_, index) in &mut self.entries {
             index.damage_all();
         }
+    }
+
+    /// Release indices for panes no longer rendered. Unscoped consumers keep
+    /// their existing bounded cache, and each live pane keeps its own history.
+    pub(crate) fn retain_panes(&mut self, live: &std::collections::HashSet<fresh_core::SplitId>) {
+        self.entries
+            .retain(|(g, _)| g.pane_id.is_none_or(|pane| live.contains(&pane)));
     }
 
     /// Drop everything — used when the buffer is replaced wholesale.

@@ -105,6 +105,7 @@ impl VirtualTextNamespace {
 /// A piece of virtual text to render at a specific position
 #[derive(Debug, Clone)]
 pub struct VirtualText {
+    pub scope: crate::view::pane_decorations::DecorationScope,
     /// Marker tracking the position (auto-adjusts on edits)
     pub marker_id: MarkerId,
     /// The gravity the marker was created with.
@@ -212,6 +213,7 @@ pub struct VirtualTextManager {
     /// `LineWrapCache` / `WrapIndex` entries — same mechanism
     /// `SoftBreakManager` and `ConcealManager` use.
     version: u32,
+    scopes: crate::view::pane_decorations::ScopedVersions,
 }
 
 impl VirtualTextManager {
@@ -221,6 +223,7 @@ impl VirtualTextManager {
             texts: HashMap::new(),
             next_id: 0,
             version: 0,
+            scopes: crate::view::pane_decorations::ScopedVersions::default(),
         }
     }
 
@@ -237,6 +240,24 @@ impl VirtualTextManager {
         self.texts.get(&id).map(|vt| vt.marker_id)
     }
 
+    pub fn set_scope(
+        &mut self,
+        scope: crate::view::pane_decorations::DecorationScope,
+    ) -> crate::view::pane_decorations::DecorationScope {
+        std::mem::replace(&mut self.scopes.write, scope)
+    }
+
+    pub(crate) fn retain_scope_versions(
+        &mut self,
+        live: &std::collections::HashSet<fresh_core::SplitId>,
+    ) {
+        self.scopes.retain_panes(live);
+    }
+
+    pub fn version_for(&self, pane: Option<fresh_core::SplitId>) -> u32 {
+        self.scopes.version_for(pane)
+    }
+
     pub fn version(&self) -> u32 {
         self.version
     }
@@ -244,6 +265,7 @@ impl VirtualTextManager {
     #[inline]
     fn bump_version(&mut self) {
         self.version = self.version.wrapping_add(1);
+        self.scopes.bump();
     }
 
     /// Add a virtual text entry
@@ -275,6 +297,7 @@ impl VirtualTextManager {
         self.texts.insert(
             id,
             VirtualText {
+                scope: self.scopes.write.clone(),
                 marker_id,
                 gravity: MarkerGravity::Right,
                 text,
@@ -338,6 +361,7 @@ impl VirtualTextManager {
         self.texts.insert(
             id,
             VirtualText {
+                scope: self.scopes.write.clone(),
                 marker_id,
                 gravity,
                 text,
@@ -382,6 +406,7 @@ impl VirtualTextManager {
         self.texts.insert(
             id,
             VirtualText {
+                scope: self.scopes.write.clone(),
                 marker_id,
                 gravity: MarkerGravity::Right,
                 text,
@@ -434,6 +459,7 @@ impl VirtualTextManager {
         self.texts.insert(
             id,
             VirtualText {
+                scope: self.scopes.write.clone(),
                 marker_id,
                 gravity: MarkerGravity::Right,
                 text,
@@ -451,6 +477,7 @@ impl VirtualTextManager {
                 compose_only,
             },
         );
+        self.bump_version();
 
         id
     }
@@ -532,6 +559,7 @@ impl VirtualTextManager {
         self.texts.insert(
             id,
             VirtualText {
+                scope: self.scopes.write.clone(),
                 marker_id,
                 gravity: MarkerGravity::Right,
                 text,
@@ -561,6 +589,9 @@ impl VirtualTextManager {
             .texts
             .iter()
             .filter_map(|(id, vtext)| {
+                if vtext.scope != self.scopes.write {
+                    return None;
+                }
                 if vtext.string_id.as_deref() == Some(string_id) {
                     Some(*id)
                 } else {
@@ -589,6 +620,9 @@ impl VirtualTextManager {
             .texts
             .iter()
             .filter_map(|(id, vtext)| {
+                if vtext.scope != self.scopes.write {
+                    return None;
+                }
                 if let Some(ref sid) = vtext.string_id {
                     if sid.starts_with(prefix) {
                         return Some((*id, vtext.marker_id));
@@ -611,6 +645,13 @@ impl VirtualTextManager {
 
     /// Remove a virtual text entry
     pub fn remove(&mut self, marker_list: &mut MarkerList, id: VirtualTextId) -> bool {
+        if !self
+            .texts
+            .get(&id)
+            .is_some_and(|v| v.scope == self.scopes.write)
+        {
+            return false;
+        }
         if let Some(vtext) = self.texts.remove(&id) {
             marker_list.delete(vtext.marker_id);
             self.bump_version();
@@ -622,13 +663,13 @@ impl VirtualTextManager {
 
     /// Clear all virtual text entries
     pub fn clear(&mut self, marker_list: &mut MarkerList) {
-        let was_non_empty = !self.texts.is_empty();
-        for vtext in self.texts.values() {
-            marker_list.delete(vtext.marker_id);
-        }
-        self.texts.clear();
-        if was_non_empty {
-            self.bump_version();
+        let ids: Vec<_> = self
+            .texts
+            .iter()
+            .filter_map(|(id, v)| (v.scope == self.scopes.write).then_some(*id))
+            .collect();
+        for id in ids {
+            self.remove(marker_list, id);
         }
     }
 
@@ -657,6 +698,9 @@ impl VirtualTextManager {
             .texts
             .iter()
             .filter_map(|(id, vtext)| {
+                if vtext.scope != self.scopes.write {
+                    return None;
+                }
                 let pos = marker_list.get_position(vtext.marker_id)?;
                 if pos >= start && pos < end {
                     Some(*id)
@@ -763,6 +807,9 @@ impl VirtualTextManager {
             .texts
             .iter()
             .filter_map(|(id, vtext)| {
+                if vtext.scope != self.scopes.write {
+                    return None;
+                }
                 if vtext.namespace.as_ref() == Some(namespace) {
                     Some(*id)
                 } else {
@@ -798,6 +845,9 @@ impl VirtualTextManager {
             .texts
             .iter()
             .filter_map(|(id, vtext)| {
+                if vtext.scope != self.scopes.write {
+                    return None;
+                }
                 if !vtext.position.is_line() || vtext.namespace.as_ref() != Some(namespace) {
                     return None;
                 }
@@ -855,6 +905,9 @@ impl VirtualTextManager {
             .texts
             .iter()
             .filter_map(|(id, vtext)| {
+                if vtext.scope != self.scopes.write {
+                    return None;
+                }
                 if !vtext.position.is_inline() {
                     return None;
                 }
@@ -891,10 +944,20 @@ impl VirtualTextManager {
         start: usize,
         end: usize,
     ) -> Vec<(usize, &VirtualText)> {
+        self.query_lines_for_pane(marker_list, start, end, None)
+    }
+
+    pub fn query_lines_for_pane(
+        &self,
+        marker_list: &MarkerList,
+        start: usize,
+        end: usize,
+        pane: Option<fresh_core::SplitId>,
+    ) -> Vec<(usize, &VirtualText)> {
         let mut results: Vec<(usize, &VirtualText)> = self
             .texts
             .values()
-            .filter(|vtext| vtext.position.is_line())
+            .filter(|vtext| vtext.scope.visible_in(pane) && vtext.position.is_line())
             .filter_map(|vtext| {
                 let pos = marker_list.get_position(vtext.marker_id)?;
                 if pos >= start && pos < end {
@@ -920,10 +983,20 @@ impl VirtualTextManager {
         start: usize,
         end: usize,
     ) -> Vec<(usize, &VirtualText)> {
+        self.query_inline_for_pane(marker_list, start, end, None)
+    }
+
+    pub fn query_inline_for_pane(
+        &self,
+        marker_list: &MarkerList,
+        start: usize,
+        end: usize,
+        pane: Option<fresh_core::SplitId>,
+    ) -> Vec<(usize, &VirtualText)> {
         let mut results: Vec<(usize, &VirtualText)> = self
             .texts
             .values()
-            .filter(|vtext| vtext.position.is_inline())
+            .filter(|vtext| vtext.scope.visible_in(pane) && vtext.position.is_inline())
             .filter_map(|vtext| {
                 let pos = marker_list.get_position(vtext.marker_id)?;
                 if pos >= start && pos < end {

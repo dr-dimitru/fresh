@@ -507,12 +507,13 @@ setting is untouched. A mode that hides the gutter should still clear
 its value on the way out.
 
 ```typescript
-setLineNumbersDefault(bufferId: number, enabled: boolean | null): boolean;
+setLineNumbersDefault(bufferId: number, enabled: boolean | null, splitId?: number | null): boolean;
 ```
 
 | Parameter | Description |
 |-----------|-------------|
 | `enabled` | The mode's default, or `null` to withdraw it |
+| `splitId` | Target pane; omitted, the active pane. Does not move focus. |
 
 ### `setFoldIndicators`
 

@@ -21,14 +21,17 @@
 
 use crate::model::marker::{MarkerId, MarkerList};
 use crate::view::activation::ScopedActivation;
+use crate::view::pane_decorations::{DecorationScope, ScopedVersions};
 use fresh_core::api::MarkerActivation;
 use fresh_core::overlay::OverlayNamespace;
+use fresh_core::SplitId;
 use std::collections::HashMap;
 use std::ops::Range;
 
 /// A conceal range hides or replaces a byte range during rendering
 #[derive(Debug, Clone)]
 pub struct ConcealRange {
+    pub scope: DecorationScope,
     /// Namespace for bulk operations (shared with overlay namespace system)
     pub namespace: OverlayNamespace,
 
@@ -82,6 +85,7 @@ pub struct ConcealManager {
     /// data (e.g. `LineWrapCache`) fold this into their key so any mutation
     /// invalidates stale entries automatically.
     version: u32,
+    scopes: ScopedVersions,
 }
 
 impl ConcealManager {
@@ -91,12 +95,28 @@ impl ConcealManager {
             ranges: Vec::new(),
             marker_to_idx: HashMap::new(),
             version: 0,
+            scopes: ScopedVersions::default(),
         }
     }
 
     /// Monotonic version, bumped on every mutation.
     pub fn version(&self) -> u32 {
         self.version
+    }
+
+    pub fn set_scope(&mut self, scope: DecorationScope) -> DecorationScope {
+        std::mem::replace(&mut self.scopes.write, scope)
+    }
+
+    pub(crate) fn retain_scope_versions(
+        &mut self,
+        live: &std::collections::HashSet<fresh_core::SplitId>,
+    ) {
+        self.scopes.retain_panes(live);
+    }
+
+    pub fn version_for(&self, pane: Option<SplitId>) -> u32 {
+        self.scopes.version_for(pane)
     }
 
     /// Add a conceal range
@@ -130,6 +150,7 @@ impl ConcealManager {
         self.marker_to_idx.insert(start_marker, idx);
         self.marker_to_idx.insert(end_marker, idx);
         self.ranges.push(ConcealRange {
+            scope: self.scopes.write.clone(),
             namespace,
             start_marker,
             end_marker,
@@ -139,6 +160,7 @@ impl ConcealManager {
             compose_only,
         });
         self.version = self.version.wrapping_add(1);
+        self.scopes.bump();
     }
 
     /// Remove all conceal ranges in a namespace
@@ -149,7 +171,9 @@ impl ConcealManager {
             .ranges
             .iter()
             .enumerate()
-            .filter_map(|(i, r)| (&r.namespace == namespace).then_some(i))
+            .filter_map(|(i, r)| {
+                (r.scope == self.scopes.write && &r.namespace == namespace).then_some(i)
+            })
             .collect();
         if indices.is_empty() {
             return;
@@ -159,6 +183,7 @@ impl ConcealManager {
             self.swap_remove_at(idx, marker_list);
         }
         self.version = self.version.wrapping_add(1);
+        self.scopes.bump();
     }
 
     /// Remove all conceal ranges that overlap with a byte range and clean up their markers
@@ -187,6 +212,9 @@ impl ConcealManager {
             .into_iter()
             .filter(|&idx| {
                 let r = &self.ranges[idx];
+                if r.scope != self.scopes.write {
+                    return false;
+                }
                 let start = marker_list.get_position(r.start_marker).unwrap_or(0);
                 let end = marker_list.get_position(r.end_marker).unwrap_or(0);
                 start < range.end && range.start < end
@@ -201,6 +229,7 @@ impl ConcealManager {
             self.swap_remove_at(idx, marker_list);
         }
         self.version = self.version.wrapping_add(1);
+        self.scopes.bump();
     }
 
     /// Like [`remove_in_range`], but only removes ranges belonging to
@@ -231,7 +260,7 @@ impl ConcealManager {
             .into_iter()
             .filter(|&idx| {
                 let r = &self.ranges[idx];
-                if &r.namespace != namespace {
+                if r.scope != self.scopes.write || &r.namespace != namespace {
                     return false;
                 }
                 let start = marker_list.get_position(r.start_marker).unwrap_or(0);
@@ -247,22 +276,24 @@ impl ConcealManager {
             self.swap_remove_at(idx, marker_list);
         }
         self.version = self.version.wrapping_add(1);
+        self.scopes.bump();
     }
 
     /// Clear all conceal ranges and their markers
     pub fn clear(&mut self, marker_list: &mut MarkerList) {
-        let had_any = !self.ranges.is_empty();
-        for range in &self.ranges {
-            marker_list.delete(range.start_marker);
-            marker_list.delete(range.end_marker);
-            if let Some(a) = &range.activation {
-                a.release(marker_list);
-            }
+        let indices: Vec<usize> = self
+            .ranges
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| (r.scope == self.scopes.write).then_some(i))
+            .collect();
+        let had_any = !indices.is_empty();
+        for idx in indices.into_iter().rev() {
+            self.swap_remove_at(idx, marker_list);
         }
-        self.ranges.clear();
-        self.marker_to_idx.clear();
         if had_any {
             self.version = self.version.wrapping_add(1);
+            self.scopes.bump();
         }
     }
 
@@ -315,8 +346,20 @@ impl ConcealManager {
         marker_list: &MarkerList,
         cursors: &[usize],
     ) -> Option<usize> {
+        self.divergence_for_pane(start, end, marker_list, cursors, None)
+    }
+
+    pub fn divergence_for_pane(
+        &self,
+        start: usize,
+        end: usize,
+        marker_list: &MarkerList,
+        cursors: &[usize],
+        pane: Option<fresh_core::SplitId>,
+    ) -> Option<usize> {
         self.ranges
             .iter()
+            .filter(|v| v.scope.visible_in(pane))
             .filter_map(|r| {
                 let a = r.activation.as_ref()?;
                 let range = r.range(marker_list);
@@ -346,10 +389,22 @@ impl ConcealManager {
         composing: bool,
         cursors: &[usize],
     ) -> Vec<(Range<usize>, Option<&str>)> {
+        self.query_viewport_for_pane(start, end, marker_list, composing, cursors, None)
+    }
+
+    pub fn query_viewport_for_pane(
+        &self,
+        start: usize,
+        end: usize,
+        marker_list: &MarkerList,
+        composing: bool,
+        cursors: &[usize],
+        pane: Option<SplitId>,
+    ) -> Vec<(Range<usize>, Option<&str>)> {
         let mut results: Vec<(Range<usize>, Option<&str>)> = self
             .ranges
             .iter()
-            .filter(|r| composing || !r.compose_only)
+            .filter(|r| r.scope.visible_in(pane) && (composing || !r.compose_only))
             .filter_map(|r| {
                 let range = r.range(marker_list);
                 if let Some(a) = &r.activation {

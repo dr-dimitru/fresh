@@ -849,6 +849,9 @@ impl Editor {
 
         // Clear seen_byte_ranges so plugins get notified of all visible lines
         self.active_window_mut().seen_byte_ranges.remove(&buffer_id);
+        self.active_window_mut()
+            .pane_line_offers
+            .retain(|(_, buffer), _| *buffer != buffer_id);
 
         // Update the file modification time
         if let Ok(metadata) = self.authority().filesystem.metadata(&path) {
@@ -1530,6 +1533,9 @@ impl Editor {
 
         // Clear seen_byte_ranges so plugins get notified of all visible lines
         self.active_window_mut().seen_byte_ranges.remove(&buffer_id);
+        self.active_window_mut()
+            .pane_line_offers
+            .retain(|(_, buffer), _| *buffer != buffer_id);
 
         // Update the file modification time
         if let Ok(metadata) = self.authority().filesystem.metadata(path) {

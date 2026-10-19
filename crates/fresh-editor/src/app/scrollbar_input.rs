@@ -195,24 +195,6 @@ impl crate::app::window::Window {
         // what the renderer uses or `max_scroll_row` ends up wrong on
         // wide terminals with `composeWidth` set (mouse-wheel /
         // scrollbar-drag stop short of the buffer's tail).
-        let gutter_width = self.buffers.get(&buffer_id).map_or(0, |state| {
-            crate::view::viewport::gutter_width(&state.buffer)
-        });
-        let (wrap_width, grid_cols) = self
-            .split_view_states()
-            .get(&split_id)
-            .map(|vs| {
-                (
-                    vs.buffer_tab_state().viewport.effective_width(gutter_width) as usize,
-                    // Terminal-grid wrap (fresh#2649): scroll-back rows
-                    // break at the capture-time PTY width.
-                    vs.buffer_tab_state()
-                        .viewport
-                        .grid_wrap
-                        .then(|| vs.buffer_tab_state().viewport.grid_cols()),
-                )
-            })
-            .unwrap_or((80, None));
 
         // Snapshot config values up front so the mutable borrow on `self.buffers`
         // below doesn't conflict with `self.config()`.
@@ -222,6 +204,23 @@ impl crate::app::window::Window {
         // Returns (byte_position, view_line_offset) for proper positioning within wrapped lines
         // Resolved before the mutable buffer borrow below.
         let fold_ranges = fold_ranges_for_split(self, split_id, buffer_id);
+        let Some(geometry) = self
+            .buffers
+            .get(&buffer_id)
+            .zip(self.split_view_states().get(&split_id))
+            .map(|(state, split)| {
+                let view = split.buffer_tab_state();
+                crate::view::ui::split_rendering::wrap_index_geometry_for(
+                    &view.viewport,
+                    state,
+                    view.viewport.line_wrap_enabled,
+                    &view.view_mode,
+                    crate::view::wrap_index::fold_signature(&fold_ranges),
+                )
+            })
+        else {
+            return Ok(());
+        };
         let scroll_position = if let Some(state) = &mut self.buffers.get_mut(&buffer_id) {
             let scrollbar_height = scrollbar_rect.height as usize;
             if scrollbar_height == 0 {
@@ -234,7 +233,7 @@ impl crate::app::window::Window {
             if buffer_len <= large_file_threshold {
                 // When line wrapping is enabled, use visual row calculations
                 if line_wrap_enabled {
-                    let pipeline_inputs_ver = state.pipeline_inputs();
+                    let pipeline_inputs_ver = state.pipeline_inputs_for(geometry.pane_id);
                     super::scrollbar_math::scrollbar_drag_relative_visual(
                         state,
                         row,
@@ -244,10 +243,9 @@ impl crate::app::window::Window {
                         drag_start_top_byte,
                         drag_start_view_line_offset,
                         viewport_height,
-                        wrap_width,
-                        grid_cols,
                         pipeline_inputs_ver,
                         fold_ranges.clone(),
+                        geometry,
                     )
                 } else {
                     // Small file without line wrap: thumb follows mouse
@@ -409,25 +407,6 @@ impl crate::app::window::Window {
             .map(|vs| vs.buffer_tab_state().viewport.line_wrap_enabled)
             .unwrap_or(false);
 
-        let gutter_width = self.buffers.get(&buffer_id).map_or(0, |state| {
-            crate::view::viewport::gutter_width(&state.buffer)
-        });
-        let (wrap_width, grid_cols) = self
-            .split_view_states()
-            .get(&split_id)
-            .map(|vs| {
-                (
-                    vs.buffer_tab_state().viewport.effective_width(gutter_width) as usize,
-                    // Terminal-grid wrap (fresh#2649): scroll-back rows
-                    // break at the capture-time PTY width.
-                    vs.buffer_tab_state()
-                        .viewport
-                        .grid_wrap
-                        .then(|| vs.buffer_tab_state().viewport.grid_cols()),
-                )
-            })
-            .unwrap_or((80, None));
-
         // Snapshot config up front so the mutable borrow on `self.buffers`
         // below doesn't conflict with `self.config()`.
         let large_file_threshold = self.config().editor.large_file_threshold_bytes as usize;
@@ -436,6 +415,23 @@ impl crate::app::window::Window {
         // Returns (byte_position, view_line_offset) for proper positioning within wrapped lines
         // Resolved before the mutable buffer borrow below.
         let fold_ranges = fold_ranges_for_split(self, split_id, buffer_id);
+        let Some(geometry) = self
+            .buffers
+            .get(&buffer_id)
+            .zip(self.split_view_states().get(&split_id))
+            .map(|(state, split)| {
+                let view = split.buffer_tab_state();
+                crate::view::ui::split_rendering::wrap_index_geometry_for(
+                    &view.viewport,
+                    state,
+                    view.viewport.line_wrap_enabled,
+                    &view.view_mode,
+                    crate::view::wrap_index::fold_signature(&fold_ranges),
+                )
+            })
+        else {
+            return Ok(());
+        };
         let scroll_position = if let Some(state) = &mut self.buffers.get_mut(&buffer_id) {
             let buffer_len = state.buffer.len();
 
@@ -446,15 +442,14 @@ impl crate::app::window::Window {
                 if line_wrap_enabled {
                     // calculate_scrollbar_jump_visual already handles max scroll limiting
                     // and returns both byte position and view line offset
-                    let pipeline_inputs_ver = state.pipeline_inputs();
+                    let pipeline_inputs_ver = state.pipeline_inputs_for(geometry.pane_id);
                     super::scrollbar_math::scrollbar_jump_visual(
                         state,
                         ratio,
                         viewport_height,
-                        wrap_width,
-                        grid_cols,
                         pipeline_inputs_ver,
                         fold_ranges.clone(),
+                        geometry,
                     )
                 } else {
                     // Small file without line wrap: use line-based calculation for precision

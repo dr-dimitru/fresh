@@ -455,6 +455,7 @@ pub(crate) fn compute_buffer_layout(
         bracket_highlight,
         &view_data.lines,
         fold_indicators_visible,
+        viewport.pane_id,
     );
 
     let calculated_offset = view_data.first_drawn;
@@ -781,17 +782,19 @@ fn resolve_build_anchor(
     // two coordinate systems at a byte where they still agree.
     let anchor_byte = index.byte_of_row(buffer, anchor_row).byte;
     let divergence = [
-        state.conceals.earliest_cursor_divergence(
+        state.conceals.divergence_for_pane(
             line_start,
             anchor_byte,
             &state.marker_list,
             cursors,
+            viewport.pane_id,
         ),
-        state.soft_breaks.earliest_cursor_divergence(
+        state.soft_breaks.divergence_for_pane(
             line_start,
             anchor_byte,
             &state.marker_list,
             cursors,
+            viewport.pane_id,
         ),
     ]
     .into_iter()
@@ -885,6 +888,7 @@ pub(crate) fn wrap_index_geometry_for(
         }
     };
     crate::view::wrap_index::WrapIndexGeometry {
+        pane_id: viewport.pane_id,
         rule,
         view_mode: if matches!(view_mode, ViewMode::PageView) {
             CacheViewMode::Compose

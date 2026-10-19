@@ -266,7 +266,7 @@ pub(super) fn scrollbar_visual_row_counts(
         view_mode,
         crate::view::wrap_index::fold_signature(&fold_ranges),
     );
-    let inputs = state.pipeline_inputs();
+    let inputs = state.pipeline_inputs_for(viewport.pane_id);
 
     state.ensure_wrap_index(geometry, inputs, fold_ranges);
     let index = state.wrap_indices.get(&geometry).expect("just ensured");

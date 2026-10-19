@@ -2797,6 +2797,11 @@ impl Editor {
         // on the next render. This is useful when a plugin is enabled and needs to
         // process lines that were already marked as seen.
         self.active_window_mut().seen_byte_ranges.remove(&buffer_id);
+        for ((_, buffer), offer) in &mut self.active_window_mut().pane_line_offers {
+            if *buffer == buffer_id {
+                offer.seen.clear();
+            }
+        }
         // Request a render so the lines_changed hook fires
         #[cfg(feature = "plugins")]
         {

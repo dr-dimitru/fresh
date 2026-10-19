@@ -338,6 +338,21 @@ type TsCreateCompositeBufferOptions = {
 	initialFocusHunk?: number;
 };
 /**
+* Resolved dimensions for the pane offering a decoration batch.
+*/
+type PaneLayout = {
+	/**
+	* Columns available for text after page centering and gutter placement,
+	* before the end-of-line cursor reservation. May be zero in a tiny pane.
+	*/
+	textWidth: number;
+	/**
+	* Columns occupied by the resolved gutter, including its separator and
+	* indicator slot. A centered page can reclaim these from its desk margin.
+	*/
+	gutterWidth: number;
+};
+/**
 * Information about the viewport
 */
 type ViewportInfo = {
@@ -408,6 +423,8 @@ type KeyEventPayload = {
 * Plugins that need to operate on every visible buffer (multi-split
 * flash labels, syncing decorations across panes, ...) can iterate
 * this list rather than only seeing the active split's `getViewport()`.
+* A visible buffer group reports its panel leaves, not the host tab behind
+* the group. Their split identifiers target the panels without moving focus.
 */
 type SplitSnapshot = {
 	/**
@@ -451,6 +468,10 @@ type SplitSnapshot = {
 	* gutter, so it is smaller than the pane rect above.
 	*/
 	viewport: ViewportInfo;
+	/**
+	* View mode of this pane's shown buffer: "source" or "compose".
+	*/
+	viewMode: "source" | "compose";
 };
 /**
 * What `editor.splitWindow()` resolves to: the new pane, already
@@ -5645,6 +5666,17 @@ interface EditorAPI {
 	* editor.on("after_file_save", "onSave");
 	* ```
 	* 
+	* `pane_lines_changed` offers newly visible or invalidated source lines for
+	* one pane, with its reconciled `layout.textWidth` and `layout.gutterWidth`.
+	* The batch identifies its window, split, buffer, mode, text epoch, and
+	* layout generation. Use these dimensions instead of the active viewport.
+	* Decoration adds and removals for that buffer made synchronously by the
+	* handler are automatically isolated to this plugin and pane. `refreshLines`
+	* in that handler refreshes only that pane. Replies for obsolete layouts
+	* are discarded; buffer coordinates retain normal edit remapping. Do not
+	* `await` before emitting these decorations: asynchronous continuations are
+	* not bound to the batch. Other calls retain their buffer-wide behavior;
+	* unscoped clears leave pane projections alone.
 	* @param eventName - Event to subscribe to
 	* @param handlerName - Name of globalThis function to call with event data
 	*/
@@ -7412,8 +7444,9 @@ interface EditorAPI {
 	* its value on the way out.
 	* 
 	* @param enabled - The mode's default, or `null` to withdraw it
+	* @param splitId - Target pane; omitted, the active pane. Does not move focus.
 	*/
-	setLineNumbersDefault(bufferId: number, enabled: boolean | null): boolean;
+	setLineNumbersDefault(bufferId: number, enabled: boolean | null, splitId?: number | null): boolean;
 	/**
 	* Show or hide the gutter's fold indicators (`▾` / `▸`) for a buffer in
 	* the active split, the way `setLineNumbers` does for line numbers.
@@ -8692,6 +8725,20 @@ interface HookEventMap {
 		byte_start: number;
 		byte_end: number;
 		content: string;
+	};
+	/** A pane-local decoration batch. Synchronous decoration commands for its
+	* buffer are scoped to this plugin/pane, including removals and refreshes.
+	* Dimensions are captured after reconciliation; do not use getViewport()
+	* for this batch. Async continuations are not implicitly scoped. */
+	pane_lines_changed: {
+		window_id: number;
+		split_id: number;
+		buffer_id: number;
+		epoch: number;
+		layout_generation: number;
+		view_mode: "source" | "compose";
+		layout: PaneLayout;
+		lines: HookEventMap["lines_changed"]["lines"];
 	};
 	lines_changed: {
 		buffer_id: number;

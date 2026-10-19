@@ -275,6 +275,19 @@ pub enum HookArgs {
         is_composing_in_any_split: bool,
     },
 
+    /// Pane-local counterpart of LinesChanged. Its dimensions and mode are
+    /// captured after reconciliation, alongside its source coordinates.
+    PaneLinesChanged {
+        window_id: u64,
+        split_id: SplitId,
+        buffer_id: BufferId,
+        epoch: u64,
+        layout_generation: u64,
+        view_mode: String,
+        layout: crate::api::PaneLayout,
+        lines: Vec<LineInfo>,
+    },
+
     /// Prompt input changed (user typed/edited)
     PromptChanged { prompt_type: String, input: String },
 

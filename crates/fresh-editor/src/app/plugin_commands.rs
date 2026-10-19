@@ -2107,13 +2107,21 @@ impl Editor {
         &mut self,
         buffer_id: BufferId,
         enabled: Option<bool>,
+        split_id: Option<SplitId>,
     ) {
         let default_line_numbers = self.config.editor.line_numbers;
-        self.active_window_mut()
-            .with_active_split_buffer_view(buffer_id, |vs| {
-                vs.line_numbers_plugin_override = enabled;
-                vs.show_line_numbers = vs.line_numbers_visible(default_line_numbers);
-            });
+        let target = split_id
+            .map(LeafId)
+            .unwrap_or_else(|| self.effective_active_split());
+        if let Some(view) = self
+            .active_window_mut()
+            .split_view_states_mut()
+            .get_mut(&target)
+        {
+            let vs = view.ensure_buffer_state(buffer_id);
+            vs.line_numbers_plugin_override = enabled;
+            vs.show_line_numbers = vs.line_numbers_visible(default_line_numbers);
+        }
     }
 
     /// Handle SetIndentationGuide command
@@ -2144,6 +2152,9 @@ impl Editor {
     /// race where render marks lines as "seen" before the plugin has initialized.
     pub(super) fn handle_refresh_all_lines(&mut self) {
         self.active_window_mut().seen_byte_ranges.clear();
+        for offer in self.active_window_mut().pane_line_offers.values_mut() {
+            offer.seen.clear();
+        }
         #[cfg(feature = "plugins")]
         {
             self.plugin_render_requested = true;

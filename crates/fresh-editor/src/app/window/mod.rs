@@ -754,6 +754,9 @@ pub struct Window {
     /// `lines_changed` plugin-hook optimisation). Keyed by `BufferId`,
     /// follows the buffers onto Window.
     pub seen_byte_ranges: HashMap<BufferId, std::collections::HashSet<(usize, usize)>>,
+    pub(crate) pane_line_offers:
+        HashMap<(LeafId, BufferId), crate::view::pane_decorations::PaneLineOffer>,
+    pub(crate) next_pane_layout_generation: u64,
 
     /// Previous viewport states for `viewport_changed` hook detection.
     /// Stores `(top_byte, width, height)` from the end of the last
@@ -2232,8 +2235,7 @@ impl Window {
     pub fn scroll_split_by_lines(&mut self, buffer_id: BufferId, leaf_id: LeafId, delta: i32) {
         self.buffers
             .with_buffer_and_split(buffer_id, leaf_id, |state, view_state| {
-                let soft_breaks = state.collect_soft_break_positions();
-                let virtual_lines = state.collect_virtual_line_positions();
+                let (soft_breaks, virtual_lines) = state.scroll_decorations(view_state);
                 // Resolved before the mutable buffer borrow below: the
                 // row-space path needs only `&Buffer`.
                 let scroll_geometry = wrap_scroll_geometry(view_state, state);
@@ -2547,6 +2549,8 @@ impl Window {
             preview: None,
             terminal_link_hover: None,
             seen_byte_ranges: HashMap::new(),
+            pane_line_offers: HashMap::new(),
+            next_pane_layout_generation: 0,
             previous_viewports: HashMap::new(),
             same_buffer_scroll_sync: false,
             last_horizontal_sync: None,
@@ -2830,6 +2834,23 @@ impl Window {
             Some((mgr, _)) => self.pane_rects.visible(&mgr.visible_leaves()),
             None => Vec::new(),
         }
+    }
+
+    /// Visible buffer leaves, including the panels of a group instead of its
+    /// host tab. Painting, pane hooks and plugin snapshots share this list.
+    pub(crate) fn visible_buffer_panes(&self) -> Vec<(LeafId, BufferId, ratatui::layout::Rect)> {
+        let Some((mgr, _)) = self.buffers.splits() else {
+            return Vec::new();
+        };
+        let groups = self.pane_groups();
+        let mut leaves = Vec::new();
+        for (leaf, buffer) in mgr.visible_leaves() {
+            match groups.get(&leaf) {
+                Some(group) => leaves.extend(group.visible_leaves()),
+                None => leaves.push((leaf, buffer)),
+            }
+        }
+        self.pane_rects.visible(&leaves)
     }
 
     /// Lay this window's grid out offscreen, at the body this window's
@@ -5190,8 +5211,7 @@ impl Window {
 
             self.buffers
                 .with_buffer_and_split(buffer_id, split_id, |state, view_state| {
-                    let soft_breaks = state.collect_soft_break_positions();
-                    let virtual_lines = state.collect_virtual_line_positions();
+                    let (soft_breaks, virtual_lines) = state.scroll_decorations(view_state);
                     let hidden_ranges = collapsed_hidden_ranges(view_state, state);
                     let buffer = &mut state.buffer;
                     if line_offset > 0 {
@@ -5316,7 +5336,7 @@ fn wrap_scroll_geometry(
     if !view_state.viewport.line_wrap_enabled || state.wrap_indices.is_empty() {
         return None;
     }
-    let inputs = state.pipeline_inputs();
+    let inputs = state.pipeline_inputs_for(view_state.viewport.pane_id);
     let geometry = crate::view::ui::split_rendering::wrap_index_geometry_for(
         &view_state.viewport,
         state,

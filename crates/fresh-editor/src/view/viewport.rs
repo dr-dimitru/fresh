@@ -65,6 +65,8 @@ impl EnsureVisible {
 /// The viewport - what portion of the buffer is visible
 #[derive(Debug, Clone)]
 pub struct Viewport {
+    /// The pane whose decoration projection this viewport measures.
+    pub pane_id: Option<fresh_core::SplitId>,
     /// Where the viewport starts, as one coordinate.
     ///
     /// The pair it replaces — a logical-line byte plus a row offset inside that
@@ -304,6 +306,7 @@ impl Viewport {
     /// Create a new viewport
     pub fn new(width: u16, height: u16) -> Self {
         Self {
+            pane_id: None,
             anchor: ViewAnchor::default(),
             left_column: 0,
             width,

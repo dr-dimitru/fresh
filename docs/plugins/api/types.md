@@ -3391,6 +3391,25 @@ type PaneDescription = {
 };
 ```
 
+### `PaneLayout`
+
+Resolved dimensions for the pane offering a decoration batch.
+
+```typescript
+type PaneLayout = {
+  /**
+  * Columns available for text after page centering and gutter placement,
+  * before the end-of-line cursor reservation. May be zero in a tiny pane.
+  */
+  textWidth: number;
+  /**
+  * Columns occupied by the resolved gutter, including its separator and
+  * indicator slot. A centered page can reclaim these from its desk margin.
+  */
+  gutterWidth: number;
+};
+```
+
 ### `PathTranslationSpec`
 
 ```typescript
@@ -3891,6 +3910,8 @@ Per-split state surfaced to plugins via `editor.listSplits()`.
 Plugins that need to operate on every visible buffer (multi-split
 flash labels, syncing decorations across panes, ...) can iterate
 this list rather than only seeing the active split's `getViewport()`.
+A visible buffer group reports its panel leaves, not the host tab behind
+the group. Their split identifiers target the panels without moving focus.
 
 ```typescript
 type SplitSnapshot = {
@@ -3935,6 +3956,10 @@ type SplitSnapshot = {
   * gutter, so it is smaller than the pane rect above.
   */
   viewport: ViewportInfo;
+  /**
+  * View mode of this pane's shown buffer: "source" or "compose".
+  */
+  viewMode: "source" | "compose";
 };
 ```
 

@@ -698,11 +698,36 @@ pub struct ViewportInfo {
     pub height: u16,
 }
 
+/// Resolved dimensions for the pane offering a decoration batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct PaneLayout {
+    /// Columns available for text after page centering and gutter placement,
+    /// before the end-of-line cursor reservation. May be zero in a tiny pane.
+    pub text_width: u16,
+    /// Columns occupied by the resolved gutter, including its separator and
+    /// indicator slot. A centered page can reclaim these from its desk margin.
+    pub gutter_width: u16,
+}
+
+// Internal reply envelope. The runtime derives plugin ownership, never JS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneDecorationContext {
+    pub window_id: u64,
+    pub split_id: SplitId,
+    pub buffer_id: BufferId,
+    pub layout_generation: u64,
+    pub plugin_name: String,
+}
+
 /// Per-split state surfaced to plugins via `editor.listSplits()`.
 ///
 /// Plugins that need to operate on every visible buffer (multi-split
 /// flash labels, syncing decorations across panes, ...) can iterate
 /// this list rather than only seeing the active split's `getViewport()`.
+/// A visible buffer group reports its panel leaves, not the host tab behind
+/// the group. Their split identifiers target the panels without moving focus.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, rename_all = "camelCase")]
@@ -733,6 +758,10 @@ pub struct SplitSnapshot {
     /// This is the *text* viewport: it excludes the tab bar and any
     /// gutter, so it is smaller than the pane rect above.
     pub viewport: ViewportInfo,
+    /// View mode of this pane's shown buffer: "source" or "compose".
+    #[serde(default)]
+    #[ts(type = "\"source\" | \"compose\"")]
+    pub view_mode: String,
 }
 
 /// One pane, as `describeWorkspace()` reports it: what is in it, where it
@@ -3823,10 +3852,50 @@ pub struct ReplaceRegex {
     pub whole_words: bool,
 }
 
+impl PluginCommand {
+    /// Buffer targeted by a command permitted inside a pane-decoration reply.
+    pub fn decoration_buffer_id(&self) -> Option<BufferId> {
+        match self {
+            Self::AddOverlay { buffer_id, .. }
+            | Self::RemoveOverlay { buffer_id, .. }
+            | Self::ClearAllOverlays { buffer_id, .. }
+            | Self::ClearNamespace { buffer_id, .. }
+            | Self::ClearOverlaysInRange { buffer_id, .. }
+            | Self::ClearOverlaysInRangeForNamespace { buffer_id, .. }
+            | Self::AddVirtualText { buffer_id, .. }
+            | Self::AddVirtualTextStyled { buffer_id, .. }
+            | Self::RemoveVirtualText { buffer_id, .. }
+            | Self::RemoveVirtualTextsByPrefix { buffer_id, .. }
+            | Self::ClearVirtualTexts { buffer_id, .. }
+            | Self::AddVirtualLine { buffer_id, .. }
+            | Self::ClearVirtualTextNamespace { buffer_id, .. }
+            | Self::ClearVirtualLinesInRange { buffer_id, .. }
+            | Self::ClearVirtualTextsInRange { buffer_id, .. }
+            | Self::AddConceal { buffer_id, .. }
+            | Self::ClearConcealNamespace { buffer_id, .. }
+            | Self::ClearConcealsInRange { buffer_id, .. }
+            | Self::ClearConcealsInRangeForNamespace { buffer_id, .. }
+            | Self::AddSoftBreak { buffer_id, .. }
+            | Self::ClearSoftBreakNamespace { buffer_id, .. }
+            | Self::ClearSoftBreaksInRange { buffer_id, .. }
+            | Self::RefreshLines { buffer_id, .. } => Some(*buffer_id),
+            _ => None,
+        }
+    }
+}
+
 /// Plugin command - allows plugins to send commands to the editor
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub enum PluginCommand {
+    // Only the runtime creates this envelope for synchronous pane-hook replies.
+    #[ts(skip)]
+    ClearPluginPaneDecorations { plugin_name: String },
+    #[ts(skip)]
+    PaneDecoration {
+        context: PaneDecorationContext,
+        command: Box<PluginCommand>,
+    },
     /// Insert text at a position in a buffer
     InsertText {
         buffer_id: BufferId,
@@ -4239,6 +4308,8 @@ pub enum PluginCommand {
     SetLineNumbersDefault {
         buffer_id: BufferId,
         enabled: Option<bool>,
+        #[serde(default)]
+        split_id: Option<SplitId>,
     },
 
     /// Set the plugin's fold-indicator default for a buffer's view state.

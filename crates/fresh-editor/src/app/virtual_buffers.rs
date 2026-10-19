@@ -444,10 +444,16 @@ impl crate::app::window::Window {
             ));
         }
 
+        // Wholesale replacement bypasses edit/marker remapping. Retire pane
+        // generations so old replies cannot anchor into unrelated new content,
+        // even when its line byte ranges and layout dimensions are identical.
+        self.pane_line_offers
+            .retain(|(_, buffer), _| *buffer != buffer_id);
         let state = self
             .buffers
             .get_mut(&buffer_id)
             .ok_or_else(|| "Buffer not found".to_string())?;
+        state.clear_pane_decorations(None, None);
 
         // Build text and properties from entries
         let (text, properties, collected_overlays) =

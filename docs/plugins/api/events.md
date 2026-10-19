@@ -23,6 +23,18 @@ globalThis.onSave = (data) => {
 editor.on("after_file_save", "onSave");
 ```
 
+`pane_lines_changed` offers newly visible or invalidated source lines for
+one pane, with its reconciled `layout.textWidth` and `layout.gutterWidth`.
+The batch identifies its window, split, buffer, mode, text epoch, and
+layout generation. Use these dimensions instead of the active viewport.
+Decoration adds and removals for that buffer made synchronously by the
+handler are automatically isolated to this plugin and pane. `refreshLines`
+in that handler refreshes only that pane. Replies for obsolete layouts
+are discarded; buffer coordinates retain normal edit remapping. Do not
+`await` before emitting these decorations: asynchronous continuations are
+not bound to the batch. Other calls retain their buffer-wide behavior;
+unscoped clears leave pane projections alone.
+
 ```typescript
 on(eventName: string, handlerName: string): void;
 on<K extends keyof HookEventMap>(eventName: K, handler: (args: HookEventMap[K]) => boolean | void | Promise<boolean | void>): void;
@@ -377,6 +389,26 @@ render_line: {
   byte_start: number;
   byte_end: number;
   content: string;
+};
+```
+
+#### `pane_lines_changed`
+
+A pane-local decoration batch. Synchronous decoration commands for its
+buffer are scoped to this plugin/pane, including removals and refreshes.
+Dimensions are captured after reconciliation; do not use getViewport()
+for this batch. Async continuations are not implicitly scoped.
+
+```typescript
+pane_lines_changed: {
+  window_id: number;
+  split_id: number;
+  buffer_id: number;
+  epoch: number;
+  layout_generation: number;
+  view_mode: "source" | "compose";
+  layout: PaneLayout;
+  lines: HookEventMap["lines_changed"]["lines"];
 };
 ```
 
