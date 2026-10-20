@@ -11058,12 +11058,15 @@ impl QuickJsBackend {
                     call_handler(&ctx, &handler.handler_name, event_data);
                     // The queue is shared by every plugin's context, so it can
                     // hold jobs queued before this emit, by any plugin. They
-                    // are not part of the batch: drain them unscoped.
+                    // are not part of the batch: drain them without its pane
+                    // or its epoch.
                     let pane = self.current_hook_pane.replace(None);
+                    let epoch = self.current_hook_epoch.replace(None);
                     run_pending_jobs_checked(
                         &ctx,
                         &format!("emit handler {}", handler.handler_name),
                     );
+                    self.current_hook_epoch.set(epoch);
                     self.current_hook_pane.replace(pane);
                 });
             }
@@ -12347,6 +12350,58 @@ mod tests {
         }
         assert_eq!(scoped, vec![("alpha".to_string(), "alpha-ns".to_string())]);
         assert_eq!(plain, vec!["beta-ns".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn hook_epoch_does_not_reach_another_plugins_queued_job() {
+        // A job queued before this emit computed its offsets against some
+        // other buffer version. Stamping it with the hook's epoch would tell
+        // the editor its offsets are current and skip the remap.
+        let (mut backend, rx) = create_test_backend();
+        backend
+            .execute_js(
+                r#"
+                const editor = getEditor();
+                Promise.resolve().then(() => editor.addConceal(1, "beta-ns", 0, 1, null));
+            "#,
+                "beta.js",
+            )
+            .unwrap();
+        backend
+            .execute_js(
+                r#"
+                const editor = getEditor();
+                globalThis.onLines = function(data) {
+                    editor.addConceal(data.buffer_id, "alpha-ns", 0, 1, null);
+                };
+                editor.on("lines_changed", "onLines");
+            "#,
+                "alpha.js",
+            )
+            .unwrap();
+        while rx.try_recv().is_ok() {}
+
+        let event_data = serde_json::json!({ "buffer_id": 1, "epoch": 7, "lines": [] });
+        backend
+            .emit_to("lines_changed", &event_data, None)
+            .await
+            .unwrap();
+        let mut epochs = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            if let PluginCommand::AddConceal {
+                namespace, epoch, ..
+            } = cmd
+            {
+                epochs.push((namespace.as_str().to_string(), epoch));
+            }
+        }
+        assert_eq!(
+            epochs,
+            vec![
+                ("alpha-ns".to_string(), Some(7)),
+                ("beta-ns".to_string(), None)
+            ]
+        );
     }
 
     #[tokio::test]
