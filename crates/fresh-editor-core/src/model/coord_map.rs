@@ -144,6 +144,22 @@ impl CoordMap {
     /// or barriered) — the caller should force a full refresh rather than act
     /// on a guessed position.
     pub fn map(&self, coord: usize, from_version: u64) -> Option<usize> {
+        self.map_with_gravity(coord, from_version, true)
+    }
+
+    /// Remap a left-gravity ownership boundary. Unlike a source character,
+    /// it stays before text inserted exactly at the captured boundary, so a
+    /// delayed text-layout reply still owns a newly inserted block prefix.
+    pub fn map_left(&self, coord: usize, from_version: u64) -> Option<usize> {
+        self.map_with_gravity(coord, from_version, false)
+    }
+
+    fn map_with_gravity(
+        &self,
+        coord: usize,
+        from_version: u64,
+        right_gravity: bool,
+    ) -> Option<usize> {
         if from_version < self.min_mappable {
             return None;
         }
@@ -152,7 +168,7 @@ impl CoordMap {
             if d.version <= from_version {
                 continue;
             }
-            c = apply_delta(c, d.pos, d.removed, d.inserted);
+            c = apply_delta(c, d.pos, d.removed, d.inserted, right_gravity);
         }
         Some(c)
     }
@@ -176,7 +192,13 @@ impl CoordMap {
 /// coordinate strictly inside the replaced span would be mapped to a different
 /// byte than its own auto-shifting marker, breaking the "exact same shift math"
 /// guarantee for stale coordinates landing inside a bulk replacement.
-fn apply_delta(coord: usize, pos: usize, removed: usize, inserted: usize) -> usize {
+fn apply_delta(
+    coord: usize,
+    pos: usize,
+    removed: usize,
+    inserted: usize,
+    right_gravity: bool,
+) -> usize {
     let (removed, inserted) = if removed > 0 && inserted > 0 {
         if inserted >= removed {
             (0, inserted - removed)
@@ -195,7 +217,7 @@ fn apply_delta(coord: usize, pos: usize, removed: usize, inserted: usize) -> usi
             c = pos;
         }
     }
-    if inserted > 0 && c >= pos {
+    if inserted > 0 && (c > pos || (right_gravity && c == pos)) {
         c += inserted;
     }
     c
@@ -204,6 +226,45 @@ fn apply_delta(coord: usize, pos: usize, removed: usize, inserted: usize) -> usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn left_mapping_matches_point_and_span_anchors_through_edits() {
+        use crate::model::marker::MarkerList;
+        let mut markers = MarkerList::new();
+        let positions = [0, 5, 9, 10, 15];
+        let points: Vec<_> = positions
+            .iter()
+            .map(|position| markers.create_left_gravity(*position))
+            .collect();
+        let span = markers.create_span_left_gravity(5, 15);
+        let mut map = CoordMap::default();
+        for (version, (pos, removed, inserted)) in
+            [(5, 0, 100), (0, 0, 4), (10, 12, 0), (0, 3, 0), (4, 2, 5)]
+                .into_iter()
+                .enumerate()
+        {
+            map.record_replace(version as u64 + 1, pos, removed, inserted);
+            if inserted >= removed {
+                markers.adjust_for_insert(pos, inserted - removed);
+            } else {
+                markers.adjust_for_delete(pos, removed - inserted);
+            }
+            for (position, point) in positions.iter().zip(&points) {
+                assert_eq!(map.map_left(*position, 0), markers.get_position(*point));
+            }
+            let (_, start, end) = markers
+                .query_range(0, 1000)
+                .into_iter()
+                .find(|(id, _, _)| *id == span)
+                .unwrap();
+            assert_eq!(
+                (Some(start), Some(end)),
+                (map.map_left(5, 0), map.map_left(15, 0))
+            );
+        }
+        map.record_barrier(100);
+        assert_eq!(map.map_left(5, 0), None);
+    }
 
     #[test]
     fn identity_when_no_edits() {

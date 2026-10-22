@@ -855,6 +855,85 @@ impl Editor {
         }
     }
 
+    pub(super) fn handle_replace_text_layout_ranges(
+        &mut self,
+        buffer_id: BufferId,
+        namespace: OverlayNamespace,
+        policy: u64,
+        covered: Vec<fresh_core::api::TextLayoutRange>,
+        reflowed: Vec<fresh_core::api::TextLayoutRange>,
+        epoch: Option<u64>,
+    ) {
+        use crate::view::pane_decorations::DecorationScope;
+        let result = self.active_window_mut().buffer_state_mut(buffer_id).and_then(|state| {
+            if !matches!(state.text_layout_ranges.scope(), DecorationScope::Pane { .. }) {
+                return None;
+            }
+            // Map every coordinate before any retirement or policy mutation.
+            let map = |ranges: Vec<fresh_core::api::TextLayoutRange>| -> Option<Vec<std::ops::Range<usize>>> {
+                ranges.into_iter().map(|range| {
+                    // Ownership follows left-gravity span boundaries rather
+                    // than right-gravity source-character coordinates.
+                    let (start, end) = match epoch {
+                        Some(epoch) => (state.coord_map.map_left(range.start, epoch)?, state.coord_map.map_left(range.end, epoch)?),
+                        None => (range.start, range.end),
+                    };
+                    (start <= end && end <= state.buffer.len()).then_some(start..end)
+                }).collect()
+            };
+            let covered = map(covered)?;
+            let reflowed = map(reflowed)?;
+            let scope = state.text_layout_ranges.scope().clone();
+            let retired = state.text_layout_ranges.replace(
+                &mut state.marker_list, &namespace, policy, &covered, &reflowed,
+            )?;
+            if retired.policy_changed {
+                state.conceals.clear_namespace(&namespace, &mut state.marker_list);
+                state.soft_breaks.clear_namespace(&namespace, &mut state.marker_list);
+            } else {
+                for range in &retired.ranges {
+                    let end = range.end.max(range.start.saturating_add(1));
+                    state.conceals.remove_in_range_for_namespace(&namespace, &(range.start..end), &mut state.marker_list);
+                    state.soft_breaks.remove_in_range_for_namespace(&namespace, range.start, end, &mut state.marker_list);
+                }
+            }
+            Some((scope, retired.policy_changed || retired.escaped))
+        });
+        if let Some((DecorationScope::Pane { split_id, .. }, true)) = result {
+            if let Some(offer) = self
+                .active_window_mut()
+                .pane_line_offers
+                .get_mut(&(LeafId(split_id), buffer_id))
+            {
+                // Retired records are already gone. This one re-offer cannot
+                // re-arm itself on the same old projection.
+                offer.seen = Default::default();
+            }
+            self.request_plugin_render();
+        }
+    }
+
+    pub(super) fn handle_invalidate_text_layout(
+        &mut self,
+        plugin_name: &str,
+        namespace: &OverlayNamespace,
+    ) {
+        // A config change applies to inactive windows too. Only this plugin's
+        // matching namespace is cleared; no active-pane inference or focus move.
+        for window in self.windows.values_mut() {
+            for (buffer_id, state) in &mut window.buffers {
+                for pane in state.invalidate_text_layout_namespace(plugin_name, namespace) {
+                    if let Some(offer) =
+                        window.pane_line_offers.get_mut(&(LeafId(pane), *buffer_id))
+                    {
+                        offer.seen = Default::default();
+                    }
+                }
+            }
+        }
+        self.request_plugin_render();
+    }
+
     // ==================== Fold Commands ====================
 
     /// Handle AddFold command — register a collapsed fold range for the

@@ -270,6 +270,28 @@ impl SoftBreakManager {
 
     /// Remove all soft breaks that fall within a byte range and clean up their markers
     pub fn remove_in_range(&mut self, start: usize, end: usize, marker_list: &mut MarkerList) {
+        self.remove_in_range_impl(None, start, end, marker_list);
+    }
+
+    /// Retire one text-layout namespace without removing code/table or other
+    /// plugins' breaks. Uses the same indexed query as the unfiltered clear.
+    pub fn remove_in_range_for_namespace(
+        &mut self,
+        namespace: &OverlayNamespace,
+        start: usize,
+        end: usize,
+        marker_list: &mut MarkerList,
+    ) {
+        self.remove_in_range_impl(Some(namespace), start, end, marker_list);
+    }
+
+    fn remove_in_range_impl(
+        &mut self,
+        namespace: Option<&OverlayNamespace>,
+        start: usize,
+        end: usize,
+        marker_list: &mut MarkerList,
+    ) {
         // O(log N + k): query the marker tree for points in `[start, end]`,
         // map back to entries, verify position is in `[start, end)` (the
         // marker tree query is closed; soft-break membership is half-open).
@@ -290,7 +312,10 @@ impl SoftBreakManager {
                 }
             })
             .collect();
-        to_remove.retain(|&i| self.breaks[i].scope == self.scopes.write);
+        to_remove.retain(|&i| {
+            self.breaks[i].scope == self.scopes.write
+                && namespace.is_none_or(|namespace| &self.breaks[i].namespace == namespace)
+        });
         to_remove.sort_unstable();
         to_remove.dedup();
         if to_remove.is_empty() {

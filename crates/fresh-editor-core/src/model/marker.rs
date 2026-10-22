@@ -124,6 +124,18 @@ impl MarkerList {
         id
     }
 
+    /// Create an edit-owned span whose start stays before text inserted at
+    /// that exact boundary. Text-layout ownership must include a newly pasted
+    /// prefix even when a bounded offer stops before the former block head.
+    pub fn create_span_left_gravity(&mut self, start: usize, end: usize) -> MarkerId {
+        let tree_id = self
+            .tree
+            .insert_left_gravity(start as u64, end.max(start) as u64);
+        let id = MarkerId(tree_id);
+        self._affinity_map.insert(id, true);
+        id
+    }
+
     /// Create the three markers an overlay needs — a start point, an end
     /// point and a span covering both — for many ranges at once.
     ///

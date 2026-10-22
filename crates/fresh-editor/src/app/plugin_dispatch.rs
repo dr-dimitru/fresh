@@ -939,6 +939,24 @@ impl Editor {
                     buffer_id, namespace, position, indent, epoch, activation, prefix,
                 );
             }
+            PluginCommand::ReplaceTextLayoutRanges {
+                buffer_id,
+                namespace,
+                policy,
+                covered,
+                reflowed,
+                epoch,
+            } => {
+                self.handle_replace_text_layout_ranges(
+                    buffer_id, namespace, policy, covered, reflowed, epoch,
+                );
+            }
+            PluginCommand::InvalidateTextLayout {
+                plugin_name,
+                namespace,
+            } => {
+                self.handle_invalidate_text_layout(&plugin_name, &namespace);
+            }
             PluginCommand::ClearSoftBreakNamespace {
                 buffer_id,
                 namespace,

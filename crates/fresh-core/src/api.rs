@@ -711,6 +711,27 @@ pub struct PaneLayout {
     pub gutter_width: u16,
 }
 
+/// A half-open buffer range, in UTF-8 byte offsets, for text-layout ownership.
+/// These coordinates are not prose budget units or display columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct TextLayoutRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[cfg(feature = "plugins")]
+impl<'js> fresh_js::FromJs<'js> for TextLayoutRange {
+    fn from_js(_ctx: &fresh_js::Ctx<'js>, value: fresh_js::Value<'js>) -> fresh_js::Result<Self> {
+        fresh_js::serde::from_value(value).map_err(|error| fresh_js::Error::FromJs {
+            from: "object",
+            to: "TextLayoutRange",
+            message: Some(error.to_string()),
+        })
+    }
+}
+
 // Internal reply envelope. The runtime derives plugin ownership, never JS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaneDecorationContext {
@@ -3879,6 +3900,7 @@ impl PluginCommand {
             | Self::AddSoftBreak { buffer_id, .. }
             | Self::ClearSoftBreakNamespace { buffer_id, .. }
             | Self::ClearSoftBreaksInRange { buffer_id, .. }
+            | Self::ReplaceTextLayoutRanges { buffer_id, .. }
             | Self::RefreshLines { buffer_id, .. } => Some(*buffer_id),
             _ => None,
         }
@@ -4699,6 +4721,21 @@ pub enum PluginCommand {
         epoch: Option<u64>,
     },
 
+    /// Replace edit-anchored ownership of a namespace's pane-local text layout.
+    ReplaceTextLayoutRanges {
+        buffer_id: BufferId,
+        namespace: OverlayNamespace,
+        policy: u64,
+        covered: Vec<TextLayoutRange>,
+        reflowed: Vec<TextLayoutRange>,
+        epoch: Option<u64>,
+    },
+    // Plugin identity comes from the runtime, not a script-supplied argument.
+    #[ts(skip)]
+    InvalidateTextLayout {
+        plugin_name: String,
+        namespace: OverlayNamespace,
+    },
     /// Refresh lines for a buffer (clear seen_lines cache to re-trigger lines_changed hook)
     RefreshLines { buffer_id: BufferId },
 

@@ -265,7 +265,11 @@ impl ConcealManager {
                 }
                 let start = marker_list.get_position(r.start_marker).unwrap_or(0);
                 let end = marker_list.get_position(r.end_marker).unwrap_or(0);
-                start < range.end && range.start < end
+                // A deleted conceal may collapse to a point. Retire its
+                // anchors too, including at byte zero, rather than leaking
+                // invisible entries after a layout block was removed.
+                (start < range.end && range.start < end)
+                    || (start == end && range.start <= start && start < range.end)
             })
             .collect();
         if to_remove.is_empty() {

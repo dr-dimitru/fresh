@@ -24,7 +24,7 @@ use fresh_core::api::{
     JsTextPropertyEntry, KeyEventPayload, LanguagePackConfig, LayoutHints, LineDiffHunk,
     LspServerPackConfig, OverlayColorSpec, OverlayOptions, PaneLayout, PluginAnimationEdge,
     PluginAnimationKind, ProcessLimitsPackConfig, RemoteBackendInfo, ReplaceResult, ScreenSize,
-    ScrollbarMarker, SearchTakeResult, SpawnResult, SplitSnapshot, TerminalResult,
+    ScrollbarMarker, SearchTakeResult, SpawnResult, SplitSnapshot, TerminalResult, TextLayoutRange,
     TextPropertiesAtCursor, TokenColor, TsHighlightSpan, ViewTokenStyle, ViewTokenWire,
     ViewTokenWireKind, ViewportInfo, VirtualBufferResult, WindowInfo,
 };
@@ -62,6 +62,7 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         "CursorInfo" => Some(decl_with_docs::<CursorInfo>(&cfg)),
         "ViewportInfo" => Some(decl_with_docs::<ViewportInfo>(&cfg)),
         "PaneLayout" => Some(decl_with_docs::<PaneLayout>(&cfg)),
+        "TextLayoutRange" => Some(decl_with_docs::<TextLayoutRange>(&cfg)),
         "ScreenSize" => Some(decl_with_docs::<ScreenSize>(&cfg)),
         "KeyEventPayload" => Some(decl_with_docs::<KeyEventPayload>(&cfg)),
         "SplitSnapshot" => Some(decl_with_docs::<SplitSnapshot>(&cfg)),
@@ -369,6 +370,7 @@ const DEPENDENCY_TYPES: &[&str] = &[
     "TsSyntaxRegion",                  // Used by setSyntaxRegions
     "TsCreateCompositeBufferOptions",  // Options for createCompositeBuffer
     "PaneLayout",                      // Resolved pane decoration dimensions
+    "TextLayoutRange",                 // Edit-anchored text-layout ownership
     "ViewportInfo",                    // Used by plugins for viewport queries
     "ScreenSize",                      // Used by editor.getScreenSize()
     "KeyEventPayload",                 // Used by editor.getNextKey()

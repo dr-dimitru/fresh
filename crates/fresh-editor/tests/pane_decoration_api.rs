@@ -210,6 +210,10 @@ registerHandler("measureVirtualReplace", () => {
   editor.setStatus("OK");
 });
 editor.registerCommand("Measure virtual replace", "Replace measured panel content", "measureVirtualReplace", null);
+registerHandler("measureLayoutOutside", () => {
+  editor.insertAtCursor("outside=" + editor.replaceTextLayoutRanges(editor.getActiveBufferId(), "flow", 1, [], []));
+});
+editor.registerCommand("Measure layout outside", "Check explicit pane-only layout ownership", "measureLayoutOutside", null);
 "#).unwrap();
     let path = temp.path().join("measure.txt");
     std::fs::write(&path, "MEASURE\nIDENTITY\nLEGACY\n").unwrap();
@@ -493,5 +497,139 @@ fn retargeted_pane_rejects_old_buffer_mutation_and_nested_wrappers() {
             })
             .is_err(),
         "nested envelopes must be rejected before dispatch"
+    );
+}
+
+#[cfg(feature = "plugins")]
+#[test]
+fn text_layout_api_rejects_calls_outside_a_synchronous_pane_hook() {
+    let (mut h, _temp) = pane_api_harness();
+    h.run_palette_command("Measure layout outside").unwrap();
+    h.wait_for_prompt_closed().unwrap();
+    h.wait_for_screen_contains("outside=false").unwrap();
+}
+
+#[cfg(feature = "plugins")]
+#[test]
+fn text_layout_ownership_maps_epochs_and_rejects_unscoped_or_stale_commands() {
+    use fresh_core::api::{PaneDecorationContext, PluginCommand, TextLayoutRange};
+    let (mut h, _temp) = pane_api_harness();
+    let screen = h.screen_to_string();
+    let identity = |prefix: char| {
+        screen
+            .split_whitespace()
+            .find_map(|word| {
+                word.strip_prefix(prefix)
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .unwrap()
+    };
+    let context = PaneDecorationContext {
+        window_id: identity('W'),
+        split_id: SplitId(identity('S') as usize),
+        buffer_id: fresh_core::BufferId(identity('B') as usize),
+        layout_generation: identity('G'),
+        plugin_name: "measure".into(),
+    };
+    let buffer_id = context.buffer_id;
+    let epoch = h.editor().active_state().buffer.version();
+    let count = |h: &crate::common::harness::EditorTestHarness| {
+        h.editor()
+            .active_state()
+            .marker_list
+            .query_range(0, 10000)
+            .len()
+    };
+    let command = |policy, epoch, reflowed| PluginCommand::ReplaceTextLayoutRanges {
+        buffer_id,
+        namespace: OverlayNamespace::from_string("flow-test".into()),
+        policy,
+        covered: vec![TextLayoutRange { start: 0, end: 7 }],
+        reflowed,
+        epoch,
+    };
+    let span = || vec![TextLayoutRange { start: 0, end: 7 }];
+    let before = count(&h);
+    h.editor_mut()
+        .handle_plugin_command(command(1, Some(epoch), span()))
+        .unwrap();
+    assert_eq!(
+        count(&h),
+        before,
+        "unscoped ownership must not be installed"
+    );
+
+    h.editor_mut()
+        .handle_plugin_command(PluginCommand::PaneDecoration {
+            context: context.clone(),
+            command: Box::new(command(1, Some(epoch), span())),
+        })
+        .unwrap();
+    assert_eq!(count(&h), before + 1);
+    h.type_text("xx").unwrap();
+    h.editor_mut().sync_plugin_runtime();
+    let before = count(&h);
+    let mut obsolete = context.clone();
+    obsolete.layout_generation += 1000;
+    h.editor_mut()
+        .handle_plugin_command(PluginCommand::PaneDecoration {
+            context: obsolete,
+            command: Box::new(command(2, Some(epoch), vec![])),
+        })
+        .unwrap();
+    assert_eq!(
+        count(&h),
+        before,
+        "stale generation must not retire current layout"
+    );
+
+    h.editor_mut()
+        .handle_plugin_command(PluginCommand::PaneDecoration {
+            context: context.clone(),
+            command: Box::new(command(1, Some(epoch), vec![])),
+        })
+        .unwrap();
+    assert_eq!(
+        count(&h),
+        before - 1,
+        "old coordinates must map to the shifted span"
+    );
+    let boundary_before = h
+        .editor()
+        .active_state()
+        .marker_list
+        .query_range(0, 0)
+        .len();
+    h.editor_mut()
+        .handle_plugin_command(PluginCommand::PaneDecoration {
+            context: context.clone(),
+            command: Box::new(command(1, Some(epoch), span())),
+        })
+        .unwrap();
+    assert_eq!(
+        h.editor()
+            .active_state()
+            .marker_list
+            .query_range(0, 0)
+            .len(),
+        boundary_before + 1,
+        "stale ownership must include a newly inserted source prefix"
+    );
+    let current = h.editor().active_state().buffer.version();
+    h.editor_mut()
+        .active_state_mut()
+        .coord_map
+        .record_barrier(current);
+    let before = count(&h);
+    h.editor_mut()
+        .handle_plugin_command(PluginCommand::PaneDecoration {
+            context,
+            command: Box::new(command(2, Some(epoch), vec![])),
+        })
+        .unwrap();
+    assert_eq!(
+        count(&h),
+        before,
+        "unmappable epochs must not partially clear ownership"
     );
 }

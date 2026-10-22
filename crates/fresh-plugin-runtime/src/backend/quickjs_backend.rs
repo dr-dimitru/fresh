@@ -5038,6 +5038,68 @@ impl JsEditorApi {
         .is_ok()
     }
 
+    #[plugin_api(section = "Conceals")]
+    /// Replace ownership of a namespace's pane-local conceal/soft-break layout.
+    /// Call synchronously inside `pane_lines_changed`, before drawing the new
+    /// decorations. Outside a matching pane hook this returns false.
+    /// `covered` is the actual union of offered source ranges, not a bounding
+    /// box across gaps. `reflowed` lists the complete blocks laid out by this
+    /// batch, wholly within that coverage. All coordinates are UTF-8 byte
+    /// offsets; a zero-length covered range can name an empty source line.
+    /// The host uses indexed, edit-anchored spans to retire intersecting old
+    /// layouts, including joins starting outside the offer. A changed `policy`
+    /// token clears that pane's old namespace, including offscreen content.
+    /// Missing old coverage is re-offered once. Other panes, plugins and
+    /// namespaces are untouched. Captured range boundaries remap with left
+    /// gravity so text inserted at the block head remains owned. Pane-generation
+    /// validation matches other synchronous pane decoration commands.
+    /// @param policy - Nonnegative integer identifying the effective layout policy
+    /// @returns Whether the command was queued, not whether it has been applied
+    pub fn replace_text_layout_ranges(
+        &self,
+        buffer_id: u32,
+        namespace: String,
+        policy: u64,
+        covered: Vec<fresh_core::api::TextLayoutRange>,
+        reflowed: Vec<fresh_core::api::TextLayoutRange>,
+    ) -> bool {
+        if self
+            .current_hook_pane
+            .borrow()
+            .as_ref()
+            .is_none_or(|context| context.buffer_id.0 != buffer_id as usize)
+        {
+            return false;
+        }
+        self.send_scoped(
+            buffer_id,
+            PluginCommand::ReplaceTextLayoutRanges {
+                buffer_id: BufferId(buffer_id as usize),
+                namespace: OverlayNamespace::from_string(namespace),
+                policy,
+                covered,
+                reflowed,
+                epoch: self.hook_epoch_for(buffer_id),
+            },
+        )
+        .is_ok()
+    }
+
+    /// Invalidate this plugin's pane-local text-layout namespace after a policy
+    /// change. Clears its conceal/soft-break layout and ownership spans across
+    /// buffers and windows, including offscreen content, then offers affected
+    /// panes again. Does not move focus or clear sibling namespaces/plugins.
+    /// Use for configuration changes, not for every scroll/frame. Ownership is
+    /// derived by the runtime; scripts cannot choose another plugin's owner.
+    pub fn invalidate_text_layout(&self, namespace: String) -> bool {
+        self.command_sender
+            .send(PluginCommand::InvalidateTextLayout {
+                plugin_name: self.plugin_name.clone(),
+                namespace: OverlayNamespace::from_string(namespace),
+            })
+            .is_ok()
+    }
+
     #[plugin_api(section = "Text Measurement")]
     /// Display width of a single Unicode code point, in terminal columns
     /// (0 for control/zero-width, 2 for CJK/fullwidth and most emoji, else 1).

@@ -4,6 +4,18 @@ use std::collections::HashMap;
 use std::mem;
 use std::rc::{Rc, Weak};
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static QUERY_NODES_VISITED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Deterministic query traversal work. Debug-only; no release profiling/logging cost.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn query_nodes_visited() -> u64 {
+    QUERY_NODES_VISITED.with(std::cell::Cell::get)
+}
+
 /// Use a simple u64 for marker IDs
 pub type MarkerId = u64;
 
@@ -880,6 +892,8 @@ impl IntervalTree {
             None => return,
         };
 
+        #[cfg(debug_assertions)]
+        QUERY_NODES_VISITED.with(|visits| visits.set(visits.get() + 1));
         Node::push_delta(node_rc);
         let node = node_rc.borrow();
 

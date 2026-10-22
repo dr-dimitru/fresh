@@ -353,6 +353,14 @@ type PaneLayout = {
 	gutterWidth: number;
 };
 /**
+* A half-open buffer range, in UTF-8 byte offsets, for text-layout ownership.
+* These coordinates are not prose budget units or display columns.
+*/
+type TextLayoutRange = {
+	start: number;
+	end: number;
+};
+/**
 * Information about the viewport
 */
 type ViewportInfo = {
@@ -6629,6 +6637,34 @@ interface EditorAPI {
 	* Clear all conceal ranges that overlap with a byte range
 	*/
 	clearConcealsInRange(bufferId: number, start: number, end: number): boolean;
+	/**
+	* Replace ownership of a namespace's pane-local conceal/soft-break layout.
+	* Call synchronously inside `pane_lines_changed`, before drawing the new
+	* decorations. Outside a matching pane hook this returns false.
+	* `covered` is the actual union of offered source ranges, not a bounding
+	* box across gaps. `reflowed` lists the complete blocks laid out by this
+	* batch, wholly within that coverage. All coordinates are UTF-8 byte
+	* offsets; a zero-length covered range can name an empty source line.
+	* The host uses indexed, edit-anchored spans to retire intersecting old
+	* layouts, including joins starting outside the offer. A changed `policy`
+	* token clears that pane's old namespace, including offscreen content.
+	* Missing old coverage is re-offered once. Other panes, plugins and
+	* namespaces are untouched. Captured range boundaries remap with left
+	* gravity so text inserted at the block head remains owned. Pane-generation
+	* validation matches other synchronous pane decoration commands.
+	* @param policy - Nonnegative integer identifying the effective layout policy
+	* @returns Whether the command was queued, not whether it has been applied
+	*/
+	replaceTextLayoutRanges(bufferId: number, namespace: string, policy: number, covered: TextLayoutRange[], reflowed: TextLayoutRange[]): boolean;
+	/**
+	* Invalidate this plugin's pane-local text-layout namespace after a policy
+	* change. Clears its conceal/soft-break layout and ownership spans across
+	* buffers and windows, including offscreen content, then offers affected
+	* panes again. Does not move focus or clear sibling namespaces/plugins.
+	* Use for configuration changes, not for every scroll/frame. Ownership is
+	* derived by the runtime; scripts cannot choose another plugin's owner.
+	*/
+	invalidateTextLayout(namespace: string): boolean;
 	/**
 	* Display width of a single Unicode code point, in terminal columns
 	* (0 for control/zero-width, 2 for CJK/fullwidth and most emoji, else 1).

@@ -4086,6 +4086,18 @@ type TerminalResult = {
 };
 ```
 
+### `TextLayoutRange`
+
+A half-open buffer range, in UTF-8 byte offsets, for text-layout ownership.
+These coordinates are not prose budget units or display columns.
+
+```typescript
+type TextLayoutRange = {
+  start: number;
+  end: number;
+};
+```
+
 ### `TextPropertiesAtCursor`
 
 Result of getTextPropertiesAtCursor - array of property objects

@@ -291,6 +291,7 @@ pub struct EditorState {
 
     /// Soft break points for marker-based line wrapping during rendering
     pub soft_breaks: SoftBreakManager,
+    pub(crate) text_layout_ranges: crate::view::text_layout_ranges::TextLayoutRanges,
     pane_decoration_scopes:
         std::collections::HashSet<crate::view::pane_decorations::DecorationScope>,
 
@@ -540,6 +541,7 @@ impl EditorState {
             virtual_texts: VirtualTextManager::new(),
             conceals: ConcealManager::new(),
             soft_breaks: SoftBreakManager::new(),
+            text_layout_ranges: Default::default(),
             pane_decoration_scopes: Default::default(),
             popups: PopupManager::new(),
             margins: MarginManager::new(),
@@ -904,6 +906,7 @@ impl EditorState {
         self.overlays.set_scope(scope.clone());
         self.virtual_texts.set_scope(scope.clone());
         self.soft_breaks.set_scope(scope.clone());
+        self.text_layout_ranges.set_scope(scope.clone());
         self.conceals.set_scope(scope)
     }
 
@@ -934,9 +937,38 @@ impl EditorState {
             self.soft_breaks.clear(&mut self.marker_list);
             self.virtual_texts.clear(&mut self.marker_list);
             self.overlays.clear(&mut self.marker_list);
+            self.text_layout_ranges.clear_scope(&mut self.marker_list);
             self.set_decoration_scope(old);
             self.pane_decoration_scopes.remove(&scope);
         }
+    }
+
+    /// A configuration policy change invalidates this plugin's namespace in
+    /// every pane of this buffer, without touching code/table or sibling state.
+    pub(crate) fn invalidate_text_layout_namespace(
+        &mut self,
+        plugin: &str,
+        namespace: &fresh_core::overlay::OverlayNamespace,
+    ) -> Vec<fresh_core::SplitId> {
+        use crate::view::pane_decorations::DecorationScope;
+        let scopes: Vec<_> = self.pane_decoration_scopes.iter().filter(|scope| {
+            matches!(scope, DecorationScope::Pane { plugin_name, .. } if plugin_name == plugin)
+        }).cloned().collect();
+        let mut panes = Vec::new();
+        for scope in scopes {
+            if let DecorationScope::Pane { split_id, .. } = &scope {
+                panes.push(*split_id);
+            }
+            let old = self.set_decoration_scope(scope);
+            self.conceals
+                .clear_namespace(namespace, &mut self.marker_list);
+            self.soft_breaks
+                .clear_namespace(namespace, &mut self.marker_list);
+            self.text_layout_ranges
+                .clear_namespace(namespace, &mut self.marker_list);
+            self.set_decoration_scope(old);
+        }
+        panes
     }
 
     /// Prune invisible/dead projection owners before reconciliation. Versions
@@ -2379,6 +2411,24 @@ mod tests {
                 0,
             );
         }
+        // Ownership spans must share the same teardown, not merely disappear
+        // from rendering when a pane/plugin is removed.
+        for owner in ["first", "second"] {
+            state.set_decoration_scope(DecorationScope::Pane {
+                split_id: SplitId(1),
+                plugin_name: owner.into(),
+            });
+            state
+                .text_layout_ranges
+                .replace(
+                    &mut state.marker_list,
+                    &crate::view::overlay::OverlayNamespace::from_string("same".into()),
+                    20,
+                    std::slice::from_ref(&(0..4)),
+                    std::slice::from_ref(&(0..4)),
+                )
+                .unwrap();
+        }
         state.set_decoration_scope(DecorationScope::Buffer);
         // Plugin unload has no pane-hook context; pane close has no plugin owner.
         state.clear_pane_decorations(None, Some("first"));
@@ -2395,6 +2445,50 @@ mod tests {
             "teardown must delete projection anchors but retain the buffer-wide marker"
         );
         assert!(state.pane_decoration_scopes.is_empty());
+    }
+
+    #[test]
+    fn text_layout_invalidation_preserves_other_namespaces_and_plugins() {
+        use crate::view::pane_decorations::DecorationScope;
+        use fresh_core::SplitId;
+        let mut state = EditorState::new(40, 20, usize::MAX, test_fs());
+        state.buffer.insert(0, "text");
+        let flow = crate::view::overlay::OverlayNamespace::from_string("flow".into());
+        for plugin in ["first", "second"] {
+            state.set_decoration_scope(DecorationScope::Pane {
+                split_id: SplitId(1),
+                plugin_name: plugin.into(),
+            });
+            for name in ["flow", "code"] {
+                let namespace = crate::view::overlay::OverlayNamespace::from_string(name.into());
+                state
+                    .conceals
+                    .add(&mut state.marker_list, namespace.clone(), 1..3, None);
+                state
+                    .soft_breaks
+                    .add(&mut state.marker_list, namespace, 2, 0);
+            }
+            state
+                .text_layout_ranges
+                .replace(
+                    &mut state.marker_list,
+                    &flow,
+                    20,
+                    std::slice::from_ref(&(0..4)),
+                    std::slice::from_ref(&(0..4)),
+                )
+                .unwrap();
+        }
+        state.set_decoration_scope(DecorationScope::Buffer);
+        assert_eq!(
+            state.invalidate_text_layout_namespace("first", &flow),
+            vec![SplitId(1)]
+        );
+        assert_eq!(state.conceals.len(), 3);
+        assert_eq!(state.soft_breaks.len(), 3);
+        assert_eq!(state.marker_list.query_range(0, 4).len(), 10);
+        state.clear_pane_decorations(None, None);
+        assert!(state.marker_list.query_range(0, 4).is_empty());
     }
 
     #[test]

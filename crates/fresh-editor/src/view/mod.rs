@@ -46,6 +46,7 @@ pub mod scroll_sync;
 pub mod scrollbar_marker;
 #[cfg(any(feature = "runtime", feature = "wasm"))]
 pub mod soft_break;
+pub mod text_layout_ranges;
 #[cfg(any(feature = "runtime", feature = "wasm"))]
 pub mod ui;
 #[cfg(any(feature = "runtime", feature = "wasm"))]
