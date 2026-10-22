@@ -763,6 +763,10 @@ pub struct LineInfo {
     pub byte_end: usize,
     /// The content of the line
     pub content: String,
+    /// True only when this batch contains the complete blank-delimited run
+    /// containing this line, with no truncated source lines or missing seen
+    /// lines. False means the bounded offer could not prove completeness.
+    pub flow_run_complete: bool,
     /// This line's role in an embedded-language region, when the buffer's
     /// grammar hosts them and the engine could resolve the line's region
     /// state. Absent both for ordinary lines and when the state is

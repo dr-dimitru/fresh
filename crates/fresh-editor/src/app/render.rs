@@ -175,25 +175,27 @@ fn line_is_blank(content: &str) -> bool {
 /// frame, and this is the draw path.
 const FLOW_RUN_LOOKBEHIND_BYTES: usize = 8192;
 
-/// Start byte of the run of non-blank lines containing `top_byte`'s line.
+/// Bounded start byte for the run containing `top_byte`'s line, and whether
+/// the scan proved its start boundary. The byte result retains the existing
+/// partial-run offer behavior; finite policies also need the boundary proof.
 ///
 /// Returns that line's own start when it opens the run, when it is itself
 /// blank, and when the run reaches further back than the scan window — the
 /// consumer then sees a line whose predecessor is absent from the batch, which
 /// is exactly the "treat it as a block head" case it already handles.
-fn flow_run_start(buffer: &crate::model::buffer::Buffer, top_byte: usize) -> usize {
+fn flow_run_start(buffer: &crate::model::buffer::Buffer, top_byte: usize) -> (usize, bool) {
     let top_line = buffer.get_line_number(top_byte);
     let Some(line_start) = buffer.line_start_offset(top_line) else {
-        return top_byte;
+        return (top_byte, false);
     };
     if line_start == 0 {
-        return line_start;
+        return (line_start, true);
     }
     let window = line_start.min(FLOW_RUN_LOOKBEHIND_BYTES);
     let from = line_start - window;
     let bytes = buffer.slice_bytes(from..line_start);
     if bytes.len() != window {
-        return line_start;
+        return (line_start, false);
     }
     // Splitting on `\n` is UTF-8 safe: no continuation byte can equal it.
     let mut run_start = line_start;
@@ -207,22 +209,60 @@ fn flow_run_start(buffer: &crate::model::buffer::Buffer, top_byte: usize) -> usi
         let Some(nl) = bytes[..content_end].iter().rposition(|b| *b == b'\n') else {
             // The window ran out mid-line, unless it starts at the buffer's
             // own beginning — where there is no line above to look at.
-            if from == 0 && !bytes[..content_end].iter().all(u8::is_ascii_whitespace) {
-                run_start = from;
+            if from == 0 {
+                if !bytes[..content_end].iter().all(u8::is_ascii_whitespace) {
+                    run_start = from;
+                }
+                return (run_start, true);
             }
-            break;
+            return (run_start, false);
         };
         let start = nl + 1;
         if bytes[start..content_end]
             .iter()
             .all(u8::is_ascii_whitespace)
         {
-            break;
+            return (run_start, true);
         }
         run_start = from + start;
         end = start;
     }
-    run_start
+    (run_start, from == 0)
+}
+
+/// Which offered lines belong to a provably complete blank-delimited run.
+/// `lines` contains (is_blank, is_complete_source_line), before seen filtering.
+/// Neither an exhausted read window nor a hole left by seen filtering proves
+/// a boundary. This uses only evidence already collected by the bounded walk.
+fn complete_flow_run_flags(
+    lines: &[(bool, bool)],
+    send: &[bool],
+    start_closed: bool,
+    reached_eof: bool,
+) -> Vec<bool> {
+    let mut complete = vec![false; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].0 {
+            complete[i] = lines[i].1 && send[i];
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < lines.len() && !lines[i].0 {
+            i += 1;
+        }
+        let closed = (start > 0 || start_closed)
+            && (if i < lines.len() {
+                lines[i].1
+            } else {
+                reached_eof
+            })
+            && lines[start..i].iter().all(|line| line.1)
+            && send[start..i].iter().all(|sent| *sent);
+        complete[start..i].fill(closed);
+    }
+    complete
 }
 
 /// Turns the fold's painted items into theme-key runs for the inspector.
@@ -720,10 +760,10 @@ impl Editor {
                         // of the blank-line-delimited run that line belongs to
                         // — see `flow_run_start` for why a reflowing renderer
                         // needs that and nothing else does.
-                        let walk_start = if composing_in_any_split {
+                        let (walk_start, run_start_closed) = if composing_in_any_split {
                             flow_run_start(&state.buffer, top_byte)
                         } else {
-                            top_byte
+                            (top_byte, false)
                         };
 
                         // Every line the walk saw, in order, paired with
@@ -737,6 +777,8 @@ impl Editor {
                             byte_end: usize,
                             content: String,
                             seen: bool,
+                            blank: bool,
+                            complete: bool,
                         }
                         // Source lines to cover the viewport with. One per row,
                         // except that a conceal spanning a line break renders
@@ -810,6 +852,8 @@ impl Editor {
                                 byte_end,
                                 seen: seen_byte_ranges.contains(&(line_start, byte_end)),
                                 content: line_content,
+                                blank,
+                                complete,
                             });
                             if !complete {
                                 break;
@@ -869,10 +913,18 @@ impl Editor {
                             }
                         }
 
+                        let run_complete = complete_flow_run_flags(
+                            &walked.iter().map(|line| (line.blank, line.complete)).collect::<Vec<_>>(),
+                            &send,
+                            run_start_closed,
+                            walked_end >= buffer_len,
+                        );
                         let mut new_lines: Vec<crate::services::plugins::hooks::LineInfo> =
                             Vec::new();
                         let mut fresh_ranges: Vec<(usize, usize)> = Vec::new();
-                        for (line, send) in walked.into_iter().zip(send) {
+                        for ((line, send), flow_run_complete) in
+                            walked.into_iter().zip(send).zip(run_complete)
+                        {
                             if !send {
                                 continue;
                             }
@@ -882,6 +934,7 @@ impl Editor {
                                 byte_start: line.byte_start,
                                 byte_end: line.byte_end,
                                 content: line.content,
+                                flow_run_complete,
                                 region: None,
                                 table: None,
                             });
@@ -6845,5 +6898,80 @@ mod dock_reservation_tests {
         assert!(dock.is_none(), "the column goes back to the editor");
         assert_eq!(chrome.width, COLS);
         assert!(editor(e.dir_context.clone(), Config::default(), false).dock_reserved);
+    }
+}
+
+#[cfg(test)]
+mod flow_run_completeness_tests {
+    use super::{complete_flow_run_flags, flow_run_start};
+
+    #[test]
+    fn an_incomplete_whitespace_prefix_is_not_a_blank_delimiter() {
+        assert_eq!(
+            complete_flow_run_flags(&[(false, true), (true, false)], &[true; 2], true, false),
+            vec![false, false]
+        );
+    }
+
+    #[test]
+    fn start_boundary_evidence_distinguishes_a_blank_from_window_exhaustion() {
+        use crate::model::buffer::Buffer;
+        for ending in ["\n", "\r\n"] {
+            let text = ["head", "", "Alpha", "Bravo"].join(ending);
+            let buffer = Buffer::from_str_test(&text);
+            assert_eq!(
+                flow_run_start(&buffer, text.find("Bravo").unwrap()),
+                (text.find("Alpha").unwrap(), true)
+            );
+        }
+        let text = "row\n".repeat(5000);
+        let buffer = Buffer::from_str_test(&text);
+        assert!(!flow_run_start(&buffer, text.len() - 4).1);
+    }
+
+    #[test]
+    fn only_whole_selected_runs_are_complete() {
+        // (blank, complete source line), including a blank delimiter.
+        let lines = [(false, true), (false, true), (true, true), (false, true)];
+        assert_eq!(
+            complete_flow_run_flags(&lines, &[true; 4], true, true),
+            vec![true; 4]
+        );
+        assert_eq!(
+            complete_flow_run_flags(&lines, &[true; 4], false, false),
+            vec![false, false, true, false]
+        );
+        assert_eq!(
+            complete_flow_run_flags(&lines, &[true, false, true, true], true, true),
+            vec![false, false, true, true]
+        );
+    }
+
+    #[test]
+    fn a_read_cap_is_not_eof_or_a_complete_source_line() {
+        assert_eq!(
+            complete_flow_run_flags(&[(false, false)], &[true], true, true),
+            vec![false]
+        );
+        assert_eq!(
+            complete_flow_run_flags(&[(false, true)], &[true], true, false),
+            vec![false]
+        );
+        assert_eq!(
+            complete_flow_run_flags(&[(false, true)], &[true], true, true),
+            vec![true]
+        );
+    }
+
+    #[test]
+    fn lookbehind_and_missing_seen_lines_cannot_prove_a_run() {
+        assert_eq!(
+            complete_flow_run_flags(&[(false, true); 3], &[true; 3], false, true),
+            vec![false; 3]
+        );
+        assert_eq!(
+            complete_flow_run_flags(&[(false, true); 3], &[true, false, true], true, true),
+            vec![false; 3]
+        );
     }
 }

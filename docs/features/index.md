@@ -1,6 +1,7 @@
 # Features
 
 - [Editing](./editing.md) - Multiple cursors, advanced selection, unlimited undo/redo
+- [Markdown Compose](./markdown.md) - Composed Markdown and optional prose reflow budgets
 - [Command Palette](./command-palette.md) - Quick access to commands, files, and navigation
 - [Navigation](./navigation.md) - Go to definition, position history
 - [File Explorer](./file-explorer.md) - Browse and manage project files

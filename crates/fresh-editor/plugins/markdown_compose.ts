@@ -8,6 +8,7 @@
 // Syntax highlighting is handled by the TextMate grammar (built-in to the editor)
 // This plugin only adds the compose mode layout features.
 import { wrapToWidth } from "./lib/text.ts";
+import { canReflowProse, flowBreaks, JOIN_CELL, normalizeReflowLimit } from "./lib/markdown_reflow.ts";
 
 const editor = getEditor();
 
@@ -31,6 +32,23 @@ editor.on("config_changed", () => {
     }
   }
 });
+
+editor.defineConfigInteger("maxProseReflowCodeUnits", {
+  default: 0,
+  minimum: 0,
+  description: "Maximum source UTF-16 code units per prose block for Compose reflow (excluding LF/CRLF). 0 is unlimited. Oversized or incomplete blocks retain source line boundaries and native wrapping, without custom hanging indents or repeated quote rails. Code and table layout is unchanged.",
+});
+
+function proseReflowLimit(): number {
+  const settings = editor.getPluginConfig() as { maxProseReflowCodeUnits?: unknown } | null;
+  return normalizeReflowLimit(settings?.maxProseReflowCodeUnits);
+}
+
+let lastProseReflowLimit = proseReflowLimit();
+const REFLOW_NS = "md-flow";
+// Initial unlimited mode does not create extra ownership metadata or commands.
+// Once opted in, retiring a return to unlimited must reach every pane too.
+let trackReflowRanges = lastProseReflowLimit > 0;
 
 // Everything this plugin draws is the composed rendering of one pane, but
 // decorations live on the buffer: a pane showing the same buffer as source
@@ -182,6 +200,7 @@ type LineInfoLike = {
   byte_start: number;
   byte_end: number;
   content: string;
+  flow_run_complete?: boolean;
   region?: RegionLine;
   table?: TableLine;
 };
@@ -1352,10 +1371,14 @@ function clearComposeDecorations(bufferId: number): void {
   // And the code blocks' side rails, which are inline virtual text rather
   // than virtual lines and so are not covered by the namespace clears.
   editor.removeVirtualTextsByPrefix(bufferId, CODE_RAIL_ID_PREFIX);
-  const memos = (editor.queryMarkers(bufferId, 0, 0x7fffffff) as Array<{ id: string }>) || [];
+  const memos = (editor.queryMarkers(bufferId, 0, Math.max(1, editor.getBufferLength(bufferId))) as Array<{ id: string }>) || [];
   for (const m of memos) {
-    if (m.id.startsWith(TABLE_WIDTH_NS_PREFIX)) editor.deleteMarker(bufferId, m.id);
+    if (m.id.startsWith(TABLE_WIDTH_NS_PREFIX)) {
+      editor.deleteMarker(bufferId, m.id);
+    }
   }
+  editor.clearConcealNamespace(bufferId, REFLOW_NS);
+  editor.clearSoftBreakNamespace(bufferId, REFLOW_NS);
 
   // Clear layout hints, emphasis overlays, conceals, and soft breaks
   editor.setLayoutHints(bufferId, null, {});
@@ -2854,6 +2877,8 @@ interface FlowBlock {
   lines: LineInfoLike[];
   /** `contentStart[i]` is the char offset in `lines[i]`; always 0 for the head. */
   contentStart: number[];
+  /** One decision shared by continuation conceals and prose break emission. */
+  reflow: boolean;
 }
 
 /** Partition a `lines_changed` batch into flow blocks, in batch order. */
@@ -2861,6 +2886,7 @@ function groupFlowBlocks(
   lines: LineInfoLike[],
   measure: number,
   verbatim: Array<boolean | null>,
+  limit = 0,
 ): FlowBlock[] {
   const blocks: FlowBlock[] = [];
   let cur: FlowBlock | null = null;
@@ -2874,8 +2900,11 @@ function groupFlowBlocks(
       cur.lines.push(line);
       continue;
     }
-    cur = { kind: flowHeadKind(line, measure, verbatim[i]), lines: [line], contentStart: [0] };
+    cur = { kind: flowHeadKind(line, measure, verbatim[i]), lines: [line], contentStart: [0], reflow: true };
     blocks.push(cur);
+  }
+  for (const block of blocks) {
+    if (block.kind !== null) block.reflow = canReflowProse(block.lines, limit);
   }
   return blocks;
 }
@@ -2900,22 +2929,6 @@ function composedCharWidths(text: string, listInfo: ListLineInfo | null): number
     }
   }
   return charW;
-}
-
-/** One column of a flow block's rendered text.
- *
- * `li`/`ci` locate the cell in the block: the character at `ci` of
- * `lines[li]`, or — when `ci` is `JOIN_CELL` — the join *before* `lines[li]`,
- * the single space a swallowed newline renders as. A break taken there falls
- * on the join itself, which is why the joins' conceal replacements are decided
- * after the wrap and not before it. */
-const JOIN_CELL = -1;
-interface FlowCell {
-  w: number;
-  /** A break opportunity: a space that survives concealment, or a join. */
-  brk: boolean;
-  li: number;
-  ci: number;
 }
 
 // =============================================================================
@@ -2987,6 +3000,10 @@ function processFlowBlock(
     }
     return;
   }
+
+  // Fallback is prose-only. Code above and tables below keep their own layout.
+  // Clear old breaks first, but do not parse/build per-character prose widths.
+  if (!block.reflow) return;
 
   // Parse the head line to get block structure
   const blocks = parseMarkdownBlocks(lineContent);
@@ -3067,58 +3084,13 @@ function processFlowBlock(
   // preceded by the join it renders as. Compose-mode widths throughout
   // (`composedCharWidths`), so concealed markup doesn't count towards the
   // measure.
-  const cells: FlowCell[] = [];
-  for (let li = 0; li < block.lines.length; li++) {
-    const text = li === 0 ? headText : lineText(block.lines[li]);
-    if (li > 0) cells.push({ w: 1, brk: true, li, ci: JOIN_CELL });
-    const charW = composedCharWidths(text, li === 0 ? listInfo : null);
-    for (let ci = block.contentStart[li]; ci < text.length; ci++) {
-      cells.push({
-        w: charW[ci],
-        brk: text[ci] === ' ' && charW[ci] > 0,
-        li,
-        ci,
-      });
-    }
-  }
-
-  // Walk the block's columns and find word-wrap break points.
-  //
-  // The wrap budget must reserve columns to match the Rust renderer's
-  // `apply_wrapping_transform`, which subtracts one from `content_width`
-  // to keep the end-of-line cursor off the scrollbar track. If the
-  // plugin uses the full viewport width, it produces lines that fit
-  // exactly N columns; the renderer then re-wraps them at N-1, splitting
-  // off the trailing word into a single-word "orphan" visual row
-  // (issue #1789).
-  //
-  // We subtract two rather than just one so the plugin's wrap output
-  // stays a column inside the renderer's threshold across platforms,
-  // covering minor differences in scrollbar / gutter / EOL-cursor
-  // reservation between terminals.
-  const wrapBudget = Math.max(1, width - 2);
-  const breaks: FlowCell[] = [];
-  let column = 0;
-
-  for (let i = 0; i < cells.length; i++) {
-    const cell = cells[i];
-    if (cell.brk && column > 0) {
-      // Look ahead to find the next word's visual length
-      let nextWordLen = 0;
-      for (let j = i + 1; j < cells.length; j++) {
-        if (cells[j].brk) break;
-        nextWordLen += cells[j].w;
-      }
-
-      // Check if the separator + next word would exceed the wrap budget
-      if (column + cell.w + nextWordLen > wrapBudget && nextWordLen > 0) {
-        breaks.push(cell);
-        column = hangingIndent;
-        continue;
-      }
-    }
-    column += cell.w;
-  }
+  const breaks = flowBreaks(
+    block.lines.map((line, li) => ({
+      text: li === 0 ? headText : lineText(line), contentStart: block.contentStart[li],
+    })),
+    width, hangingIndent,
+    (text, li) => composedCharWidths(text, li === 0 ? listInfo : null),
+  );
 
   // The joins themselves. Anchored from the end of the previous line's text
   // (trailing whitespace included in the concealed span, so a line padded with
@@ -3132,7 +3104,7 @@ function processFlowBlock(
     const joinEnd = line.byte_start
       + editor.utf8ByteLength(text.slice(0, block.contentStart[li]));
     addComposeConceal(
-      bufferId, "md-syntax", joinStart, joinEnd, " ",
+      bufferId, REFLOW_NS, joinStart, joinEnd, " ",
     );
   }
 
@@ -3154,11 +3126,11 @@ function processFlowBlock(
     }
     if (quotePrefix) {
       editor.addSoftBreak(
-        bufferId, "md-wrap", breakBytePos, hangingIndent,
+        bufferId, REFLOW_NS, breakBytePos, hangingIndent,
         undefined, undefined, undefined, quotePrefix,
       );
     } else {
-      editor.addSoftBreak(bufferId, "md-wrap", breakBytePos, hangingIndent);
+      editor.addSoftBreak(bufferId, REFLOW_NS, breakBytePos, hangingIndent);
     }
   }
 }
@@ -3266,6 +3238,18 @@ function computeRowWidths(bufferId: number, lines: LineInfoLike[], measure: numb
 }
 
 
+/** The actual source coverage, in UTF-8 bytes, not a bounding box over gaps.
+ * The host owns indexed spans, edit remapping and any necessary re-offer. */
+function offeredSourceRanges(lines: LineInfoLike[]): TextLayoutRange[] {
+  const ranges: Array<{ start: number; end: number }> = [];
+  for (const line of lines) {
+    const previous = ranges[ranges.length - 1];
+    if (previous && line.byte_start <= previous.end) previous.end = Math.max(previous.end, line.byte_end);
+    else ranges.push({ start: line.byte_start, end: line.byte_end });
+  }
+  return ranges;
+}
+
 // lines_changed: called for newly visible or invalidated lines
 
 
@@ -3299,10 +3283,11 @@ function computeRowWidths(bufferId: number, lines: LineInfoLike[], measure: numb
 // Register hooks
 editor.on("pane_lines_changed", (data) => {
   // Mode and dimensions belong to this batch's reconciled pane, not the active
-  // buffer snapshot. The host scopes all synchronous decoration mutations to
-  // this pane, so differently sized Compose views cannot replace each other.
+  // buffer snapshot. Synchronous mutations bind to its pane and generation.
   if (data.view_mode !== "compose" || data.layout.textWidth === 0) return;
   const measure = data.layout.textWidth;
+  const limit = proseReflowLimit();
+  if (limit > 0) trackReflowRanges = true;
   // Cursor reveal/conceal decisions are NOT made here: every emitted
   // decoration carries an activation scope and the renderer evaluates it
   // per frame against each split's own cursors. This handler runs only
@@ -3328,9 +3313,18 @@ editor.on("pane_lines_changed", (data) => {
   // indent and `>` run are inside a join conceal, so the per-line decorations
   // that would otherwise render them must stand down.
   const verbatim = verbatimStates(data.lines);
-  const blocks = groupFlowBlocks(data.lines, measure, verbatim);
+  const blocks = groupFlowBlocks(data.lines, measure, verbatim, limit);
+  if (trackReflowRanges) {
+    editor.replaceTextLayoutRanges(
+      data.buffer_id, REFLOW_NS, limit, offeredSourceRanges(data.lines),
+      limit > 0 ? blocks.filter(block => block.kind !== null && block.reflow).map(block => ({
+        start: block.lines[0].byte_start, end: block.lines[block.lines.length - 1].byte_end,
+      })) : [],
+    );
+  }
   const joined = new Set<number>();
   for (const block of blocks) {
+    if (!block.reflow) continue;
     for (let i = 1; i < block.lines.length; i++) joined.add(block.lines[i].byte_start);
   }
 
@@ -3557,8 +3551,14 @@ editor.on("after_delete", (data) => {
 // movement changes what's *active* without touching any marker, so it never
 // re-fires lines_changed, never bumps the conceal/soft-break versions, and
 // never invalidates the line-wrap cache or visual-row index.
-editor.on("buffer_closed", (data) => {
-  // View state is cleaned up automatically when the buffer is removed from keyed_states
+editor.on("config_changed", () => {
+  const limit = proseReflowLimit();
+  if (limit === lastProseReflowLimit) return;
+  lastProseReflowLimit = limit;
+  if (limit > 0) trackReflowRanges = true;
+  // This explicit owner operation reaches offscreen and inactive-window panes.
+  // Ordinary unscoped clears must not erase a sibling pane's projection.
+  editor.invalidateTextLayout(REFLOW_NS);
 });
 // Pane geometry changes invalidate the host's pane batch automatically. A
 // scroll/focus event alone must not refresh already-decorated document ranges.

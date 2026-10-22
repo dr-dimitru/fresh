@@ -8813,6 +8813,12 @@ interface HookEventMap {
 			byte_start: number;
 			byte_end: number;
 			content: string;
+			/** True only when this batch contains the complete blank-delimited source
+			* run containing this line: both boundaries were reached, every source
+			* line is complete, and none was omitted as already seen. False or absent
+			* means unknown (for example, a viewport/read/line cap), not a short run.
+			* A finite whole-block layout policy should fall back on unknown runs. */
+			flow_run_complete?: boolean;
 			/** This line's role in an embedded-language region — a Markdown fenced
 			* code block, a Vue `<script>`/`<style>` block — as the highlighting
 			* engine classifies it while parsing. `"open"` and `"close"` are the
