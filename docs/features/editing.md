@@ -70,6 +70,7 @@ Fold and unfold code blocks via gutter indicators or "Toggle Fold" from the comm
 
 - **LSP folding** — uses `foldingRange` from the language server when available.
 - **Indent-based folding** — fallback for files without LSP support and large file mode. Fold from any line within an indented block.
+- **Markdown folding** — without a language server, the bundled `markdown_folding` plugin folds a heading's section, a fenced code block's body, and a list item's nested items, in source and Compose views. It replaces the indent fallback for Markdown buffers.
 
 **Per-buffer override** — **Toggle Folding Indicators (Current Buffer)** in the command palette hides the ▾/▸ gutter arrows for the active buffer only. Existing folds are untouched — collapsed regions stay collapsed and keep their placeholder, and "Toggle Fold" still works — but a gutter click no longer creates a fold, since there is no arrow to aim at. The choice persists across restarts.
 

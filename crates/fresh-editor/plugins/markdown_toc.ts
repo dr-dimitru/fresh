@@ -73,6 +73,8 @@
 //   reader just chose (a centred heading is rarely the top heading), so a
 //   jump remembers its target for a moment and the first viewport change
 //   that still shows it is taken as the jump's own.
+import { markdownFoldRanges, type MarkdownFoldRange } from "./lib/markdown_folds.ts";
+
 const editor = getEditor();
 
 // =============================================================================
@@ -340,6 +342,8 @@ interface TocState {
   stale: boolean;
   /** `is_composing_in_any_split` at the last scan — a flip triggers one. */
   composing: boolean;
+  /** Fold ranges of the last scan: sections, fences and list items. */
+  foldRanges: MarkdownFoldRange[];
 }
 
 let toc: TocState | null = null;
@@ -572,6 +576,7 @@ async function rescan(bufferId: number): Promise<void> {
   for (const key of toc.folded) if (scan.headings.some((h) => String(h.byte) === key)) folded.add(key);
 
   toc.headings = scan.headings;
+  toc.foldRanges = markdownFoldRanges(text);
   toc.expanded = expanded;
   toc.folded = folded;
   toc.stale = false;
@@ -597,6 +602,7 @@ function track(bufferId: number, path: string): void {
       selected: -1,
       stale: false,
       composing: isComposingInAnySplit(bufferId),
+      foldRanges: [],
     };
   }
   void rescan(bufferId);
@@ -635,15 +641,14 @@ function noticeComposeFlip(bufferId: number): void {
 // Folding (toc.fold_buffer)
 // =============================================================================
 
-/** Publish every heading's section as a toggleable fold range, in the shape
- *  an LSP `foldingRange` response takes, so the standard fold keybinding and
- *  the panel's disclosure glyphs agree on the ranges. */
+/** Publish the document's fold ranges, in the shape an LSP `foldingRange`
+ *  response takes, so the standard fold keybinding and the panel's
+ *  disclosure glyphs agree on the ranges. The set is the one
+ *  markdown_folding publishes: the host keeps one set per buffer, and
+ *  headings alone would take the list and fence folds away. */
 function publishFoldingRanges(): void {
   if (!toc || !foldBufferEnabled()) return;
-  const ranges = toc.headings
-    .filter((h) => h.endLine > h.line)
-    .map((h) => ({ startLine: h.line, endLine: h.endLine, kind: "region" }));
-  editor.setFoldingRanges(toc.bufferId, ranges);
+  editor.setFoldingRanges(toc.bufferId, toc.foldRanges);
 }
 
 /** Re-apply the buffer folds from `toc.folded`. There is no per-range unfold
