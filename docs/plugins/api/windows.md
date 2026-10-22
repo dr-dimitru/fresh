@@ -222,8 +222,8 @@ getScreenSize(): ScreenSize;
 
 ### `orchestratorMode`
 
-Whether the editor was launched by a bare `fresh` in Orchestrator mode.
-This reflects the launch, not the `orchestrator_mode` preference,
+Whether the editor is the daemon a bare `fresh` with Auto Attach on
+attaches to. This reflects the launch, not the `auto_attach` preference,
 which stays on for `fresh FILE`. Plugins in the mode use it to
 override their own settings.
 
@@ -388,9 +388,9 @@ setWindowCycleOrder(ids: number[]): boolean;
 
 Load every saved workspace into `listWindows()`, once.
 
-A launch starts with only the workspaces of its own directory (all of
-them in Orchestrator mode); the rest of the registry is read on first
-use rather than at startup. Call this before listing workspaces to a
+A launch starts with only the workspaces of its own directory (plus,
+in Orchestrator mode, the one last used); the rest of the registry is
+read on first use rather than at startup. Call this before listing workspaces to a
 user. Resolves once `listWindows()` includes them all; resolves at
 once when they already are.
 

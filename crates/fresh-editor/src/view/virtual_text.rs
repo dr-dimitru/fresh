@@ -268,6 +268,17 @@ impl VirtualTextManager {
         self.scopes.bump();
     }
 
+    /// The one way an entry enters the manager. The bump lives here rather
+    /// than in each `add*` method so a new add path cannot forget it and
+    /// leave the line-wrap cache serving a layout without the entry (#3311).
+    fn insert(&mut self, vtext: VirtualText) -> VirtualTextId {
+        let id = VirtualTextId(self.next_id);
+        self.next_id += 1;
+        self.texts.insert(id, vtext);
+        self.bump_version();
+        id
+    }
+
     /// Add a virtual text entry
     ///
     /// # Arguments
@@ -291,33 +302,24 @@ impl VirtualTextManager {
     ) -> VirtualTextId {
         let marker_id = marker_list.create(position);
 
-        let id = VirtualTextId(self.next_id);
-        self.next_id += 1;
-
-        self.texts.insert(
-            id,
-            VirtualText {
-                scope: self.scopes.write.clone(),
-                marker_id,
-                gravity: MarkerGravity::Right,
-                text,
-                style,
-                fg_theme_key: None,
-                bg_theme_key: None,
-                pad_to_column: None,
-                position: vtext_position,
-                priority,
-                string_id: None,
-                namespace: None,
-                gutter_glyph: None,
-                gutter_color: None,
-                text_overlays: Vec::new(),
-                compose_only: false,
-            },
-        );
-        self.bump_version();
-
-        id
+        self.insert(VirtualText {
+            scope: self.scopes.write.clone(),
+            marker_id,
+            gravity: MarkerGravity::Right,
+            text,
+            style,
+            fg_theme_key: None,
+            bg_theme_key: None,
+            pad_to_column: None,
+            position: vtext_position,
+            priority,
+            string_id: None,
+            namespace: None,
+            gutter_glyph: None,
+            gutter_color: None,
+            text_overlays: Vec::new(),
+            compose_only: false,
+        })
     }
 
     /// Add an inline virtual text entry whose foreground/background colours
@@ -355,33 +357,24 @@ impl VirtualTextManager {
 
         let marker_id = gravity.create(marker_list, position);
 
-        let id = VirtualTextId(self.next_id);
-        self.next_id += 1;
-
-        self.texts.insert(
-            id,
-            VirtualText {
-                scope: self.scopes.write.clone(),
-                marker_id,
-                gravity,
-                text,
-                style,
-                fg_theme_key,
-                bg_theme_key,
-                pad_to_column: None,
-                position: vtext_position,
-                priority,
-                string_id: None,
-                namespace: None,
-                gutter_glyph: None,
-                gutter_color: None,
-                text_overlays: Vec::new(),
-                compose_only: false,
-            },
-        );
-        self.bump_version();
-
-        id
+        self.insert(VirtualText {
+            scope: self.scopes.write.clone(),
+            marker_id,
+            gravity,
+            text,
+            style,
+            fg_theme_key,
+            bg_theme_key,
+            pad_to_column: None,
+            position: vtext_position,
+            priority,
+            string_id: None,
+            namespace: None,
+            gutter_glyph: None,
+            gutter_color: None,
+            text_overlays: Vec::new(),
+            compose_only: false,
+        })
     }
 
     /// Add a virtual text entry with a string identifier
@@ -400,33 +393,24 @@ impl VirtualTextManager {
     ) -> VirtualTextId {
         let marker_id = marker_list.create(position);
 
-        let id = VirtualTextId(self.next_id);
-        self.next_id += 1;
-
-        self.texts.insert(
-            id,
-            VirtualText {
-                scope: self.scopes.write.clone(),
-                marker_id,
-                gravity: MarkerGravity::Right,
-                text,
-                style,
-                fg_theme_key: None,
-                bg_theme_key: None,
-                pad_to_column: None,
-                position: vtext_position,
-                priority,
-                string_id: Some(string_id),
-                namespace: None,
-                gutter_glyph: None,
-                gutter_color: None,
-                text_overlays: Vec::new(),
-                compose_only: false,
-            },
-        );
-        self.bump_version();
-
-        id
+        self.insert(VirtualText {
+            scope: self.scopes.write.clone(),
+            marker_id,
+            gravity: MarkerGravity::Right,
+            text,
+            style,
+            fg_theme_key: None,
+            bg_theme_key: None,
+            pad_to_column: None,
+            position: vtext_position,
+            priority,
+            string_id: Some(string_id),
+            namespace: None,
+            gutter_glyph: None,
+            gutter_color: None,
+            text_overlays: Vec::new(),
+            compose_only: false,
+        })
     }
 
     /// String-id form of [`add_with_theme_keys`] — same as
@@ -453,33 +437,24 @@ impl VirtualTextManager {
 
         let marker_id = marker_list.create(position);
 
-        let id = VirtualTextId(self.next_id);
-        self.next_id += 1;
-
-        self.texts.insert(
-            id,
-            VirtualText {
-                scope: self.scopes.write.clone(),
-                marker_id,
-                gravity: MarkerGravity::Right,
-                text,
-                style,
-                fg_theme_key,
-                bg_theme_key,
-                pad_to_column,
-                position: vtext_position,
-                priority,
-                string_id: Some(string_id),
-                namespace: None,
-                gutter_glyph: None,
-                gutter_color: None,
-                text_overlays: Vec::new(),
-                compose_only,
-            },
-        );
-        self.bump_version();
-
-        id
+        self.insert(VirtualText {
+            scope: self.scopes.write.clone(),
+            marker_id,
+            gravity: MarkerGravity::Right,
+            text,
+            style,
+            fg_theme_key,
+            bg_theme_key,
+            pad_to_column,
+            position: vtext_position,
+            priority,
+            string_id: Some(string_id),
+            namespace: None,
+            gutter_glyph: None,
+            gutter_color: None,
+            text_overlays: Vec::new(),
+            compose_only,
+        })
     }
 
     /// Add a virtual line (LineAbove or LineBelow) with namespace for bulk removal
@@ -553,33 +528,24 @@ impl VirtualTextManager {
 
         let marker_id = marker_list.create(position);
 
-        let id = VirtualTextId(self.next_id);
-        self.next_id += 1;
-
-        self.texts.insert(
-            id,
-            VirtualText {
-                scope: self.scopes.write.clone(),
-                marker_id,
-                gravity: MarkerGravity::Right,
-                text,
-                style,
-                fg_theme_key,
-                bg_theme_key,
-                pad_to_column: None,
-                position: placement,
-                priority,
-                string_id: None,
-                namespace: Some(namespace),
-                gutter_glyph,
-                gutter_color,
-                text_overlays,
-                compose_only,
-            },
-        );
-        self.bump_version();
-
-        id
+        self.insert(VirtualText {
+            scope: self.scopes.write.clone(),
+            marker_id,
+            gravity: MarkerGravity::Right,
+            text,
+            style,
+            fg_theme_key,
+            bg_theme_key,
+            pad_to_column: None,
+            position: placement,
+            priority,
+            string_id: None,
+            namespace: Some(namespace),
+            gutter_glyph,
+            gutter_color,
+            text_overlays,
+            compose_only,
+        })
     }
 
     /// Remove a virtual text entry by its string identifier
@@ -1079,6 +1045,103 @@ mod tests {
             Some(6),
             "left gravity stays in front of the text inserted at it",
         );
+    }
+
+    /// The line-wrap cache keys on `version()`, so an add that leaves it
+    /// unchanged can be served a layout without the new entry (#3311).
+    /// Every add path is exercised on its own, with no removal in the
+    /// same pass whose bump could cover for it.
+    #[test]
+    fn every_add_path_bumps_the_version() {
+        type AddFn = fn(&mut VirtualTextManager, &mut MarkerList);
+        let paths: [(&str, AddFn); 6] = [
+            ("add", |m, ml| {
+                m.add(
+                    ml,
+                    0,
+                    "x".into(),
+                    hint_style(),
+                    VirtualTextPosition::AfterChar,
+                    0,
+                );
+            }),
+            ("add_with_theme_keys", |m, ml| {
+                m.add_with_theme_keys(
+                    ml,
+                    0,
+                    "x".into(),
+                    hint_style(),
+                    None,
+                    None,
+                    VirtualTextPosition::AfterChar,
+                    0,
+                    MarkerGravity::Right,
+                );
+            }),
+            ("add_with_id", |m, ml| {
+                m.add_with_id(
+                    ml,
+                    0,
+                    "x".into(),
+                    hint_style(),
+                    VirtualTextPosition::AfterChar,
+                    0,
+                    "id".into(),
+                );
+            }),
+            ("add_with_id_and_theme_keys", |m, ml| {
+                m.add_with_id_and_theme_keys(
+                    ml,
+                    0,
+                    "x".into(),
+                    hint_style(),
+                    None,
+                    None,
+                    VirtualTextPosition::AfterChar,
+                    0,
+                    "id".into(),
+                    None,
+                    false,
+                );
+            }),
+            ("add_line", |m, ml| {
+                m.add_line(
+                    ml,
+                    0,
+                    "x".into(),
+                    hint_style(),
+                    VirtualTextPosition::LineAbove,
+                    VirtualTextNamespace::from_string("ns".into()),
+                    0,
+                );
+            }),
+            ("add_line_with_theme_keys", |m, ml| {
+                m.add_line_with_theme_keys(
+                    ml,
+                    0,
+                    "x".into(),
+                    hint_style(),
+                    None,
+                    None,
+                    VirtualTextPosition::LineAbove,
+                    VirtualTextNamespace::from_string("ns".into()),
+                    0,
+                    None,
+                    None,
+                    Vec::new(),
+                    false,
+                );
+            }),
+        ];
+
+        for (name, add) in paths {
+            let mut marker_list = MarkerList::new();
+            marker_list.adjust_for_insert(0, 10);
+            let mut manager = VirtualTextManager::new();
+            let before = manager.version();
+            add(&mut manager, &mut marker_list);
+            assert_ne!(manager.version(), before, "{name} must bump the version");
+        }
     }
 
     #[test]

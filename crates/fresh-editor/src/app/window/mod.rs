@@ -775,6 +775,12 @@ pub struct Window {
     /// created, so a new partner gets the column.
     pub(crate) last_horizontal_sync: Option<(LeafId, usize)>,
 
+    /// A pane scrolled by the pointer (wheel, scrollbar) since the last
+    /// frame's scroll sync. It drives that sync instead of the focused pane:
+    /// the wheel scrolls the pane under the pointer, and syncing from the
+    /// focused partner instead put the scrolled pane straight back.
+    pub(crate) scroll_sync_driver: Option<LeafId>,
+
     /// Per-window interactive search-and-replace session state.
     /// Drives the F+y/n/!/q UX during `replace_in_buffer` /
     /// `replace_all`. Per-window because the search target buffer
@@ -792,6 +798,12 @@ pub struct Window {
     pub file_explorer_scope_revision: u64,
 
     file_explorer_scope_fingerprint: Option<FileExplorerScopeFingerprint>,
+
+    /// Whether the user's own close is what hid the explorer (see
+    /// `FileExplorerState::closed_by_user`). Set and cleared by
+    /// `Editor::toggle_file_explorer`; saved only while the explorer is
+    /// hidden, so any later open forgets it.
+    pub file_explorer_closed_by_user: bool,
 
     /// Whether a file-explorer rebuild is in flight (debounce flag).
     pub file_explorer_sync_in_progress: bool,
@@ -1770,10 +1782,11 @@ impl Window {
         false
     }
 
-    /// True iff at least one LSP server attached to the active buffer's
-    /// language advertises `textDocument/rename` (and therefore the
-    /// `prepareRename` request, which the editor surfaces only through
-    /// the rename feature flag).
+    /// True iff the server that `send_prepare_rename` would ask (the
+    /// rename handle for the active buffer's language) advertises
+    /// `renameProvider.prepareProvider`. Servers that only advertise
+    /// `renameProvider: true` (e.g. pylsp) answer prepareRename with
+    /// MethodNotFound, so the editor must go straight to the rename prompt.
     pub(crate) fn server_supports_prepare_rename(&self) -> bool {
         let Some(language) = self
             .buffers
@@ -1782,15 +1795,9 @@ impl Window {
         else {
             return false;
         };
-        {
-            let lsp = &self.lsp;
-            for sh in lsp.get_handles(&language) {
-                if sh.capabilities.rename {
-                    return true;
-                }
-            }
-        }
-        false
+        self.lsp
+            .handle_for_feature(&language, LspFeature::Rename)
+            .is_some_and(|sh| sh.capabilities.rename_prepare)
     }
 
     /// Send `textDocument/prepareRename` for the symbol at the active
@@ -2308,6 +2315,7 @@ impl Window {
                     view_state.viewport.top_byte()
                 );
             });
+        self.scroll_sync_driver = Some(leaf_id);
     }
 
     /// Scroll the Live Grep overlay's preview pane by `delta` lines
@@ -2316,16 +2324,19 @@ impl Window {
     /// through `scroll_split_by_lines`. Returns true if a preview was present
     /// and scrolled.
     pub fn scroll_overlay_preview_by_lines(&mut self, delta: i32) -> bool {
-        let buffer_id = match self.overlay_preview_state.as_ref() {
-            Some(ps) if !ps.blanked => ps.buffer_id,
+        let (buffer_id, compose) = match self.overlay_preview_state.as_ref() {
+            Some(ps) if !ps.blanked => (
+                ps.buffer_id,
+                ps.view_state.buffer_tab_state().is_page_view(),
+            ),
             _ => return false,
         };
         // Gather buffer-derived inputs first so the mutable borrows below stay
         // disjoint (buffer store vs. overlay preview state).
         let (soft_breaks, virtual_lines) = match self.buffers.get(&buffer_id) {
             Some(s) => (
-                s.collect_soft_break_positions(),
-                s.collect_virtual_line_positions(),
+                s.collect_soft_break_positions(compose),
+                s.collect_virtual_line_positions(compose),
             ),
             None => return false,
         };
@@ -2554,11 +2565,13 @@ impl Window {
             previous_viewports: HashMap::new(),
             same_buffer_scroll_sync: false,
             last_horizontal_sync: None,
+            scroll_sync_driver: None,
             interactive_replace_state: None,
             scroll_sync_manager: crate::view::scroll_sync::ScrollSyncManager::new(),
             file_explorer_visible: false,
             file_explorer_scope_revision: 0,
             file_explorer_scope_fingerprint: Some(FileExplorerScopeFingerprint::hidden()),
+            file_explorer_closed_by_user: false,
             file_explorer_sync_in_progress: false,
             file_explorer_sync_deferred: None,
             file_explorer_width: resources.config.file_explorer.width,

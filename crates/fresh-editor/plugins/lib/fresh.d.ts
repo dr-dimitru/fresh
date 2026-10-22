@@ -1041,7 +1041,7 @@ type ActionSpec = {
 	* macro — which contains `InsertChar` and other payload actions —
 	* round-trip losslessly through `executeActions`.
 	*/
-	args: Record<string, unknown>;
+	args?: Record<string, unknown>;
 };
 /**
 * Action button for action popups
@@ -3675,13 +3675,23 @@ interface FreshConfig {
 	*/
 	self_update?: boolean;
 	/**
-	* When on (default), `fresh` with no arguments reattaches to a single background
-	* editor with the workspace dock and your last workspace. When off, it opens a
-	* plain editor in the current directory; runs with files or flags are unaffected.
+	* When on (default), `fresh` with no arguments is `fresh -a`: it runs in a single
+	* background editor that outlives the terminal, and every later bare `fresh`
+	* reattaches to it. When off, it opens a plain editor in this terminal. Runs with
+	* files or flags are unaffected. Formerly `orchestrator_mode`.
 	*
 	* Default: `true`
 	*/
-	orchestrator_mode?: boolean;
+	auto_attach?: boolean;
+	/**
+	* When on, `fresh` with no arguments reopens the workspace you used last,
+	* wherever you type it. When off (default), it opens the current directory.
+	* Works with Auto Attach on or off; runs with files or flags are
+	* unaffected.
+	*
+	* Default: `false`
+	*/
+	open_last_workspace?: boolean;
 	/**
 	* Editor behavior settings (indentation, line numbers, wrapping, etc.)
 	*/
@@ -4489,7 +4499,10 @@ interface FileExplorerConfig {
 		*/
 		show_gitignored?: boolean;
 		/**
-		* Extra patterns to ignore, on top of `.gitignore`.
+		* Extra patterns to ignore, on top of `.gitignore`, written as
+		* `.gitignore` lines relative to the project root (`build/`, `/dist`,
+		* `*.log`, `!keep.log`). The file explorer, Quick Open, project search
+		* and Live Grep all leave out what they match.
 		*/
 		custom_ignore_patterns?: string[];
 		/**
@@ -5076,6 +5089,14 @@ interface TerminalConfig {
 		* Default: `"requested"`
 		*/
 		mouse_forwarding?: TerminalMouseForwarding;
+		/**
+		* Close a shell's tab (and its pane, if it was the only tab) when the
+		* shell exits (`exit`, Ctrl+D) instead of keeping it as read-only
+		* scrollback. Terminals running a command (agents, plugins) are kept.
+		*
+		* Default: `false`
+		*/
+		close_on_exit?: boolean;
 	}
 	/**
 	* When programs in the terminal get mouse events.
@@ -5726,8 +5747,8 @@ interface EditorAPI {
 	*/
 	envActive(): boolean;
 	/**
-	* Whether the editor was launched by a bare `fresh` in Orchestrator mode.
-	* This reflects the launch, not the `orchestrator_mode` preference,
+	* Whether the editor is the daemon a bare `fresh` with Auto Attach on
+	* attaches to. This reflects the launch, not the `auto_attach` preference,
 	* which stays on for `fresh FILE`. Plugins in the mode use it to
 	* override their own settings.
 	*/
@@ -6145,7 +6166,7 @@ interface EditorAPI {
 	* rewrite) *and* applies the value immediately, so a checkbox a plugin
 	* draws can own a real setting.
 	* 
-	* `path` is dot-separated (e.g. `"orchestrator_mode"`,
+	* `path` is dot-separated (e.g. `"auto_attach"`,
 	* `"editor.tab_size"`). The host refuses a path that is not a real
 	* config setting rather than writing a key that would be silently
 	* dropped on the next load, and says so in the status bar.
@@ -7147,9 +7168,9 @@ interface EditorAPI {
 	/**
 	* Load every saved workspace into `listWindows()`, once.
 	* 
-	* A launch starts with only the workspaces of its own directory (all of
-	* them in Orchestrator mode); the rest of the registry is read on first
-	* use rather than at startup. Call this before listing workspaces to a
+	* A launch starts with only the workspaces of its own directory (plus,
+	* in Orchestrator mode, the one last used); the rest of the registry is
+	* read on first use rather than at startup. Call this before listing workspaces to a
 	* user. Resolves once `listWindows()` includes them all; resolves at
 	* once when they already are.
 	*/
@@ -8218,7 +8239,13 @@ interface EditorAPI {
 	delay(durationMs: number): Promise<void>;
 	/**
 	* Project-wide grep search (async)
-	* Searches all files in the project, respecting .gitignore.
+	* Searches the project's files by Quick Open's rules, with hidden and
+	* gitignored files left out whatever the explorer shows: in a git
+	* repository, what `git ls-files --cached --others --exclude-standard`
+	* reports (so .gitignore is respected) plus the files of submodules and
+	* nested repositories; otherwise every non-hidden file outside `.git`,
+	* `node_modules`, `target` and similar directories. Either way, files
+	* matched by `file_explorer.custom_ignore_patterns` are left out.
 	* Open buffers with dirty edits are searched in-memory.
 	*/
 	grepProject(pattern: string, fixedString: boolean | null, caseSensitive: boolean | null, maxResults: number | null, wholeWords: boolean | null): Promise<GrepMatch[]>;
@@ -8226,7 +8253,7 @@ interface EditorAPI {
 	* Begin a streaming project-wide search and return a `SearchHandle`.
 	* The producer (host) writes matches at full speed into shared state;
 	* the consumer drains via `handle.take()` at its own cadence. Call
-	* `handle.cancel()` to abort.
+	* `handle.cancel()` to abort. Searches the same files as `grepProject`.
 	*/
 	beginSearch(pattern: string, opts?: {
 		fixedString?: boolean;
@@ -8929,6 +8956,19 @@ interface HookEventMap {
 		missing_servers: string[];
 		user_dismissed: boolean;
 	};
+	/**
+	* An LSP navigation resolved to a URI whose scheme this plugin claimed
+	* with `registerLspUriScheme`. `line` and `character` are 0-indexed, as
+	* the server sent them.
+	*/
+	lsp_open_external_uri: {
+		uri: string;
+		scheme: string;
+		line: number;
+		character: number;
+		language: string;
+		server_name: string;
+	};
 	// ── UI events ────────────────────────────────────────────────────────────
 	/** The user chose an action in a popup opened with `editor.showActionPopup`. */
 	action_popup_result: {
@@ -8975,6 +9015,12 @@ interface HookEventMap {
 		terminal_id: number;
 		window_id: number;
 		last_line: string;
+		/** The terminal's tab title; empty until it has a meaningful one. */
+		terminal_title: string;
+		/** The last OSC 133 / OSC 9;4 activity marker: `true` while a command
+		*  runs, `false` once it has finished, `null` if the program never
+		*  emitted one. */
+		osc_activity: boolean | null;
 	};
 	/** A terminal's process exited. `exit_code` is `null` when a signal ended it. */
 	terminal_exit: {

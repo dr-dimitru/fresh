@@ -352,6 +352,7 @@ impl crate::app::window::Window {
                 .viewport
                 .set_skip_ensure_visible();
         }
+        self.scroll_sync_driver = Some(split_id);
 
         Ok(())
     }
@@ -531,6 +532,7 @@ impl crate::app::window::Window {
                 .viewport
                 .set_skip_ensure_visible();
         }
+        self.scroll_sync_driver = Some(split_id);
 
         Ok(())
     }

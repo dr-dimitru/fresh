@@ -416,7 +416,7 @@ pub struct ActionSpec {
     /// macro — which contains `InsertChar` and other payload actions —
     /// round-trip losslessly through `executeActions`.
     #[serde(default)]
-    #[ts(type = "Record<string, unknown>")]
+    #[ts(optional, type = "Record<string, unknown>")]
     pub args: std::collections::HashMap<String, serde_json::Value>,
 }
 
@@ -1708,8 +1708,9 @@ pub struct EditorStateSnapshot {
     /// after the restart that activation triggers.
     #[serde(default)]
     pub env_active: bool,
-    /// Launched by a bare `fresh` in Orchestrator mode. The launch, not the
-    /// `orchestrator_mode` preference, which stays on for `fresh FILE`.
+    /// Launched by a bare `fresh` with Auto Attach on (its daemon). The
+    /// launch, not the `auto_attach` preference, which stays on for
+    /// `fresh FILE`.
     #[serde(default)]
     pub orchestrator_mode: bool,
     /// Launched to open the files on its command line (`fresh FILE…`,
@@ -6172,7 +6173,10 @@ pub enum PluginCommand {
     },
 
     /// Project-wide grep search (async)
-    /// Searches all project files via FileSystem trait, respecting .gitignore.
+    /// Searches the project's files by Quick Open's rules with hidden and
+    /// gitignored files left out (`services::project_files`): `git ls-files`
+    /// in a git repository, so .gitignore is respected, else a walk; minus
+    /// `custom_ignore_patterns`.
     /// For open buffers with dirty edits, searches the buffer's piece tree.
     GrepProject {
         /// Which plugin asked. Coalescing is per plugin: a newer grep replaces

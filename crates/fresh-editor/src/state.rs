@@ -498,6 +498,31 @@ impl EditorState {
             .unwrap_or(global_default);
     }
 
+    /// Stamp the `editor.*` settings onto an unnamed buffer the editor creates
+    /// itself rather than opens from a file: a new buffer (Ctrl+N), the initial
+    /// and per-window scratch buffers, and an unnamed buffer restored by hot
+    /// exit.
+    ///
+    /// [`EditorState::new`] takes no config, so the state it returns keeps
+    /// built-in defaults — occurrence highlighting on, `BufferSettings::default()`
+    /// for tab size, auto-close, whitespace indicators and the rest — until
+    /// something stamps it. The file-open paths stamp inline, between their
+    /// language and `.editorconfig` resolution; every unnamed buffer comes
+    /// through here, so a path that creates one cannot stamp only half of it.
+    pub fn apply_unnamed_buffer_config(&mut self, config: &crate::config::Config) {
+        self.margins
+            .configure_for_line_numbers(config.editor.line_numbers);
+        self.buffer
+            .set_default_line_ending(config.editor.default_line_ending.to_line_ending());
+        self.apply_occurrence_highlight(config.editor.highlight_occurrences);
+        // Buffer settings (whitespace visibility, tabs, guides, …): resolve
+        // from the user's config so a brand-new buffer behaves the same as an
+        // opened file. Without this the buffer kept `BufferSettings::default()`
+        // (e.g. tabs-on/spaces-off whitespace), so configured space indicators
+        // never showed in a new file (issue #2580).
+        self.apply_buffer_config(config);
+    }
+
     /// Create a new state with a buffer and default (plain text) language.
     /// All other fields are initialized to their defaults.
     fn new_from_buffer(buffer: Buffer) -> Self {
@@ -716,11 +741,6 @@ impl EditorState {
     /// cursor-dependent activation is the renderer's business, and letting it
     /// reach the index would mean scroll position changed when a cursor moved.
     ///
-    /// `view_mode` decides whether conceals added as `composeOnly` apply:
-    /// markdown_compose emits them whenever any split composes the buffer, so
-    /// a Source-mode split must ignore them — the same gate `build_view_data`
-    /// applies. Compose's frame lines and code rails are
-    /// deliberately *not* gated here; see the comment on `virtual_lines`.
     /// Collapsed byte ranges for `folds`, sorted — the form the index and the
     /// renderer both want. Folds live on the split, so they arrive as an
     /// argument rather than off `self`.
@@ -767,6 +787,14 @@ impl EditorState {
     /// or scroll position would change when a cursor moved. The one legitimate
     /// non-empty caller is the render path's cursor-line expansion, which
     /// re-wraps a single line the way the frame will draw it.
+    ///
+    /// `view_mode` is the mode of the pane the index serves, and decides which
+    /// of compose's decorations count. markdown_compose emits its soft breaks,
+    /// its `composeOnly` conceals, frame lines and code rails whenever *any*
+    /// split composes the buffer, so a Source-mode pane beside a composing one
+    /// (dual mode) must ignore them all — the same gates `build_view_data` and
+    /// `inject_virtual_lines` apply when they draw it. Rows the index reports
+    /// have to be the rows the pane draws.
     pub fn index_decorations(
         &self,
         view_mode: crate::view::line_wrap_cache::CacheViewMode,
@@ -790,7 +818,9 @@ impl EditorState {
         let no_cursors = cursors;
         let is_compose = matches!(view_mode, CacheViewMode::Compose);
 
-        let soft_breaks = if self.soft_breaks.is_empty() || (pane.is_some() && !is_compose) {
+        // Soft breaks are compose's wrapping: a Source-mode pane draws none of
+        // them (`build_view_data` applies them in page view only).
+        let soft_breaks = if self.soft_breaks.is_empty() || !is_compose {
             Vec::new()
         } else {
             // `theme: None` — the index measures and never draws, so a
@@ -819,33 +849,37 @@ impl EditorState {
             Vec::new()
         } else {
             crate::view::ui::split_rendering::transforms::resolve_inline_hints_for_pane(
-                self,
-                None,
-                0,
-                end,
-                pane.is_none() || is_compose,
-                pane,
+                self, None, 0, end, is_compose, pane,
             )
         };
 
-        // A real pane's canonical index uses its actual view mode and scope,
-        // exactly like painting. The legacy unscoped entry point retains its
-        // historical measuring convention (include Compose frames), for callers
-        // that do not have a pane or a meaningful mode.
-        let virtual_lines = if self.virtual_texts.is_empty() {
-            Vec::new()
+        // Compose's frame lines and list spacers are drawn only in a
+        // composing pane, and a pane's own decorations only in that pane.
+        // Every caller labels its index with the mode of the pane it serves
+        // (`wrap_index_geometry_for`), so a composing pane counts them and a
+        // source pane beside it does not. `virtual_lines_above` says which are
+        // drawn above their line, so the index orders a line's rows as the
+        // renderer draws them (`inject_virtual_lines`).
+        let (virtual_lines, virtual_lines_above) = if self.virtual_texts.is_empty() {
+            (Vec::new(), Vec::new())
         } else {
-            let mut v: Vec<usize> = self
-                .virtual_texts
-                .query_lines_for_pane(&self.marker_list, 0, end, pane)
-                .into_iter()
-                .filter(|(_, v)| pane.is_none() || is_compose || !v.compose_only)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|(pos, _)| pos)
-                .collect();
-            v.sort_unstable();
-            v
+            let mut all = Vec::new();
+            let mut above = Vec::new();
+            for (pos, vt) in
+                self.virtual_texts
+                    .query_lines_for_pane(&self.marker_list, 0, end, pane)
+            {
+                if !is_compose && vt.compose_only {
+                    continue;
+                }
+                all.push(pos);
+                if vt.position == crate::view::virtual_text::VirtualTextPosition::LineAbove {
+                    above.push(pos);
+                }
+            }
+            all.sort_unstable();
+            above.sort_unstable();
+            (all, above)
         };
 
         crate::view::wrap_index::IndexDecorations {
@@ -854,6 +888,7 @@ impl EditorState {
             inline_hints,
             folds,
             virtual_lines,
+            virtual_lines_above,
         }
     }
 
@@ -1937,8 +1972,13 @@ impl EditorState {
     /// this, mouse wheel and PageDown clamp to a row count that
     /// ignores virtual lines and stop short of the buffer's real tail.
     ///
+    /// `is_compose` is whether the pane scrolling is in page view: the lines a
+    /// plugin added as `composeOnly` are drawn only there, so a source pane
+    /// sharing the buffer with a composing one (dual mode) must not count
+    /// them, or its scroll stalls on rows it never draws.
+    ///
     /// Empty when no plugin has added virtual lines.
-    pub fn collect_virtual_line_positions(&self) -> Vec<usize> {
+    pub fn collect_virtual_line_positions(&self, is_compose: bool) -> Vec<usize> {
         if self.virtual_texts.is_empty() {
             return Vec::new();
         }
@@ -1946,6 +1986,7 @@ impl EditorState {
             .virtual_texts
             .query_lines_in_range(&self.marker_list, 0, self.buffer.len() + 1)
             .into_iter()
+            .filter(|(_, vt)| is_compose || !vt.compose_only)
             .map(|(pos, _vt)| pos)
             .collect();
         v.sort_unstable();
@@ -1963,9 +2004,11 @@ impl EditorState {
     /// after the break — the wrap counter needs it to compute the
     /// continuation segment's effective width correctly.
     ///
-    /// Empty when no plugin is wrapping the buffer.
-    pub fn collect_soft_break_positions(&self) -> Vec<(usize, u16)> {
-        if self.soft_breaks.is_empty() {
+    /// Empty when no plugin is wrapping the buffer, and for a pane not in
+    /// page view (`is_compose` false): the renderer applies soft breaks in
+    /// page view only, so a source pane beside a composing one draws none.
+    pub fn collect_soft_break_positions(&self, is_compose: bool) -> Vec<(usize, u16)> {
+        if self.soft_breaks.is_empty() || !is_compose {
             return Vec::new();
         }
         // query_viewport already returns pairs sorted by ascending position.

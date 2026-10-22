@@ -2853,8 +2853,8 @@ impl JsEditorApi {
     }
 
     #[plugin_api(section = "Windows")]
-    /// Whether the editor was launched by a bare `fresh` in Orchestrator mode.
-    /// This reflects the launch, not the `orchestrator_mode` preference,
+    /// Whether the editor is the daemon a bare `fresh` with Auto Attach on
+    /// attaches to. This reflects the launch, not the `auto_attach` preference,
     /// which stays on for `fresh FILE`. Plugins in the mode use it to
     /// override their own settings.
     pub fn orchestrator_mode(&self) -> bool {
@@ -3883,7 +3883,7 @@ impl JsEditorApi {
     /// rewrite) *and* applies the value immediately, so a checkbox a plugin
     /// draws can own a real setting.
     ///
-    /// `path` is dot-separated (e.g. `"orchestrator_mode"`,
+    /// `path` is dot-separated (e.g. `"auto_attach"`,
     /// `"editor.tab_size"`). The host refuses a path that is not a real
     /// config setting rather than writing a key that would be silently
     /// dropped on the next load, and says so in the status bar.
@@ -6448,9 +6448,9 @@ impl JsEditorApi {
 
     /// Load every saved workspace into `listWindows()`, once.
     ///
-    /// A launch starts with only the workspaces of its own directory (all of
-    /// them in Orchestrator mode); the rest of the registry is read on first
-    /// use rather than at startup. Call this before listing workspaces to a
+    /// A launch starts with only the workspaces of its own directory (plus,
+    /// in Orchestrator mode, the one last used); the rest of the registry is
+    /// read on first use rather than at startup. Call this before listing workspaces to a
     /// user. Resolves once `listWindows()` includes them all; resolves at
     /// once when they already are.
     #[plugin_api(async_promise, js_name = "loadWorkspaces", ts_return = "void")]
@@ -9224,7 +9224,13 @@ impl JsEditorApi {
 
     #[plugin_api(section = "Search & Replace")]
     /// Project-wide grep search (async)
-    /// Searches all files in the project, respecting .gitignore.
+    /// Searches the project's files by Quick Open's rules, with hidden and
+    /// gitignored files left out whatever the explorer shows: in a git
+    /// repository, what `git ls-files --cached --others --exclude-standard`
+    /// reports (so .gitignore is respected) plus the files of submodules and
+    /// nested repositories; otherwise every non-hidden file outside `.git`,
+    /// `node_modules`, `target` and similar directories. Either way, files
+    /// matched by `file_explorer.custom_ignore_patterns` are left out.
     /// Open buffers with dirty edits are searched in-memory.
     #[plugin_api(async_promise, js_name = "grepProject", ts_return = "GrepMatch[]")]
     #[qjs(rename = "_grepProjectStart")]
@@ -9253,7 +9259,7 @@ impl JsEditorApi {
     /// Begin a streaming project-wide search and return a `SearchHandle`.
     /// The producer (host) writes matches at full speed into shared state;
     /// the consumer drains via `handle.take()` at its own cadence. Call
-    /// `handle.cancel()` to abort.
+    /// `handle.cancel()` to abort. Searches the same files as `grepProject`.
     #[plugin_api(
         js_name = "beginSearch",
         ts_raw = "beginSearch(pattern: string, opts?: { fixedString?: boolean; caseSensitive?: boolean; maxResults?: number; wholeWords?: boolean; sourceBufferId?: number; fileGlob?: string }): SearchHandle"

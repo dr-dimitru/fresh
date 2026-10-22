@@ -395,7 +395,7 @@ impl SoftBreakManager {
     /// (the per-line layout the scroll math reads). The prefix text is
     /// emitted either way; only its colour depends on the theme, so both
     /// paths lay out identical columns. Same split as
-    /// [`crate::view::ui::split_rendering::transforms::resolve_inline_hints`].
+    /// [`crate::view::ui::split_rendering::transforms::resolve_inline_hints_for_pane`].
     pub fn query_viewport_rendered(
         &self,
         start: usize,

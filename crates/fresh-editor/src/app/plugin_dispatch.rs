@@ -1818,8 +1818,10 @@ impl Editor {
             }
 
             // ==================== Vi Mode Commands ====================
+            // Actions a plugin issues are its handler's doing, and replaying
+            // the handler issues them again, so they stay out of a recording.
             PluginCommand::ExecuteAction { action_name } => {
-                self.handle_execute_action(action_name);
+                self.without_macro_recording(|editor| editor.handle_execute_action(action_name));
             }
             PluginCommand::CompleteCommand {
                 request_id,
@@ -1834,7 +1836,7 @@ impl Editor {
                 crate::server::command_access::complete(request_id, ok, output, error);
             }
             PluginCommand::ExecuteActions { actions } => {
-                self.handle_execute_actions(actions);
+                self.without_macro_recording(|editor| editor.handle_execute_actions(actions));
             }
             PluginCommand::DefineMacro { register, steps } => {
                 self.handle_define_macro(register, steps);
@@ -3150,13 +3152,17 @@ impl Editor {
         self.plugin_timers
             .retain(|t| t.repeat || !fired.contains(&t.id));
 
-        for (id, plugin_name, handler_name) in due {
-            if let Err(e) = self.handle_action(Action::PluginAction(handler_name.clone())) {
-                tracing::warn!(
-                    "plugin timer {id} ({plugin_name}) handler '{handler_name}' failed: {e}"
-                );
+        // Timer handlers are not user input, so they stay out of any macro
+        // being recorded (otherwise every tick lands in the saved macro).
+        self.without_macro_recording(|editor| {
+            for (id, plugin_name, handler_name) in due {
+                if let Err(e) = editor.handle_action(Action::PluginAction(handler_name.clone())) {
+                    tracing::warn!(
+                        "plugin timer {id} ({plugin_name}) handler '{handler_name}' failed: {e}"
+                    );
+                }
             }
-        }
+        });
         true
     }
 
@@ -3330,9 +3336,11 @@ impl Editor {
     /// Define (or replace) an in-memory macro under `register` from a step
     /// list supplied by a plugin (`editor.defineMacro`). Each step is parsed
     /// through `Action::from_str` (with its args), so payload actions like
-    /// `insert_char` reconstruct faithfully. Unknown action names are skipped
-    /// with a warning rather than aborting, so one typo in a hand-edited
-    /// `init.ts` macro doesn't discard the whole register.
+    /// `insert_char` reconstruct faithfully. A name that isn't a built-in
+    /// action parses as a plugin action, so a typo is stored rather than
+    /// rejected. A step whose required args are missing (e.g. `insert_char`
+    /// with no `char`) is skipped with a warning rather than aborting, so one
+    /// bad step in a hand-edited `init.ts` macro doesn't discard the register.
     fn handle_define_macro(&mut self, register: String, steps: Vec<fresh_core::api::ActionSpec>) {
         use crate::input::keybindings::Action;
 
@@ -3351,7 +3359,7 @@ impl Editor {
                 }
                 None => {
                     tracing::warn!(
-                        "defineMacro['{}']: unknown action '{}' skipped",
+                        "defineMacro['{}']: action '{}' is missing its args, skipped",
                         key,
                         spec.action
                     );

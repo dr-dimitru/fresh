@@ -48,6 +48,7 @@ pub mod dock_panel_routing;
 #[cfg(feature = "plugins")]
 pub mod dock_switch_wipes_outgoing_window;
 pub mod document_model;
+pub mod duplicate_line_above;
 pub mod emacs_actions;
 pub mod emacs_keymap;
 pub mod encoding;
@@ -384,6 +385,7 @@ pub mod split_view_markdown_compose;
 pub mod status_bar_config;
 #[cfg(feature = "plugins")]
 pub mod status_bar_message_click;
+pub mod status_bar_palette_click;
 pub mod stdin_input;
 pub mod sticky_column_units;
 pub mod sudo_save_prompt;
@@ -422,6 +424,7 @@ pub mod undo_redo_marker_roundtrip;
 pub mod unicode_cursor;
 pub mod unicode_prompt_bugs;
 pub mod universal_lsp;
+pub mod unnamed_buffer_config;
 pub mod unnamed_buffer_persistence;
 pub mod unnamed_buffer_record_survival;
 pub mod unsaved_change_gutter;
